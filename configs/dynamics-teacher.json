@@ -1,0 +1,6 @@
+{
+  "steps": 50,
+  "velocity_magnitudes": [0.05, 0.5, 2.0, 4.0],
+  "directions": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+  "loaded_regions": ["entire_end", "upper_y"]
+}

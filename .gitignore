@@ -1,0 +1,12 @@
+.venv/
+.venv-wsl/
+.cache/
+.tools/
+.pytest_cache/
+__pycache__/
+*.pyc
+data/
+runs/
+dist/
+*.egg-info/
+.env

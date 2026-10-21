@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fracture-world"
+version = "0.1.0"
+description = "Coupled fracture flow matching, engine-free dynamics, proximal correction, and numerical evaluation"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=2.0,<3",
+    "scipy>=1.14,<2",
+    "torch>=2.5,<3",
+    "torch-geometric>=2.6,<3",
+    "torchdiffeq>=0.2.5,<0.3",
+    "clarabel>=0.10,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+native = ["pybind11>=2.13,<4", "cmake>=3.28,<5", "ninja>=1.11,<2"]
+
+[project.scripts]
+fracture-world = "fracture_world.cli:main"
+
+[project.urls]
+FEMFX = "https://github.com/GPUOpen-Effects/FEMFX"
+FlowMatching = "https://arxiv.org/abs/2210.02747"
+ADMM = "https://web.stanford.edu/~boyd/papers/admm_distr_stats.html"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fracture_world"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+package = true

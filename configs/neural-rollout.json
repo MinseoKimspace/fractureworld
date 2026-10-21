@@ -1,0 +1,13 @@
+{
+  "fracture_samples": 2,
+  "flow_steps": 8,
+  "fracture_prior_weight": 1.0,
+  "rho": 0.01,
+  "absolute_tolerance": 1e-8,
+  "relative_tolerance": 1e-7,
+  "geometry_tolerance": 1e-6,
+  "max_iterations": null,
+  "max_contact_iterations": null,
+  "kinematic_rule": "backward_euler",
+  "seed": 17
+}
