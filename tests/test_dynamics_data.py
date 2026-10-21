@@ -219,6 +219,25 @@ def test_dataset_rejects_different_material_topologies(tmp_path):
     assert len(load_dynamics_dataset(tmp_path)) == 1
 
 
+def test_dataset_progress_reports_current_case_before_loading_and_keeps_validation(tmp_path, monkeypatch):
+    import fracture_world.dynamics_data as dynamics_data
+
+    recorded_trajectory(tmp_path)
+    events = []
+    load = dynamics_data.load_dynamics_trajectory
+
+    def tracked(path):
+        assert events[-1]["status"] == "case_started"
+        assert events[-1]["case"] == path.stem
+        return load(path)
+
+    monkeypatch.setattr(dynamics_data, "load_dynamics_trajectory", tracked)
+    trajectories = load_dynamics_dataset(tmp_path, progress=events.append)
+    assert len(trajectories) == 1
+    assert events[-1]["status"] == "completed"
+    assert events[-1]["cases"] == 1
+
+
 @pytest.mark.parametrize("frame", [-1, True, 3, 0.5])
 def test_invalid_transition_selection_is_rejected(tmp_path, frame):
     case, path = recorded_trajectory(tmp_path)

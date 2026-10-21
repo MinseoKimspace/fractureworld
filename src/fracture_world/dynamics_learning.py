@@ -205,13 +205,28 @@ def train_dynamics(data_dir, output_dir, config):
         raise ValueError("training weights must be finite")
     if config.fracture_weight <= 0 or config.flow_weight <= 0:
         raise ValueError("fracture and flow weights must be positive")
-    trajectories = load_dynamics_dataset(data_dir, stream=True) if config.stream_data else load_dynamics_dataset(data_dir)
+    setup_started = perf_counter()
+
+    def setup_progress(update):
+        print(json.dumps(dict(event="training_setup", timestamp=datetime.now(timezone.utc).isoformat(),
+                              elapsed_seconds=perf_counter() - setup_started, **update), allow_nan=False), flush=True)
+
+    setup_progress(dict(phase="initialization", status="started", data=str(Path(data_dir).resolve())))
+    device = choose_device(config.device)
+    if device.type == "cpu":
+        torch.set_num_threads(min(torch.get_num_threads(), 4))
+    options = dict(progress=setup_progress)
+    if config.stream_data:
+        options["stream"] = True
+    trajectories = load_dynamics_dataset(data_dir, **options)
+    setup_progress(dict(phase="training_inputs", status="started", cases=len(trajectories)))
     for trajectory in trajectories:
-        if not config.learn_support_release and not np.array_equal(trajectory.fixed, np.broadcast_to(trajectory.fixed[0], trajectory.fixed.shape)):
+        if not config.learn_support_release and supervision_counts(trajectory)["support_positive"]:
             raise ValueError("automatic support release is not modeled; use trajectories with prescribed constant material supports")
         base_dt = trajectory.metadata["conditioning_context"]["dt"]
         if not np.allclose(np.diff(trajectory.times), base_dt, rtol=64 * np.finfo(np.float32).eps, atol=0):
             raise ValueError("temporal dynamics training requires every native step; regenerate with record_stride=1")
+    setup_progress(dict(phase="training_inputs", status="completed", cases=len(trajectories)))
     splits = split_dynamics_cases(trajectories, config.seed, config.overfit, event_stratified=config.event_stratified,
                                   split_unit=config.split_unit)
     training = splits["train"]
@@ -223,7 +238,7 @@ def train_dynamics(data_dir, output_dir, config):
 
         coverage = inspect_dynamics_dataset(data_dir, config.seed, config.overfit, config.min_post_event_steps,
                                            event_stratified=config.event_stratified, split_unit=config.split_unit,
-                                           trajectories=trajectories)
+                                           trajectories=trajectories, progress=setup_progress)
         if not coverage["ready_for_training"]:
             raise ValueError("dataset is not ready for fracture/support-release training: " +
                              json.dumps(coverage["reasons"], allow_nan=False))
@@ -235,13 +250,12 @@ def train_dynamics(data_dir, output_dir, config):
     fracture_positive_weight = max(1.0, fracture_negative / fracture_positive) if fracture_positive else 1.0
     support_positive_weight = max(1.0, support_negative / support_positive) if support_positive else 1.0
     seed_all(config.seed)
-    device = choose_device(config.device)
-    if device.type == "cpu":
-        torch.set_num_threads(min(torch.get_num_threads(), 4))
+    setup_progress(dict(phase="normalization", status="started", cases=len(training)))
     model_config = dict(hidden=config.hidden, heads=config.heads, graph_layers=config.graph_layers,
                         transformer_layers=config.transformer_layers, learn_support_release=config.learn_support_release,
                         flow_architecture=config.flow_architecture, flow_layers=config.flow_layers, motion_prior=config.motion_prior,
                         **_scales(training))
+    setup_progress(dict(phase="model_initialization", status="started", device=str(device)))
     model = TemporalDynamicsModel(**model_config).to(device)
     model.fracture_logit_offset = float(np.log(fracture_positive_weight))
     model.support_logit_offset = float(np.log(support_positive_weight))
@@ -278,6 +292,8 @@ def train_dynamics(data_dir, output_dir, config):
                   "mesh_shape_families": {item.topology.fingerprint: item.shape_family for item in trajectories},
                   "generalization_protocol": config.split_unit}
     started = perf_counter()
+    setup_progress(dict(phase="ready", status="completed", device=str(device),
+                        splits={name: len(rows) for name, rows in splits.items()}))
 
     def train_stage(network, epochs, stage, fixed_predictor=None):
         optimizer = torch.optim.AdamW(network.parameters(), lr=config.learning_rate)

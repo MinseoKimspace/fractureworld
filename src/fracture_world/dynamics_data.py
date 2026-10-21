@@ -385,7 +385,7 @@ class StreamedDynamicsTrajectory:
         return self._load().transition(frame)
 
 
-def load_dynamics_dataset(directory, *, stream=False):
+def load_dynamics_dataset(directory, *, stream=False, progress=None):
     directory = Path(directory).resolve()
     if directory.is_file():
         specification = json.loads(directory.read_text(encoding="utf-8"))
@@ -406,7 +406,7 @@ def load_dynamics_dataset(directory, *, stream=False):
             seen.add(source)
             if "split" in entry and entry["split"] not in {"train", "validation", "test"}:
                 raise ValueError("collection split must select train, validation or test")
-            for item in load_dynamics_dataset(source, stream=stream):
+            for item in load_dynamics_dataset(source, stream=stream, progress=progress):
                 context = item.metadata.get("conditioning_context", {})
                 if "shape_family" in context and context["shape_family"] != entry["shape_family"]:
                     raise ValueError("collection shape family differs from the recorded geometry source")
@@ -420,7 +420,10 @@ def load_dynamics_dataset(directory, *, stream=False):
     if not paths:
         raise ValueError("no native dynamics cases were found")
     trajectories, topologies = [], {}
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
+        if progress is not None:
+            progress(dict(phase="dataset_loading", status="case_started", dataset=str(directory),
+                          case=path.stem, case_index=index, cases=len(paths)))
         item = load_dynamics_trajectory(path)
         topology_key = (item.topology.fingerprint, item.material["rest_density"])
         topology = topologies.setdefault(topology_key, item.topology)
@@ -431,6 +434,8 @@ def load_dynamics_dataset(directory, *, stream=False):
         else:
             trajectories.append(replace(item, topology=topology))
     validate_dynamics_compatibility(trajectories)
+    if progress is not None:
+        progress(dict(phase="dataset_loading", status="completed", dataset=str(directory), cases=len(paths)))
     return trajectories
 
 

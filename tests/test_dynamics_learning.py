@@ -106,7 +106,7 @@ def test_normalization_and_class_weights_are_computed_from_training_split_only(t
     cases = [item if item.case_id == training_id else replace(
         item, velocities=item.velocities * 1.e6, broken=np.zeros_like(item.broken), fixed=np.zeros_like(item.fixed))
              for item in cases]
-    monkeypatch.setattr(dynamics_learning, "load_dynamics_dataset", lambda _: cases)
+    monkeypatch.setattr(dynamics_learning, "load_dynamics_dataset", lambda _, **kwargs: cases)
     checkpoint_path = train_dynamics(tmp_path / "unused", tmp_path / "trained",
                                     training_config(overfit=False, corrector_epochs=0))
     _, _, checkpoint, _ = load_dynamics_model(checkpoint_path, "cpu")

@@ -62,6 +62,18 @@ def test_held_out_event_coverage_and_original_support_identity(monkeypatch):
             assert case["released_original_support_vertices"] == 1
 
 
+def test_coverage_progress_preserves_report_and_identifies_current_case():
+    items = dataset_with_coverage()
+    expected = inspect_dynamics_dataset("unused", trajectories=items)
+    events = []
+    actual = inspect_dynamics_dataset("unused", trajectories=items, progress=events.append)
+    assert actual == expected
+    started = [event for event in events if event["status"] == "case_started"]
+    assert [event["case"] for event in started] == [item.case_id for item in items]
+    assert [event["case_index"] for event in started] == list(range(1, len(items) + 1))
+    assert events[-1]["status"] == "completed"
+
+
 def test_absent_events_are_not_reported_as_training_ready(monkeypatch):
     report = inspect(monkeypatch, [trajectory(f"case-{index}") for index in range(20)])
     assert not report["ready_for_training"]

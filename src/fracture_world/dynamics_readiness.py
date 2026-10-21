@@ -90,16 +90,26 @@ def _summary(rows):
 
 
 def inspect_dynamics_dataset(directory, seed=17, overfit=False, min_post_event_steps=1, event_stratified=False,
-                             split_unit="loading_condition", trajectories=None, stream_data=False):
+                             split_unit="loading_condition", trajectories=None, stream_data=False, progress=None):
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("split seed must be an integer")
     if isinstance(min_post_event_steps, bool) or not isinstance(min_post_event_steps, int) or min_post_event_steps < 1:
         raise ValueError("minimum post-event native steps must be a positive integer")
     if trajectories is None:
-        trajectories = load_dynamics_dataset(directory, stream=True) if stream_data else load_dynamics_dataset(directory)
+        options = {"stream": True} if stream_data else {}
+        if progress is not None:
+            options["progress"] = progress
+        trajectories = load_dynamics_dataset(directory, **options)
     else:
         trajectories = list(trajectories)
-    cases = [_case_report(item, min_post_event_steps) for item in trajectories]
+    cases = []
+    for index, item in enumerate(trajectories, start=1):
+        if progress is not None:
+            progress(dict(phase="event_coverage", status="case_started", case=item.case_id,
+                          case_index=index, cases=len(trajectories)))
+        cases.append(_case_report(item, min_post_event_steps))
+    if progress is not None:
+        progress(dict(phase="event_coverage", status="completed", cases=len(trajectories)))
     by_id = {row["case_id"]: row for row in cases}
     reasons = []
     try:

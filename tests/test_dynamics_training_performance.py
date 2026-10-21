@@ -5,7 +5,7 @@ import json
 import numpy as np
 import torch
 
-from fracture_world import dynamics_learning
+from fracture_world import dynamics_data, dynamics_learning
 from fracture_world.dynamics_data import load_dynamics_trajectory
 from fracture_world.dynamics_learning import _TrainingMetrics, _TrainingTrajectory, _rollout_loss, transition_batch
 from test_dynamics_data import recorded_trajectory
@@ -97,6 +97,10 @@ def test_training_logs_measured_window_throughput_and_split_scoped_eta(tmp_path,
     dynamics_learning.train_dynamics(tmp_path / "data", tmp_path / "trained",
                                     training_config(corrector_epochs=0, stream_data=True))
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    setup = [record for record in records if record.get("event") == "training_setup"]
+    assert setup[0]["phase"] == "initialization"
+    assert setup[-1]["phase"] == "ready"
+    assert any(record["phase"] == "dataset_loading" and record["status"] == "case_started" for record in setup)
     progress = [record for record in records if record.get("event") == "training_progress"]
     assert progress
     assert all(0 < item["windows_completed"] <= item["windows_total"] == 3 for item in progress)
@@ -106,3 +110,18 @@ def test_training_logs_measured_window_throughput_and_split_scoped_eta(tmp_path,
     assert epoch["epoch_seconds"] > 0
     assert epoch["split_timing"]["train"]["windows"] == 3
     assert epoch["split_timing"]["validation"]["windows"] == 0
+
+
+def test_streamed_support_validation_does_not_load_every_trajectory_again(tmp_path, monkeypatch):
+    recorded_trajectory(tmp_path / "data")
+    loaded = []
+    load = dynamics_data.load_dynamics_trajectory
+
+    def tracked(*args, **kwargs):
+        loaded.append(args[0])
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(dynamics_data, "load_dynamics_trajectory", tracked)
+    dynamics_learning.train_dynamics(tmp_path / "data", tmp_path / "trained",
+                                    training_config(corrector_epochs=0, stream_data=True, learn_support_release=False))
+    assert len(loaded) == 2
