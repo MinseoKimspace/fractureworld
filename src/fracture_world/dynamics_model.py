@@ -3,6 +3,8 @@ import math
 
 import numpy as np
 import torch
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from torch import nn
 from torch.nn import functional as F
@@ -29,6 +31,31 @@ DYNAMICS_METADATA = (list(DYNAMICS_INPUT_DIMS), DYNAMICS_EDGE_TYPES)
 class FractureFlowContext:
     features: torch.Tensor
     edge_index: torch.Tensor
+
+
+class DynamicsGraphCache:
+    def __init__(self):
+        self.entries = {}
+
+    def resolve(self, name, tensors, build):
+        if torch.is_inference_mode_enabled() or any(value.requires_grad for value in tensors):
+            return build()
+        try:
+            versions = tuple(value._version for value in tensors)
+        except RuntimeError:
+            return build()
+        previous = self.entries.get(name)
+        if previous is not None:
+            inputs, old_versions, result = previous
+            if old_versions == versions and all(old is current for old, current in zip(inputs, tensors)):
+                return result
+        result = build()
+        self.entries[name] = (tuple(tensors), versions, result)
+        return result
+
+
+def _cached(cache, name, tensors, build):
+    return build() if cache is None else cache.resolve(name, tensors, build)
 
 
 def build_fracture_adjacency(face_pairs):
@@ -71,61 +98,76 @@ def _validated_batch(batch):
     for key in ("rest_positions", "velocities", "forces"):
         if batch[key].shape != positions.shape:
             raise ValueError(f"{key} must have shape (N, 3)")
-    if batch["masses"].shape != (count,) or (batch["masses"] <= 0).any():
+    if batch["masses"].shape != (count,):
         raise ValueError("masses must be positive with shape (N,)")
     if batch["fixed"].shape != (count,) or batch["fixed"].dtype != torch.bool:
         raise ValueError("fixed must be a boolean vector with shape (N,)")
     pairs = batch["face_pairs"]
     if pairs.ndim != 3 or pairs.shape[1:] != (3, 2) or pairs.dtype != torch.long:
         raise ValueError("face_pairs must have integer shape (F, 3, 2)")
-    if pairs.numel() and ((pairs < 0).any() or (pairs >= count).any()):
-        raise ValueError("face_pairs contain an invalid material corner")
     if batch["broken"].shape != (len(pairs),) or batch["broken"].dtype != torch.bool:
         raise ValueError("broken must be a boolean vector with shape (F,)")
     if batch["material"].shape != (4,):
         raise ValueError("material must contain density, Young modulus, Poisson ratio and fracture threshold")
     material = batch["material"]
-    if (material[[0, 1, 3]] <= 0).any() or not -1 < material[2] < 0.5:
-        raise ValueError("material properties lie outside their admissible range")
     for key in required - {"face_pairs", "broken", "fixed", "dt"}:
         value = batch[key]
-        if value.device != positions.device or value.dtype != positions.dtype or not torch.isfinite(value).all():
+        if value.device != positions.device or value.dtype != positions.dtype:
             raise ValueError("floating point dynamics inputs must be finite and share dtype and device")
     for key in ("face_pairs", "broken", "fixed"):
         if batch[key].device != positions.device:
             raise ValueError("dynamics inputs must share a device")
     dt = torch.as_tensor(batch["dt"], device=positions.device, dtype=positions.dtype)
-    if dt.numel() != 1 or not torch.isfinite(dt).all() or dt.item() <= 0:
+    if dt.numel() != 1:
         raise ValueError("dt must be a finite positive scalar")
+    finite_inputs = torch.stack([torch.isfinite(batch[key]).all()
+                                  for key in sorted(required - {"face_pairs", "broken", "fixed", "dt"})]).all()
+    invalid = torch.stack(((batch["masses"] <= 0).any(), ((pairs < 0) | (pairs >= count)).any(),
+                           (material[[0, 1, 3]] <= 0).any() | (material[2] <= -1) | (material[2] >= 0.5),
+                           ~finite_inputs, ~torch.isfinite(dt).all() | (dt <= 0).any())).detach().cpu().tolist()
+    errors = ("masses must be positive with shape (N,)", "face_pairs contain an invalid material corner",
+              "material properties lie outside their admissible range",
+              "floating point dynamics inputs must be finite and share dtype and device",
+              "dt must be a finite positive scalar")
+    for failed, message in zip(invalid, errors):
+        if failed:
+            raise ValueError(message)
     return dt.reshape(())
 
 
-def _contact_pairs(batch, radius):
+def _contact_pairs(batch, radius, cache=None):
     positions = batch["positions"].detach().cpu().numpy()
     count = len(positions)
-    parent = np.arange(count)
+    face_pairs = _cached(cache, "cpu_face_pairs", (batch["face_pairs"],),
+                         lambda: batch["face_pairs"].detach().cpu().numpy().copy())
 
-    def representative(index):
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
+    def connectivity():
+        intact_faces = face_pairs[~batch["broken"].detach().cpu().numpy()]
+        intact = intact_faces.reshape(-1, 2)
+        adjacency = coo_matrix((np.ones(len(intact), dtype=np.int8), (intact[:, 0], intact[:, 1])),
+                               shape=(count, count)).tocsr()
+        groups = connected_components(adjacency, directed=False, return_labels=True)[1]
+        cell_pairs = np.sort(intact_faces[:, 0] // 4, axis=1)
+        neighbors = np.unique(cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1])
+        return groups, neighbors
 
-    intact_faces = batch["face_pairs"][~batch["broken"]].detach().cpu().numpy()
-    intact = intact_faces.reshape(-1, 2)
-    for left, right in intact:
-        parent[representative(int(left))] = representative(int(right))
-    groups = np.array([representative(index) for index in range(count)])
-    neighboring_cells = {tuple(sorted((int(face[0, 0] // 4), int(face[0, 1] // 4)))) for face in intact_faces}
+    groups, neighboring_cells = _cached(cache, "contact_connectivity",
+                                         (batch["rest_positions"], batch["face_pairs"], batch["broken"]), connectivity)
     pairs = cKDTree(positions).query_pairs(radius, output_type="ndarray")
     if len(pairs):
         pairs = pairs[(pairs[:, 0] // 4 != pairs[:, 1] // 4) & (groups[pairs[:, 0]] != groups[pairs[:, 1]])]
-        pairs = pairs[np.array([tuple(sorted((int(a // 4), int(b // 4)))) not in neighboring_cells for a, b in pairs], dtype=bool)]
+        cell_pairs = pairs // 4
+        cell_codes = cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1]
+        pairs = pairs[~np.isin(cell_codes, neighboring_cells)]
     return torch.as_tensor(pairs.reshape(-1, 2), device=batch["positions"].device, dtype=torch.long)
 
 
 def constant_acceleration_prediction(batch):
     dt = _validated_batch(batch)
+    return _constant_acceleration_prediction(batch, dt)
+
+
+def _constant_acceleration_prediction(batch, dt):
     acceleration = batch["forces"] / batch["masses"][:, None]
     positions = batch["positions"] + dt * batch["velocities"] + 0.5 * dt.square() * acceleration
     velocities = batch["velocities"] + dt * acceleration
@@ -140,6 +182,12 @@ def constant_acceleration_prediction(batch):
 def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale=1.0,
                          material_scale=(1.0, 1.0, 1.0, 1.0), contact_radius=0.1, proposal=None, physical_proposal=None):
     dt = _validated_batch(batch)
+    return _build_dynamics_graph(batch, dt, length_scale, velocity_scale, mass_scale, material_scale,
+                                  contact_radius, proposal, physical_proposal)
+
+
+def _build_dynamics_graph(batch, dt, length_scale, velocity_scale, mass_scale, material_scale,
+                           contact_radius, proposal, physical_proposal, cache=None):
     scales = np.asarray([length_scale, velocity_scale, mass_scale, contact_radius, *material_scale], dtype=float)
     if scales.shape != (8,) or not np.isfinite(scales).all() or (scales <= 0).any():
         raise ValueError("normalization scales and contact_radius must be finite and positive")
@@ -148,7 +196,7 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
     count = len(x)
     cell_count = count // 4
     pairs = batch["face_pairs"]
-    center = (rest * mass[:, None]).sum(dim=0) / mass.sum()
+    center = _cached(cache, "rest_center", (rest, mass), lambda: (rest * mass[:, None]).sum(dim=0) / mass.sum())
     force_delta = force * dt / (mass[:, None] * velocity_scale)
     proposal_features = torch.zeros((count, 6), device=x.device, dtype=x.dtype)
     proposed_release_probability = torch.zeros(count, device=x.device, dtype=x.dtype)
@@ -178,24 +226,33 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
     corner_features = torch.cat(((x - center) / length_scale, (rest - center) / length_scale,
                                  v / velocity_scale, force_delta, (mass / mass_scale).log()[:, None],
                                  fixed.to(x.dtype)[:, None], proposal_features, proposed_release_probability[:, None]), dim=-1)
-    rest_cells = rest.reshape(cell_count, 4, 3)
     current_cells = x.reshape(cell_count, 4, 3)
-    reference_edges = (rest_cells[:, 1:] - rest_cells[:, :1]).transpose(1, 2)
     current_edges = (current_cells[:, 1:] - current_cells[:, :1]).transpose(1, 2)
-    determinants = torch.linalg.det(reference_edges)
-    if (determinants.abs() <= torch.finfo(x.dtype).tiny).any():
-        raise ValueError("material tetrahedra must be nondegenerate")
-    deformation = current_edges @ torch.linalg.inv(reference_edges)
+
+    def reference_geometry():
+        rest_cells = rest.reshape(cell_count, 4, 3)
+        reference_edges = (rest_cells[:, 1:] - rest_cells[:, :1]).transpose(1, 2)
+        determinants = torch.linalg.det(reference_edges)
+        if (determinants.abs() <= torch.finfo(x.dtype).tiny).any():
+            raise ValueError("material tetrahedra must be nondegenerate")
+        return determinants, torch.linalg.inv(reference_edges)
+
+    determinants, reference_inverse = _cached(cache, "reference_geometry", (rest,), reference_geometry)
+    deformation = current_edges @ reference_inverse
     material = batch["material"] / torch.as_tensor(material_scale, device=x.device, dtype=x.dtype)
     material_features = torch.stack((material[0].log(), material[1].log(), batch["material"][2], material[3].log()))
     cell_features = torch.cat((deformation.reshape(cell_count, 9), v.reshape(cell_count, 4, 3).mean(dim=1) / velocity_scale,
                                (determinants.abs() / (6 * length_scale ** 3)).log()[:, None],
                                material_features[None].expand(cell_count, -1)), dim=-1)
     left, right = pairs[:, :, 0], pairs[:, :, 1]
-    triangles = rest[left]
-    normals = torch.linalg.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0], dim=-1)
-    double_area = torch.linalg.vector_norm(normals, dim=-1)
-    normals = normals / double_area.clamp_min(torch.finfo(x.dtype).tiny)[:, None]
+
+    def reference_faces():
+        triangles = rest[left]
+        normals = torch.linalg.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0], dim=-1)
+        double_area = torch.linalg.vector_norm(normals, dim=-1)
+        return normals / double_area.clamp_min(torch.finfo(x.dtype).tiny)[:, None], double_area
+
+    normals, double_area = _cached(cache, "reference_faces", (rest, pairs), reference_faces)
     face_features = torch.cat((((x[left].mean(dim=1) + x[right].mean(dim=1)) / 2 - center) / length_scale,
                                (x[right] - x[left]).mean(dim=1) / length_scale,
                                (v[right] - v[left]).mean(dim=1) / velocity_scale, normals,
@@ -205,7 +262,7 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
     mean_velocity = (v * mass[:, None]).sum(dim=0) / mass.sum() / velocity_scale
     body_features = torch.cat((extent, mean_velocity, (mass.sum() / mass_scale).log()[None],
                                (dt * velocity_scale / length_scale)[None]))[None]
-    contacts = _contact_pairs(batch, contact_radius)
+    contacts = _contact_pairs(batch, contact_radius, cache)
     contact_count = len(contacts)
     load_features = torch.cat(((x - center) / length_scale, torch.zeros_like(x), v / velocity_scale,
                                torch.zeros_like(mass[:, None]), force_delta, torch.zeros_like(mass[:, None])), dim=-1)
@@ -275,6 +332,7 @@ class TemporalDynamicsModel(nn.Module):
                            material_scale=list(material_scale), contact_radius=contact_radius,
                            learn_support_release=learn_support_release, flow_architecture=flow_architecture,
                            flow_layers=flow_layers, motion_prior=motion_prior)
+        self._graph_cache = DynamicsGraphCache()
         self.fracture_logit_offset = 0.0
         self.support_logit_offset = 0.0
         self.encoders = nn.ModuleDict({name: nn.Linear(width, hidden) for name, width in DYNAMICS_INPUT_DIMS.items()})
@@ -297,10 +355,11 @@ class TemporalDynamicsModel(nn.Module):
         nn.init.zeros_(self.support_head.bias)
 
     def encode(self, batch, proposal=None):
-        physical = constant_acceleration_prediction(batch) if self.config["motion_prior"] == "constant_acceleration" else None
-        graph = build_dynamics_graph(batch, **{key: self.config[key] for key in (
+        dt = _validated_batch(batch)
+        physical = _constant_acceleration_prediction(batch, dt) if self.config["motion_prior"] == "constant_acceleration" else None
+        graph = _build_dynamics_graph(batch, dt, **{key: self.config[key] for key in (
             "length_scale", "velocity_scale", "mass_scale", "material_scale", "contact_radius")}, proposal=proposal,
-                                     physical_proposal=physical)
+                                      physical_proposal=physical, cache=self._graph_cache)
         hidden = {name: F.gelu(self.encoders[name](features)) for name, features in graph.x_dict.items()}
         for layer, norms in zip(self.graph_layers, self.norms):
             updates = layer(hidden, graph.edge_index_dict)
@@ -349,14 +408,22 @@ class TemporalDynamicsModel(nn.Module):
     def forward(self, batch):
         return self._prediction(batch, *self.encode(batch))
 
+    def forward_with_flow_context(self, batch):
+        corner_context, face_context = self.encode(batch)
+        adjacency = _cached(self._graph_cache, "fracture_adjacency", (batch["face_pairs"],),
+                            lambda: build_fracture_adjacency(batch["face_pairs"]))
+        return self._prediction(batch, corner_context, face_context), FractureFlowContext(face_context, adjacency)
+
     def fracture_context(self, batch):
         return self.encode(batch)[1]
 
     def prepare_fracture_flow(self, batch):
-        return FractureFlowContext(self.fracture_context(batch), build_fracture_adjacency(batch["face_pairs"]))
+        adjacency = _cached(self._graph_cache, "fracture_adjacency", (batch["face_pairs"],),
+                            lambda: build_fracture_adjacency(batch["face_pairs"]))
+        return FractureFlowContext(self.fracture_context(batch), adjacency)
 
     def fracture_velocity(self, batch, field, time, context=None):
-        if field.shape != batch["broken"].shape or not torch.isfinite(field).all():
+        if field.shape != batch["broken"].shape:
             raise ValueError("fracture field must be finite with one value per internal face")
         if not field.is_floating_point() or field.dtype != batch["positions"].dtype or field.device != batch["positions"].device:
             raise ValueError("fracture field must share the floating point dtype and device of the current state")
@@ -365,7 +432,13 @@ class TemporalDynamicsModel(nn.Module):
         if features.shape != (len(field), self.config["hidden"]) or features.dtype != field.dtype or features.device != field.device:
             raise ValueError("fracture context must have one compatible hidden vector per face")
         time = torch.as_tensor(time, dtype=field.dtype, device=field.device)
-        if time.numel() != 1 or not torch.isfinite(time).all() or not 0 <= time.item() <= 1:
+        if time.numel() != 1:
+            raise ValueError("fracture flow time must be scalar in [0, 1]")
+        invalid_field, invalid_time = torch.stack((~torch.isfinite(field).all(),
+                                                   ~torch.isfinite(time).all() | (time < 0).any() | (time > 1).any())).detach().cpu().tolist()
+        if invalid_field:
+            raise ValueError("fracture field must be finite with one value per internal face")
+        if invalid_time:
             raise ValueError("fracture flow time must be scalar in [0, 1]")
         if not len(field):
             return field * 0

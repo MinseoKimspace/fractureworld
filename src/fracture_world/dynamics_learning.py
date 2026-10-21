@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from time import perf_counter
@@ -64,6 +65,39 @@ def transition_batch(trajectory, frame, device):
                        trajectory.metadata.get("conditioning_context", {}).get("floor_height_m"))
 
 
+class _TrainingTrajectory:
+    def __init__(self, trajectory, device):
+        self.base = transition_batch(trajectory, 0, device)
+        self.frames = {key: torch.tensor(np.array(getattr(trajectory, key), copy=True), dtype=dtype, device=device)
+                       for key, dtype in (("positions", torch.float32), ("velocities", torch.float32),
+                                          ("broken", torch.bool), ("fixed", torch.bool))}
+        self.timesteps = np.diff(trajectory.times)
+
+    def batch(self, frame):
+        return {**self.base, **{key: values[frame] for key, values in self.frames.items()},
+                "dt": float(self.timesteps[frame])}
+
+    def targets(self, frame):
+        return [self.frames[key][frame + 1] for key in ("positions", "velocities", "broken", "fixed")]
+
+
+class _TrainingMetrics:
+    names = ("loss", "motion", "fracture", "flow", "support_release")
+
+    def __init__(self, device):
+        self.sums = torch.zeros(len(self.names), dtype=torch.float64, device=device)
+        self.last = None
+        self.count = 0
+
+    def update(self, loss, terms):
+        self.last = torch.stack([loss.detach(), *(terms[key] for key in self.names[1:])]).to(torch.float64)
+        self.sums.add_(self.last)
+        self.count += 1
+
+    def scores(self):
+        return dict(zip(self.names, (self.sums / self.count).cpu().tolist())) if self.count else None
+
+
 def _scales(trajectories):
     length = max(float(np.linalg.norm(np.ptp(item.topology.mesh.nodes, axis=0))) for item in trajectories)
     velocity = max(item.velocity_rms if hasattr(item, "velocity_rms") else float(np.sqrt(np.mean(item.velocities**2)))
@@ -82,7 +116,11 @@ def _scales(trajectories):
 
 def _loss(model, batch, target_positions, target_velocities, target_broken, target_fixed, config, proposal=None,
           flow=True, fracture_positive_weight=1.0, support_positive_weight=1.0, return_output=False):
-    output = model(batch) if proposal is None else model(batch, proposal)
+    context = None
+    if flow and proposal is None and hasattr(model, "forward_with_flow_context"):
+        output, context = model.forward_with_flow_context(batch)
+    else:
+        output = model(batch) if proposal is None else model(batch, proposal)
     mass = batch["masses"] / batch["masses"].sum()
     velocity = model.config["velocity_scale"]
     position_error = ((output["positions"] - target_positions) / (batch["dt"] * velocity)).square().sum(dim=1)
@@ -101,7 +139,8 @@ def _loss(model, batch, target_positions, target_velocities, target_broken, targ
             destination = 2 * target - 1
             field = (1 - time) * noise + time * destination
             field = torch.where(batch["broken"], torch.ones_like(field), field)
-            prediction = model.fracture_velocity(batch, field, time)
+            prediction = (model.fracture_velocity(batch, field, time, context=context) if context is not None
+                          else model.fracture_velocity(batch, field, time))
             matching = (prediction[intact] - (destination - noise)[intact]).square().mean()
     support = motion.new_zeros(())
     if config.learn_support_release and batch["fixed"].any():
@@ -109,8 +148,8 @@ def _loss(model, batch, target_positions, target_velocities, target_broken, targ
         support = F.binary_cross_entropy_with_logits(output["support_release_logits"][batch["fixed"]], release,
                                                       pos_weight=motion.new_tensor(support_positive_weight))
     loss = motion + config.fracture_weight * fracture + config.flow_weight * matching + support
-    terms = dict(motion=float(motion.detach()), fracture=float(fracture.detach()), flow=float(matching.detach()),
-                 support_release=float(support.detach()))
+    terms = dict(motion=motion.detach(), fracture=fracture.detach(), flow=matching.detach(),
+                 support_release=support.detach())
     return (loss, terms, output) if return_output else (loss, terms)
 
 
@@ -125,16 +164,20 @@ def _validate_autoregressive_prediction(output, case_id, frame):
 
 
 def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor=None,
-                  fracture_positive_weight=1.0, support_positive_weight=1.0):
-    batch = transition_batch(trajectory, frame, device)
+                  fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None):
+    batch = transition_batch(trajectory, frame, device) if prepared is None else prepared.batch(frame)
     horizon = min(config.rollout_steps, len(trajectory) - frame)
     losses, components = [], []
     for offset in range(horizon):
-        target = trajectory.transition(frame + offset)
-        batch = {**batch, "dt": target.dt}
-        target_values = [torch.tensor(np.array(value, copy=True), dtype=dtype, device=device) for value, dtype in (
-            (target.target_positions, torch.float32), (target.target_velocities, torch.float32),
-            (target.target_broken, torch.bool), (target.target_fixed, torch.bool))]
+        if prepared is None:
+            target = trajectory.transition(frame + offset)
+            batch = {**batch, "dt": target.dt}
+            target_values = [torch.tensor(np.array(value, copy=True), dtype=dtype, device=device) for value, dtype in (
+                (target.target_positions, torch.float32), (target.target_velocities, torch.float32),
+                (target.target_broken, torch.bool), (target.target_fixed, torch.bool))]
+        else:
+            batch = {**batch, "dt": float(prepared.timesteps[frame + offset])}
+            target_values = prepared.targets(frame + offset)
         proposal = fixed_predictor(batch) if fixed_predictor is not None else None
         loss, terms, output = _loss(network, batch, *target_values, config, proposal,
                                     flow=fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
@@ -147,7 +190,8 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
         components.append(terms)
         batch = {**batch, "positions": output["positions"], "velocities": output["velocities"],
                  "broken": batch["broken"] | output["broken"], "fixed": batch["fixed"] & output["next_fixed"]}
-    return torch.stack(losses).mean(), {key: float(np.mean([item[key] for item in components])) for key in components[0]}
+    return torch.stack(losses).mean(), {key: torch.stack([item[key] for item in components]).mean(dtype=torch.float64)
+                                      for key in components[0]}
 
 
 def train_dynamics(data_dir, output_dir, config):
@@ -243,38 +287,63 @@ def train_dynamics(data_dir, output_dir, config):
         best, best_state = float("inf"), None
         last_progress = perf_counter()
         for epoch in range(epochs):
+            epoch_started = perf_counter()
             scores = {}
+            timings = {}
             for name in ("train", "validation"):
+                split_started = perf_counter()
                 is_training = name == "train"
                 network.train(is_training)
-                total, components = [], []
+                metrics = _TrainingMetrics(device)
+                window_count = sum(len(item) for item in splits[name])
+                prepare_seconds = 0.0
+                interval_started, interval_windows = split_started, 0
                 for case_index, trajectory in enumerate(splits[name], start=1):
+                    prepare_started = perf_counter()
+                    prepared = _TrainingTrajectory(trajectory, device)
+                    prepare_seconds += perf_counter() - prepare_started
                     order = np.random.permutation(len(trajectory)) if is_training else range(len(trajectory))
                     for transition_index, frame in enumerate(order, start=1):
                         with torch.set_grad_enabled(is_training):
                             loss, terms = _rollout_loss(network, trajectory, int(frame), device, config,
                                                         fixed_predictor=fixed_predictor,
                                                         fracture_positive_weight=fracture_positive_weight,
-                                                        support_positive_weight=support_positive_weight)
+                                                        support_positive_weight=support_positive_weight, prepared=prepared)
                             if is_training:
                                 optimizer.zero_grad(set_to_none=True)
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0, error_if_nonfinite=True)
                                 optimizer.step()
-                        total.append(float(loss.detach()))
-                        components.append(terms)
+                        metrics.update(loss, terms)
                         if perf_counter() - last_progress >= 5:
+                            current_loss = float(metrics.last[0])
+                            now = perf_counter()
+                            elapsed = now - split_started
+                            seconds_per_window = elapsed / metrics.count
+                            interval_count = metrics.count - interval_windows
                             print(json.dumps(dict(event="training_progress", stage=stage, epoch=epoch + 1,
+                                                  timestamp=datetime.now(timezone.utc).isoformat(),
                                                   split=name, case=trajectory.case_id, case_index=case_index,
                                                   cases=len(splits[name]), transition=transition_index,
                                                   transitions=len(trajectory), rollout_steps=config.rollout_steps,
-                                                  loss=total[-1], device=str(device)),
+                                                  windows_completed=metrics.count, windows_total=window_count,
+                                                  elapsed_seconds=elapsed, seconds_per_window=seconds_per_window,
+                                                  interval_seconds_per_window=(now - interval_started) / interval_count,
+                                                  eta_seconds=(window_count - metrics.count) * seconds_per_window,
+                                                  data_prepare_seconds=prepare_seconds,
+                                                  loss=current_loss, device=str(device)),
                                              allow_nan=False), flush=True)
-                            last_progress = perf_counter()
-                scores[name] = {"loss": float(np.mean(total)),
-                                **{key: float(np.mean([item[key] for item in components])) for key in components[0]}} if total else None
+                            last_progress = interval_started = perf_counter()
+                            interval_windows = metrics.count
+                    del prepared
+                scores[name] = metrics.scores()
+                timings[name] = dict(seconds=perf_counter() - split_started, windows=metrics.count,
+                                     data_prepare_seconds=prepare_seconds)
+                if metrics.count:
+                    timings[name]["seconds_per_window"] = timings[name]["seconds"] / metrics.count
             criterion = (scores["validation"] or scores["train"])["loss"]
             record = dict(stage=stage, epoch=epoch + 1, losses=scores, seconds=perf_counter() - started,
+                          epoch_seconds=perf_counter() - epoch_started, split_timing=timings,
                           device=str(device), overfit_debug=config.overfit, rollout_steps=config.rollout_steps)
             with (directory / "training.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, allow_nan=False) + "\n")
