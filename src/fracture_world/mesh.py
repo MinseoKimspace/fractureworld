@@ -1,7 +1,46 @@
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+from .partition import component_labels
+
+
+FEMFX_MAX_TETRAHEDRON_ASPECT_RATIO = 25.0
+
+
+def tetrahedron_aspect_ratios(nodes, tets):
+    vertices = np.asarray(nodes, dtype=float)[np.asarray(tets)]
+    vertices = vertices - vertices[:, :1]
+    scale = np.max(np.abs(vertices), axis=(1, 2))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vertices = vertices / scale[:, None, None]
+    edges = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]])
+    lengths = np.linalg.norm(vertices[:, edges[:, 1]] - vertices[:, edges[:, 0]], axis=-1)
+    face_ids = np.array([[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]])
+    faces = vertices[:, face_ids]
+    double_areas = np.linalg.norm(np.cross(faces[:, :, 1] - faces[:, :, 0],
+                                          faces[:, :, 2] - faces[:, :, 0]), axis=-1)
+    six_volumes = np.abs(np.linalg.det(vertices[:, 1:] - vertices[:, :1]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return lengths.max(axis=1) * double_areas.max(axis=1) / six_volumes
+
+
+def rigid_pose(nodes, pose=None):
+    nodes = np.asarray(nodes, dtype=float)
+    if pose is None:
+        return nodes.copy()
+    if not isinstance(pose, dict) or set(pose) != {"rotation_xyzw", "translation"}:
+        raise ValueError("initial_pose requires rotation_xyzw and translation")
+    quaternion = np.asarray(pose["rotation_xyzw"], dtype=float)
+    translation = np.asarray(pose["translation"], dtype=float)
+    if quaternion.shape != (4,) or translation.shape != (3,) or not np.isfinite(np.r_[quaternion, translation]).all():
+        raise ValueError("initial pose must contain finite quaternion and translation vectors")
+    if not np.isclose(np.linalg.norm(quaternion), 1.0, rtol=1e-10, atol=1e-12):
+        raise ValueError("initial rotation quaternion must have unit length")
+    return Rotation.from_quat(quaternion).apply(nodes) + translation
 
 
 @dataclass(frozen=True)
@@ -84,9 +123,34 @@ class VolumeMesh:
     def internal_faces(self):
         return np.flatnonzero(self.faces.cells[:, 1] >= 0)
 
+    @cached_property
+    def tetrahedron_aspect_ratios(self):
+        result = tetrahedron_aspect_ratios(self.nodes, self.tets)
+        result.setflags(write=False)
+        return result
+
     @property
     def dual_edges(self):
         return self.faces.cells[self.internal_faces].copy()
+
+    @cached_property
+    def corner_face_pairs(self):
+        cells = self.dual_edges
+        vertices = self.faces.vertices[self.internal_faces]
+        sides = []
+        for side in range(2):
+            local = np.argmax(self.tets[cells[:, side], :, None] == vertices[:, None, :], axis=1)
+            sides.append(4 * cells[:, side, None] + local)
+        pairs = np.stack(sides, axis=-1)
+        pairs.setflags(write=False)
+        return pairs
+
+    def corner_groups(self, broken):
+        broken = np.asarray(broken, dtype=bool)
+        if broken.shape != (len(self.internal_faces),):
+            raise ValueError("broken must contain one flag per internal material face")
+        pairs = self.corner_face_pairs[~broken].reshape(-1, 2)
+        return component_labels(4 * len(self.tets), pairs, np.zeros(len(pairs), dtype=bool))
 
     def save(self, path: str | Path):
         np.savez_compressed(path, nodes=self.nodes, tets=self.tets)

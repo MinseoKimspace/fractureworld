@@ -30,17 +30,26 @@ def parser():
     suite = commands.add_parser("dynamics-suite", help="Create explicit native loading sweeps without fabricating fracture or support labels")
     suite.add_argument("--specification", type=Path, required=True)
     suite.add_argument("--output", type=Path, required=True)
+    drops = commands.add_parser("drop-suite", help="Prepare solid geometry and explicit free-fall impact-window cases")
+    drops.add_argument("--shape", required=True)
+    drops.add_argument("--surface", type=Path)
+    drops.add_argument("--specification", type=Path, required=True)
+    drops.add_argument("--output", type=Path, required=True)
     readiness = commands.add_parser("dynamics-inspect", help="Check actual fracture/release event coverage in disjoint training, validation and test cases")
     readiness.add_argument("--data", type=Path, required=True)
     readiness.add_argument("--seed", type=int, default=17)
     readiness.add_argument("--min-post-event-steps", type=int, default=1)
     readiness.add_argument("--event-stratified", action="store_true")
+    readiness.add_argument("--split-unit", choices=["loading_condition", "shape_family"], default="loading_condition")
+    readiness.add_argument("--stream-data", action="store_true")
     readiness.add_argument("--output", type=Path)
     dynamics_training = commands.add_parser("dynamics-train", help="Train engine-free motion, irreversible fracture flow and optional support release")
     dynamics_training.add_argument("--data", type=Path, required=True)
     dynamics_training.add_argument("--output", type=Path, required=True)
     dynamics_training.add_argument("--epochs", type=int, required=True)
     dynamics_training.add_argument("--corrector-epochs", type=int, default=0)
+    dynamics_training.add_argument("--rollout-steps", type=int, default=1,
+                                   help="Autoregressive training window length; only its initial state is observed")
     dynamics_training.add_argument("--hidden", type=int, default=48)
     dynamics_training.add_argument("--heads", type=int, default=3)
     dynamics_training.add_argument("--graph-layers", type=int, default=2)
@@ -57,6 +66,9 @@ def parser():
     dynamics_training.add_argument("--require-event-coverage", action="store_true")
     dynamics_training.add_argument("--min-post-event-steps", type=int, default=10)
     dynamics_training.add_argument("--event-stratified", action="store_true")
+    dynamics_training.add_argument("--split-unit", choices=["loading_condition", "shape_family"], default="loading_condition")
+    dynamics_training.add_argument("--motion-prior", choices=["backward_euler", "constant_acceleration"], default="constant_acceleration")
+    dynamics_training.add_argument("--stream-data", action="store_true")
     initial = commands.add_parser("dynamics-initial", help="Export only one current state, without teacher future arrays")
     initial.add_argument("--case", type=Path, required=True)
     initial.add_argument("--trajectory", type=Path, required=True)
@@ -72,9 +84,9 @@ def parser():
         command.add_argument("--specification", type=Path)
         command.add_argument("--device", default="auto")
         if name == "dynamics-rollout":
-            command.add_argument("--method", choices=["raw", "neural", "central", "consensus"], default="consensus")
+            command.add_argument("--method", choices=["physics", "raw", "neural", "central", "consensus"], default="consensus")
         else:
-            command.add_argument("--methods", nargs="+", choices=["raw", "neural", "central", "consensus"])
+            command.add_argument("--methods", nargs="+", choices=["physics", "raw", "neural", "central", "consensus"])
             command.add_argument("--reference-case", type=Path)
             command.add_argument("--reference-trajectory", type=Path)
     dynamics_evaluation = commands.add_parser("dynamics-evaluate", help="Evaluate frozen neural rollouts against held-out numerical trajectories")
@@ -82,6 +94,15 @@ def parser():
     dynamics_evaluation.add_argument("--case", type=Path, required=True)
     dynamics_evaluation.add_argument("--trajectory", type=Path)
     dynamics_evaluation.add_argument("--output", type=Path)
+    benchmark = commands.add_parser("dynamics-benchmark", help="Evaluate all held-out cases with separate positive-fracture metrics")
+    benchmark.add_argument("--checkpoint", type=Path, required=True)
+    benchmark.add_argument("--data", type=Path, required=True)
+    benchmark.add_argument("--output", type=Path, required=True)
+    benchmark.add_argument("--steps", type=int, required=True)
+    benchmark.add_argument("--specification", type=Path)
+    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument("--split", choices=["validation", "test"], default="test")
+    benchmark.add_argument("--methods", nargs="+", choices=["physics", "raw", "neural", "central", "consensus"])
     return root
 
 
@@ -123,12 +144,17 @@ def run(args):
         from .dynamics_generator import create_dynamics_suite
 
         output(create_dynamics_suite(args.output, args.specification))
+    elif args.command == "drop-suite":
+        from .drop_generator import create_drop_suite
+
+        output(create_drop_suite(args.output, args.specification, args.shape, args.surface))
     elif args.command == "dynamics-inspect":
         from .dynamics_readiness import inspect_dynamics_dataset
         from .io import write_json
 
         report = inspect_dynamics_dataset(args.data, args.seed, min_post_event_steps=args.min_post_event_steps,
-                                          event_stratified=args.event_stratified)
+                                          event_stratified=args.event_stratified, split_unit=args.split_unit,
+                                          stream_data=args.stream_data)
         if args.output:
             if args.output.exists():
                 raise ValueError("inspection output already exists")
@@ -165,6 +191,15 @@ def run(args):
         from .dynamics_evaluation import evaluate_dynamics
 
         output(evaluate_dynamics(args.rollout, args.case, args.trajectory, args.output))
+    elif args.command == "dynamics-benchmark":
+        from .dynamics_experiment import benchmark_dynamics
+        from .dynamics_runtime import load_rollout_config
+
+        progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
+        report = benchmark_dynamics(args.checkpoint, args.data, args.output, args.steps,
+                                    load_rollout_config(args.specification), args.device, args.methods, args.split, progress)
+        output(dict(report=str((args.output / "benchmark.json").resolve()), cases=len(report["cases"]),
+                    all_rollouts_completed=report["all_rollouts_completed"], conditions=report["conditions"]))
 
 
 

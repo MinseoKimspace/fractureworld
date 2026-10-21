@@ -55,7 +55,7 @@ def test_actual_engine_free_rollout_advances_all_methods_on_portable_current_sta
     checkpoint, initial, topology, _ = portable_rollout_inputs(tmp_path)
     directory = tmp_path / method
     config = RolloutConfig(fracture_samples=1, flow_steps=1, max_iterations=10000, max_contact_iterations=3,
-                           absolute_tolerance=1.e-10, relative_tolerance=1.e-9)
+                           absolute_tolerance=1.e-10, relative_tolerance=1.e-9, fracture_policy="marginal_search")
     report = rollout_dynamics(checkpoint, initial, directory, 2, method, config, "cpu")
     assert report["status"] == "completed"
     assert report["completed_steps"] == 2
@@ -89,7 +89,8 @@ def test_all_methods_receive_the_same_first_step_fracture_candidate_pool(tmp_pat
 
 def test_old_fractures_are_irreversible_and_positive_release_evidence_is_reported_honestly(tmp_path):
     checkpoint, initial, _, fixed = portable_rollout_inputs(tmp_path, broken=True, learned_supports=True)
-    report = rollout_dynamics(checkpoint, initial, tmp_path / "released", 1, "raw", RolloutConfig(fracture_samples=0), "cpu")
+    report = rollout_dynamics(checkpoint, initial, tmp_path / "released", 1, "raw",
+                              RolloutConfig(fracture_samples=0, fracture_policy="marginal_search"), "cpu")
     assert report["completed_steps"] == 1
     assert not report["learned_support_release_has_positive_training_examples"]
     with np.load(tmp_path / "released" / "trajectory.npz", allow_pickle=False) as archive:
@@ -148,12 +149,17 @@ def test_cancelled_rollout_saves_initial_frame_without_committing_a_step(tmp_pat
     assert report["status"] == "interrupted"
     assert report["completed_steps"] == 0
     assert report["predictor_calls"] == 0
+    assert report["checked_constraint_steps"] == 0
+    assert report["all_committed_geometry_valid"] is None
+    assert report["all_committed_energy_valid"] is None
+    assert report["all_committed_swept_geometry_valid"] is None
     assert (tmp_path / "cancelled" / "trajectory.npz").is_file()
 
 
 def test_replay_records_each_frame_supports_components_and_both_crack_sides(tmp_path):
     checkpoint, initial, _, fixed = portable_rollout_inputs(tmp_path, broken=True, learned_supports=True)
-    rollout_dynamics(checkpoint, initial, tmp_path / "rendered", 1, "raw", RolloutConfig(fracture_samples=0), "cpu")
+    rollout_dynamics(checkpoint, initial, tmp_path / "rendered", 1, "raw",
+                     RolloutConfig(fracture_samples=0, fracture_policy="marginal_search"), "cpu")
     replay = json.loads((tmp_path / "rendered" / "replay.json").read_text())
     before = replay["frames"][0]["geometries"][0]
     after = replay["frames"][1]["geometries"][0]
@@ -169,3 +175,52 @@ def test_replay_records_each_frame_supports_components_and_both_crack_sides(tmp_
 def test_shared_flow_policy_rejects_ambiguous_candidate_count(samples):
     with pytest.raises(ValueError, match="exactly one"):
         RolloutConfig(fracture_samples=samples, fracture_policy="shared_sample")
+
+
+def test_default_fracture_policy_uses_only_flow_samples():
+    assert RolloutConfig().fracture_policy == "fm_search"
+    with pytest.raises(ValueError, match="at least one"):
+        RolloutConfig(fracture_samples=0)
+    assert RolloutConfig(fracture_policy="marginal_search", fracture_samples=0).fracture_policy == "marginal_search"
+
+
+@pytest.mark.parametrize("stage", ["predictor", "neural"])
+@pytest.mark.parametrize("field", ["positions", "velocities", "position_increment", "velocity_increment",
+                                   "fracture_probability", "support_release_probability"])
+def test_nonfinite_predictions_save_failure_report_before_geometry_or_optimization(tmp_path, monkeypatch, stage, field):
+    checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
+    network = TemporalDynamicsModel if stage == "predictor" else NeuralDynamicsCorrector
+    original = network.forward
+
+    def corrupted(self, *args, **kwargs):
+        output = original(self, *args, **kwargs)
+        source = output.get(field, output["positions"])
+        output[field] = torch.full_like(source, float("nan"))
+        return output
+
+    monkeypatch.setattr(network, "forward", corrupted)
+    method = "consensus" if stage == "predictor" else "neural"
+    directory = tmp_path / "failed"
+    report = rollout_dynamics(checkpoint, initial, directory, 3, method, device="cpu")
+    assert report["status"] == "nonfinite_prediction"
+    assert report["completed_steps"] == 0
+    assert report["optimization_solves"] == 0
+    assert report["events"][-1]["status"] == "nonfinite_prediction"
+    assert field in report["events"][-1]["reason"]
+    assert report["all_committed_geometry_valid"] is None
+    assert report["all_committed_energy_valid"] is None
+    assert report["all_committed_swept_geometry_valid"] is None
+    assert json.loads((directory / "report.json").read_text())["status"] == "nonfinite_prediction"
+    with np.load(directory / "trajectory.npz", allow_pickle=False) as archive:
+        assert len(archive["times"]) == 1
+        assert np.isfinite(archive["positions"]).all()
+        assert np.isfinite(archive["velocities"]).all()
+
+
+def test_nonfinite_flow_sample_is_not_silently_thresholded_into_an_unbroken_mask(tmp_path, monkeypatch):
+    checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
+    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise: torch.full_like(noise, float("nan")))
+    report = rollout_dynamics(checkpoint, initial, tmp_path / "failed-flow", 1, "raw", device="cpu")
+    assert report["status"] == "nonfinite_prediction"
+    assert report["completed_steps"] == 0
+    assert "sampled fracture field" in report["events"][-1]["reason"]

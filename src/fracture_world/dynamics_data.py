@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -7,7 +8,7 @@ import numpy as np
 
 from .data import _mesh_digest, load_prepared_case
 from .io import file_hash
-from .mesh import VolumeMesh
+from .mesh import VolumeMesh, rigid_pose
 
 
 def _frozen(values, dtype=None):
@@ -45,12 +46,7 @@ def material_topology(mesh, density):
     if not np.isscalar(density) or not np.isfinite(density) or density <= 0:
         raise ValueError("rest density must be finite and positive")
     corner_ids = np.arange(len(mesh.tets) * 4).reshape(-1, 4)
-    faces = mesh.faces.vertices[mesh.internal_faces]
-    owners = mesh.dual_edges
-    pairs = np.empty((len(faces), 3, 2), dtype=np.int64)
-    for side in (0, 1):
-        local = np.argmax(mesh.tets[owners[:, side], :, None] == faces[:, None, :], axis=1)
-        pairs[:, :, side] = owners[:, side, None] * 4 + local
+    pairs = mesh.corner_face_pairs
     return MaterialTopology(
         mesh, _frozen(mesh.nodes[mesh.tets].reshape(-1, 3)),
         _frozen(np.repeat(mesh.volumes * density / 4, 4)), _frozen(corner_ids),
@@ -89,6 +85,11 @@ class DynamicsTrajectory:
     case_id: str
     condition_digest: str
     metadata: dict
+
+    @property
+    def shape_family(self):
+        context = self.metadata.get("conditioning_context", {})
+        return self.metadata.get("shape_family", context.get("shape_family", self.topology.fingerprint))
 
     def __len__(self):
         return len(self.times) - 1
@@ -136,16 +137,26 @@ def _context(case):
         raise ValueError("fixed material vertex indices are invalid")
     if len(np.unique(fixed)) != len(fixed):
         raise ValueError("fixed material vertex indices must be unique")
-    if context.get("loading") != "instantaneous_vertex_impulses":
-        raise ValueError("only explicitly recorded initial vertex impulses are supported")
+    if context.get("loading") not in {"instantaneous_vertex_impulses", "gravity_driven_drop"}:
+        raise ValueError("only explicitly recorded initial impulses and gravity-driven drops are supported")
+    if context.get("loading") == "gravity_driven_drop":
+        floor = context.get("floor_height_m")
+        bounds = context.get("scene_options", {}).get("collision_bounds", [])
+        if fixed.size or gravity[1] >= 0 or gravity[0] != 0 or gravity[2] != 0:
+            raise ValueError("drop references require free supports and downward Y gravity")
+        if not isinstance(floor, (int, float)) or not np.isfinite(floor) or len(bounds) != 6 or bounds[2] != floor:
+            raise ValueError("drop references require a recorded native floor plane")
     return context, material, gravity, fixed.astype(np.int64)
 
 
 def _loading(case, topology, fixed):
     momentum = np.zeros_like(case.mesh.nodes)
     impulses = case.metadata.get("case", {}).get("vertex_impulses")
-    if not isinstance(impulses, list) or not impulses:
+    loading = case.metadata["conditioning_context"]["loading"]
+    if not isinstance(impulses, list) or (not impulses and loading != "gravity_driven_drop"):
         raise ValueError("dynamics case requires initial vertex impulses")
+    if loading == "gravity_driven_drop" and (impulses or "initial_pose" not in case.metadata["case"]):
+        raise ValueError("drop references require an explicit rigid initial pose and no impulses")
     for item in impulses:
         vertex, impulse = item.get("vertex"), np.asarray(item.get("impulse"), dtype=float)
         if isinstance(vertex, bool) or not isinstance(vertex, int) or not 0 <= vertex < len(momentum) or vertex in fixed:
@@ -156,14 +167,22 @@ def _loading(case, topology, fixed):
     nodal_mass = np.bincount(case.mesh.tets.ravel(), weights=topology.masses, minlength=len(momentum))
     if (nodal_mass <= 0).any():
         raise ValueError("every material vertex must have positive rest mass")
-    velocity = momentum / nodal_mass[:, None]
+    rigid_velocity = np.asarray(case.metadata["case"].get("initial_linear_velocity", [0.0, 0.0, 0.0]), dtype=float)
+    if rigid_velocity.shape != (3,) or not np.isfinite(rigid_velocity).all() or (np.any(rigid_velocity) and len(fixed)):
+        raise ValueError("rigid initial velocity must be finite and preserve prescribed supports")
+    velocity = momentum / nodal_mass[:, None] + rigid_velocity
     initial_impulses = topology.masses[:, None] * velocity[case.mesh.tets].reshape(-1, 3)
     canonical = {**case.metadata["conditioning_context"]}
-    for key in ("dt", "steps", "threads", "native_revision", "binding_sha256"):
+    for key in ("dt", "steps", "threads", "native_revision", "binding_sha256", "shape_id", "shape_family", "geometry_source"):
         canonical.pop(key, None)
     active = np.flatnonzero(np.linalg.norm(momentum, axis=1) > 0)
-    if not len(active):
+    if not len(active) and impulses:
         raise ValueError("initial vertex impulses cancel exactly")
+    pose = case.metadata["case"].get("initial_pose")
+    if pose is not None:
+        canonical["initial_pose"] = rigid_pose(case.mesh.nodes, pose).tolist()
+    if np.any(rigid_velocity):
+        canonical["initial_linear_velocity"] = rigid_velocity.tolist()
     canonical["initial_momentum"] = [[int(vertex), *momentum[vertex].tolist()] for vertex in active]
     return velocity, initial_impulses, _digest(canonical)
 
@@ -194,7 +213,8 @@ def _validate_history(arrays, case, topology, context, fixed, initial_velocity):
         raise ValueError("fracture history must contain one binary integer per internal facet")
     if cuts[0].any() or (np.diff(cuts.astype(np.int64), axis=0) < 0).any() or not np.array_equal(cuts[-1], case.cut_labels):
         raise ValueError("fracture history must start intact, remain irreversible and match final labels")
-    if not np.array_equal(positions[0], case.mesh.nodes.astype(np.float32)[case.mesh.tets]):
+    initial_nodes = rigid_pose(case.mesh.nodes, case.metadata["case"].get("initial_pose"))
+    if not np.array_equal(positions[0], initial_nodes.astype(np.float32)[case.mesh.tets]):
         raise ValueError("initial corner positions differ from the source material mesh")
     if not np.array_equal(velocities[0], initial_velocity.astype(np.float32)[case.mesh.tets]):
         raise ValueError("initial corner velocities differ from the recorded loading case")
@@ -246,6 +266,10 @@ def _support_history(arrays, case, topology, positions, velocities, broken, fixe
         pairs = ids[topology.face_pairs]
         if not np.array_equal(np.all(pairs[:, :, 0] == pairs[:, :, 1], axis=1), ~broken[frame]):
             raise ValueError("native topology disagrees with fracture history")
+        groups = case.mesh.corner_groups(broken[frame])
+        memberships = np.unique(np.column_stack((groups, ids)), axis=0)
+        if len(memberships) != len(np.unique(groups)) or len(memberships) != count:
+            raise ValueError("native corner connectivity cannot be represented by the recorded face-cut state")
         for values in (positions, velocities):
             intact_pairs = topology.face_pairs[~broken[frame]]
             if not np.array_equal(values[frame, intact_pairs[:, :, 0]], values[frame, intact_pairs[:, :, 1]]):
@@ -308,42 +332,159 @@ def load_dynamics_trajectory(case_path, trajectory_path=None):
                               _frozen(times), _frozen(gravity), dict(material), _frozen(impulses), case_path.stem, condition, metadata)
 
 
-def load_dynamics_dataset(directory):
-    paths = sorted((Path(directory) / "cases").glob("*.npz"))
+@lru_cache(maxsize=1)
+def _streamed_case(path, source_hashes):
+    item = load_dynamics_trajectory(path)
+    if tuple(sorted(item.metadata["source_hashes"].items())) != source_hashes:
+        raise RuntimeError("streamed source changed after dataset indexing")
+    return item
+
+
+def supervision_counts(item):
+    if isinstance(item, StreamedDynamicsTrajectory):
+        return item.event_counts
+    return dict(fracture_positive=int(np.count_nonzero(~item.broken[:-1] & item.broken[1:])),
+                fracture_negative=int(np.count_nonzero(~item.broken[:-1] & ~item.broken[1:])),
+                support_positive=int(np.count_nonzero(item.fixed[:-1] & ~item.fixed[1:])),
+                support_negative=int(np.count_nonzero(item.fixed[:-1] & item.fixed[1:])))
+
+
+@dataclass(frozen=True)
+class StreamedDynamicsTrajectory:
+    case_path: Path
+    topology: MaterialTopology
+    case_id: str
+    condition_digest: str
+    metadata: dict
+    transitions: int
+    velocity_rms: float
+    event_counts: dict
+    times: np.ndarray
+
+    @property
+    def shape_family(self):
+        context = self.metadata.get("conditioning_context", {})
+        return self.metadata.get("shape_family", context.get("shape_family", self.topology.fingerprint))
+
+    def __len__(self):
+        return self.transitions
+
+    def _load(self):
+        return _streamed_case(self.case_path, tuple(sorted(self.metadata["source_hashes"].items())))
+
+    def __getattr__(self, name):
+        if name == "material":
+            return self.metadata["conditioning_context"]["material"]
+        if name == "gravity":
+            return np.asarray(self.metadata["conditioning_context"]["gravity"], dtype=float)
+        if name in {"positions", "velocities", "broken", "fixed", "initial_impulses"}:
+            return getattr(self._load(), name)
+        raise AttributeError(name)
+
+    def transition(self, frame):
+        return self._load().transition(frame)
+
+
+def load_dynamics_dataset(directory, *, stream=False):
+    directory = Path(directory).resolve()
+    if directory.is_file():
+        specification = json.loads(directory.read_text(encoding="utf-8"))
+        if not isinstance(specification, dict) or specification.get("schema") != "fracture-world.dynamics-collection.v1":
+            raise ValueError("unsupported dynamics collection schema")
+        entries = specification.get("datasets")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("a dynamics collection requires a nonempty datasets list")
+        trajectories, seen = [], set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) - {"path", "shape_family", "split"}:
+                raise ValueError("collection entries require path, shape_family and optional split")
+            if not isinstance(entry.get("path"), str) or not isinstance(entry.get("shape_family"), str) or not entry["shape_family"].strip():
+                raise ValueError("collection paths and shape families must be nonempty strings")
+            source = (directory.parent / entry["path"]).resolve()
+            if source in seen or not source.is_dir():
+                raise ValueError("collection entries must select distinct generated dataset directories")
+            seen.add(source)
+            if "split" in entry and entry["split"] not in {"train", "validation", "test"}:
+                raise ValueError("collection split must select train, validation or test")
+            for item in load_dynamics_dataset(source, stream=stream):
+                context = item.metadata.get("conditioning_context", {})
+                if "shape_family" in context and context["shape_family"] != entry["shape_family"]:
+                    raise ValueError("collection shape family differs from the recorded geometry source")
+                metadata = {**item.metadata, "shape_family": entry["shape_family"], "source_dataset": str(source)}
+                if "split" in entry:
+                    metadata["dataset_split"] = entry["split"]
+                trajectories.append(replace(item, metadata=metadata))
+        validate_dynamics_compatibility(trajectories, allow_mixed_meshes=True)
+        return trajectories
+    paths = sorted((directory / "cases").glob("*.npz"))
     if not paths:
         raise ValueError("no native dynamics cases were found")
-    trajectories = [load_dynamics_trajectory(path) for path in paths]
+    trajectories, topologies = [], {}
+    for path in paths:
+        item = load_dynamics_trajectory(path)
+        topology_key = (item.topology.fingerprint, item.material["rest_density"])
+        topology = topologies.setdefault(topology_key, item.topology)
+        if stream:
+            trajectories.append(StreamedDynamicsTrajectory(path.resolve(), topology, item.case_id, item.condition_digest,
+                                                           item.metadata, len(item), float(np.sqrt(np.mean(item.velocities**2))),
+                                                           supervision_counts(item), item.times))
+        else:
+            trajectories.append(replace(item, topology=topology))
     validate_dynamics_compatibility(trajectories)
     return trajectories
 
 
-def validate_dynamics_compatibility(trajectories):
+def validate_dynamics_compatibility(trajectories, *, allow_mixed_meshes=False):
     trajectories = list(trajectories)
     if not trajectories:
         raise ValueError("dynamics dataset must contain at least one loading case")
     reference = trajectories[0]
     if len({item.case_id for item in trajectories}) != len(trajectories):
         raise ValueError("dynamics dataset contains duplicate case IDs")
-    if any(item.topology.fingerprint != reference.topology.fingerprint for item in trajectories):
+    if not allow_mixed_meshes and any(item.topology.fingerprint != reference.topology.fingerprint for item in trajectories):
         raise ValueError("the first dynamics model requires one compatible material mesh")
+    families = {}
+    for item in trajectories:
+        if not isinstance(item.shape_family, str) or not item.shape_family.strip():
+            raise ValueError("shape families must be nonempty strings")
+        previous = families.setdefault(item.topology.fingerprint, item.shape_family)
+        if previous != item.shape_family:
+            raise ValueError("the same material mesh cannot belong to different shape families")
     return reference.topology
 
 
-def split_dynamics_cases(trajectories, seed=17, overfit=False, event_stratified=False):
+def split_dynamics_cases(trajectories, seed=17, overfit=False, event_stratified=False, split_unit="loading_condition"):
     trajectories = list(trajectories)
-    validate_dynamics_compatibility(trajectories)
+    validate_dynamics_compatibility(trajectories, allow_mixed_meshes=True)
+    if split_unit not in {"loading_condition", "shape_family"}:
+        raise ValueError("split_unit must select loading_condition or shape_family")
     if overfit:
         return {"train": sorted(trajectories, key=lambda item: item.case_id), "validation": [], "test": []}
+    assignments = [item.metadata.get("dataset_split") for item in trajectories]
+    if any(value is not None for value in assignments):
+        if split_unit != "shape_family" or any(value not in {"train", "validation", "test"} for value in assignments):
+            raise ValueError("explicit collection splits require shape_family splitting and an assignment for every dataset")
+        family_splits = {}
+        for item, assignment in zip(trajectories, assignments, strict=True):
+            if family_splits.setdefault(item.shape_family, assignment) != assignment:
+                raise ValueError("shape-family leakage across explicit dataset splits")
+        if set(family_splits.values()) != {"train", "validation", "test"}:
+            raise ValueError("explicit collections require nonempty train, validation and test shape families")
+        return {name: sorted((item for item in trajectories if item.metadata["dataset_split"] == name), key=lambda item: item.case_id)
+                for name in ("train", "validation", "test")}
     groups = {}
     for item in trajectories:
-        groups.setdefault(item.condition_digest, []).append(item)
+        key = item.shape_family if split_unit == "shape_family" else item.condition_digest
+        groups.setdefault(key, []).append(item)
     if len(groups) < 3:
-        raise ValueError("held-out dynamics training requires at least three distinct loading conditions; overfit enables debugging")
+        unit = "shape families" if split_unit == "shape_family" else "loading conditions"
+        raise ValueError(f"held-out dynamics training requires at least three distinct {unit}; overfit enables debugging")
     strata = {}
     for condition, rows in groups.items():
+        counts = [supervision_counts(item) for item in rows] if event_stratified else []
         stratum = (
-            any(np.any(~item.broken[:-1] & item.broken[1:]) for item in rows),
-            any(np.any(item.fixed[:-1] & ~item.fixed[1:]) for item in rows),
+            any(item["fracture_positive"] for item in counts),
+            any(item["support_positive"] for item in counts),
         ) if event_stratified else None
         strata.setdefault(stratum, []).append(condition)
     selections = dict(validation=[], test=[], train=[])

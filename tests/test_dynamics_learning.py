@@ -10,6 +10,7 @@ from fracture_world.dynamics_data import load_dynamics_trajectory, split_dynamic
 from fracture_world.dynamics_learning import (
     DynamicsTrainingConfig,
     _loss,
+    _rollout_loss,
     _scales,
     load_dynamics_model,
     train_dynamics,
@@ -35,7 +36,7 @@ def test_required_event_coverage_rejects_debug_data_with_structured_reasons(tmp_
 def test_recorded_data_trains_predictor_corrector_and_reloads_release_supervision(tmp_path):
     data = tmp_path / "data"
     recorded_trajectory(data, supports=True)
-    checkpoint_path = train_dynamics(data, tmp_path / "trained", training_config())
+    checkpoint_path = train_dynamics(data, tmp_path / "trained", training_config(rollout_steps=2))
     model, corrector, checkpoint, device = load_dynamics_model(checkpoint_path, "cpu")
     assert device.type == "cpu"
     assert corrector is not None
@@ -46,6 +47,8 @@ def test_recorded_data_trains_predictor_corrector_and_reloads_release_supervisio
     assert checkpoint["class_weights"]["support_release_positive"] == 3.5
     assert checkpoint["runtime_engine_calls"] == 0
     assert checkpoint["training"]["overfit"]
+    assert checkpoint["training"]["rollout_steps"] == 2
+    assert checkpoint["training_window_steps"] == 2
     assert checkpoint["condition_splits"]["validation"] == []
     records = [json.loads(line) for line in (tmp_path / "trained" / "training.jsonl").read_text().splitlines()]
     assert [record["stage"] for record in records] == ["predictor", "neural_corrector"]
@@ -119,3 +122,119 @@ def test_support_release_training_requires_explicit_option(tmp_path):
     recorded_trajectory(tmp_path / "data", supports=True)
     with pytest.raises(ValueError, match="support release"):
         train_dynamics(tmp_path / "data", tmp_path / "trained", training_config(learn_support_release=False))
+
+
+class RecordedAutoregressiveModel(torch.nn.Module):
+    def __init__(self, invalid=False):
+        super().__init__()
+        self.shift = torch.nn.Parameter(torch.tensor(0.01))
+        self.config = {"velocity_scale": 1.0}
+        self.inputs = []
+        self.outputs = []
+        self.invalid = invalid
+
+    def forward(self, batch, proposal=None):
+        self.inputs.append(batch)
+        displacement = torch.stack((self.shift, self.shift * 0, self.shift * 0))
+        positions = batch["positions"] + displacement
+        velocities = batch["velocities"] + displacement
+        if proposal is not None:
+            positions = positions + proposal["positions"] - batch["positions"]
+            velocities = velocities + proposal["velocities"] - batch["velocities"]
+        if self.invalid == "inverted":
+            positions = positions.reshape(-1, 4, 3)[:, [1, 0, 2, 3]].reshape(-1, 3)
+        elif self.invalid == "nonfinite":
+            positions = positions * float("nan")
+        broken = batch["broken"].clone()
+        broken[1] = True
+        output = dict(positions=positions, velocities=velocities,
+                      fracture_logits=self.shift.expand(len(broken)), broken=broken,
+                      support_release_logits=self.shift.expand(len(positions)),
+                      next_fixed=torch.zeros_like(batch["fixed"]))
+        self.outputs.append(output)
+        return output
+
+    def fracture_velocity(self, batch, field, time):
+        return torch.zeros_like(field) + self.shift * 0
+
+
+def test_autoregressive_window_passes_predicted_states_and_preserves_motion_gradients(tmp_path):
+    case, path = recorded_trajectory(tmp_path / "source", supports=True)
+    trajectory = load_dynamics_trajectory(case, path)
+    model = RecordedAutoregressiveModel()
+    loss, terms = _rollout_loss(model, trajectory, 0, "cpu", training_config(rollout_steps=2))
+    assert len(model.inputs) == 2
+    assert model.inputs[1]["positions"] is model.outputs[0]["positions"]
+    assert model.inputs[1]["velocities"] is model.outputs[0]["velocities"]
+    torch.testing.assert_close(model.inputs[1]["broken"], torch.tensor([False, True, False]))
+    assert not model.inputs[1]["fixed"].any()
+    assert not torch.equal(model.inputs[1]["broken"], torch.from_numpy(trajectory.broken[1].copy()))
+    assert not torch.equal(model.inputs[1]["fixed"], torch.from_numpy(trajectory.fixed[1].copy()))
+    derivative = torch.autograd.grad(model.outputs[1]["positions"].sum(), model.outputs[0]["positions"], retain_graph=True)[0]
+    torch.testing.assert_close(derivative, torch.ones_like(derivative))
+    loss.backward()
+    assert torch.isfinite(model.shift.grad) and model.shift.grad.abs() > 0
+    assert all(np.isfinite(value) for value in terms.values())
+
+
+def test_autoregressive_inputs_do_not_depend_on_changed_future_supervision(tmp_path):
+    case, path = recorded_trajectory(tmp_path / "source", supports=True)
+    trajectory = load_dynamics_trajectory(case, path)
+    positions, velocities = trajectory.positions.copy(), trajectory.velocities.copy()
+    positions[1:] += 100
+    velocities[1:] -= 100
+    altered = replace(trajectory, positions=positions, velocities=velocities,
+                      broken=np.zeros_like(trajectory.broken), fixed=np.zeros_like(trajectory.fixed))
+    altered_fixed = altered.fixed.copy()
+    altered_fixed[0] = trajectory.fixed[0]
+    altered = replace(altered, fixed=altered_fixed)
+    baseline, changed = RecordedAutoregressiveModel(), RecordedAutoregressiveModel()
+    first_loss, _ = _rollout_loss(baseline, trajectory, 0, "cpu", training_config(rollout_steps=2))
+    second_loss, _ = _rollout_loss(changed, altered, 0, "cpu", training_config(rollout_steps=2))
+    assert first_loss.item() != second_loss.item()
+    for first, second in zip(baseline.inputs, changed.inputs):
+        assert not any(key.startswith("target") for key in first)
+        for key, value in first.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, second[key])
+            else:
+                assert value == second[key]
+
+
+@pytest.mark.parametrize("invalid,match", [("inverted", "inverted or degenerate"), ("nonfinite", "nonfinite")])
+def test_invalid_autoregressive_states_fail_explicitly(tmp_path, invalid, match):
+    case, path = recorded_trajectory(tmp_path / "source")
+    trajectory = load_dynamics_trajectory(case, path)
+    model = RecordedAutoregressiveModel(invalid)
+    with pytest.raises(FloatingPointError, match=match):
+        _rollout_loss(model, trajectory, 0, "cpu", training_config(rollout_steps=2))
+    assert len(model.inputs) == 1
+
+
+def test_autoregressive_optional_corrector_retains_gradient_through_frozen_predictor(tmp_path):
+    case, path = recorded_trajectory(tmp_path / "source")
+    trajectory = load_dynamics_trajectory(case, path)
+    predictor = RecordedAutoregressiveModel()
+    predictor.requires_grad_(False)
+    corrector = RecordedAutoregressiveModel()
+    loss, _ = _rollout_loss(corrector, trajectory, 0, "cpu", training_config(rollout_steps=2), fixed_predictor=predictor)
+    assert predictor.inputs[1]["positions"] is corrector.outputs[0]["positions"]
+    derivative = torch.autograd.grad(predictor.outputs[1]["positions"].sum(), corrector.outputs[0]["positions"], retain_graph=True)[0]
+    torch.testing.assert_close(derivative, torch.ones_like(derivative))
+    loss.backward()
+    assert predictor.shift.grad is None
+    assert torch.isfinite(corrector.shift.grad) and corrector.shift.grad.abs() > 0
+
+
+def test_cli_rollout_window_matches_training_config():
+    from fracture_world.cli import parser
+
+    arguments = parser().parse_args(["dynamics-train", "--data", "data", "--output", "output", "--epochs", "1", "--rollout-steps", "3"])
+    config = DynamicsTrainingConfig(**{name: getattr(arguments, name) for name in DynamicsTrainingConfig.__dataclass_fields__})
+    assert config.rollout_steps == 3
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, 1.5])
+def test_training_rejects_invalid_autoregressive_window_before_loading_data(tmp_path, steps):
+    with pytest.raises(ValueError, match="rollout_steps"):
+        train_dynamics(tmp_path / "missing", tmp_path / "unused", training_config(rollout_steps=steps))

@@ -1,0 +1,36 @@
+{
+  "schema": "fracture-world.drop-suite.v1",
+  "geometry": {
+    "geometry_mode": "solid",
+    "height_m": 0.12,
+    "surface_triangles": 800,
+    "surface_remeshing": "uniform",
+    "target_tetrahedra": 800,
+    "radius_edge_ratio": 1.5,
+    "minimum_dihedral_degrees": 10,
+    "maximum_tetrahedron_aspect_ratio": 25.0
+  },
+  "material": {
+    "rest_density": 1000.0,
+    "youngs_modulus": 1000000.0,
+    "poissons_ratio": 0.25,
+    "fracture_stress_threshold": 10000.0
+  },
+  "drop_heights_m": [0.0001, 0.0005, 0.01, 0.04, 0.12, 0.2, 0.3, 0.45, 0.6, 0.8],
+  "orientations": 100,
+  "preimpact_time_s": 0.002,
+  "dt": 0.0001,
+  "steps": 200,
+  "gravity_m_per_s2": 9.81,
+  "floor_height_m": 0.0,
+  "threads": 1,
+  "scene_options": {
+    "rayleigh_mass_damping": 0.0,
+    "rayleigh_stiffness_damping": 0.0,
+    "friction_coefficient": 0.0,
+    "enable_self_collision": true,
+    "dist_contact_bias": 0.0,
+    "dist_contact_threshold": 0.00001
+  },
+  "seed": 17
+}

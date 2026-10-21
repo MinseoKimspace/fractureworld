@@ -36,7 +36,8 @@ def test_export_contains_one_selected_state_and_loads_without_source_archives(tm
     assert initial.dt == 0.125
     assert initial.metadata["future_state_included"] is False
     assert initial.metadata["support_policy"] == "free"
-    assert initial.metadata["observed_source_support_constant"]
+    assert initial.metadata["observed_source_support_constant"] is None
+    assert initial.metadata["source_support_history"] == "not_inspected"
     with np.load(output, allow_pickle=False) as archive:
         assert set(archive.files) == ARRAYS
         assert archive["positions"].shape == (12, 3)
@@ -53,13 +54,14 @@ def test_export_contains_one_selected_state_and_loads_without_source_archives(tm
     assert not loaded.topology.mesh.nodes.flags.writeable
 
 
-def test_fixed_support_policy_requires_an_explicit_choice_and_invariant_source_history(tmp_path):
+def test_fixed_support_policy_requires_an_explicit_choice_without_inspecting_future_flags(tmp_path):
     case, trajectory = recorded_trajectory(tmp_path / "source", supports=True)
     output = tmp_path / "initial.npz"
     with pytest.raises(TypeError, match="support_policy"):
         export_initial(case, trajectory, 0, output)
-    with pytest.raises(ValueError, match="support-changing"):
-        export_initial(case, trajectory, 0, output, support_policy="prescribed")
+    declared = export_initial(case, trajectory, 0, tmp_path / "declared.npz", support_policy="prescribed")
+    assert declared.metadata["source_support_history"] == "not_inspected"
+    assert declared.metadata["observed_source_support_constant"] is None
     constant_supports(trajectory)
     with pytest.raises(ValueError, match="fixed source supports"):
         export_initial(case, trajectory, 0, output, support_policy="free")
@@ -76,7 +78,8 @@ def test_learned_support_policy_exports_current_flags_without_future_release_lab
     state = export_initial(case, trajectory, 0, output, support_policy="learned")
     assert state.metadata["support_policy"] == "learned_material_corner_release"
     assert state.metadata["support_semantics"] == "recorded_numerical_teacher_kinematic_flags"
-    assert state.metadata["observed_source_support_constant"] is False
+    assert state.metadata["observed_source_support_constant"] is None
+    assert state.metadata["source_support_history"] == "not_inspected"
     assert state.fixed.sum() == 3
     with np.load(output, allow_pickle=False) as archive:
         assert set(archive.files) == ARRAYS

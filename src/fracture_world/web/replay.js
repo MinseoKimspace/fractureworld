@@ -38,7 +38,8 @@ renderer.toneMapping=THREE.ACESFilmicToneMapping;
 const scene=new THREE.Scene();
 scene.background=new THREE.Color('#131c26');
 const camera=new THREE.PerspectiveCamera(42,1,.001,1000);
-camera.up.set(0,0,1);
+const yUp=data.metadata?.up_axis==='y';
+camera.up.set(0,yUp?1:0,yUp?0:1);
 const controls=new OrbitControls(camera,canvas);
 controls.enableDamping=true;
 scene.add(new THREE.HemisphereLight('#d9e9fa','#4e5663',2.4));
@@ -124,10 +125,19 @@ const center=bounds.getCenter(new THREE.Vector3());
 const radius=Math.max(bounds.getSize(new THREE.Vector3()).length(),1e-6);
 meshes.forEach(mesh=>{mesh.userData.supports.material.size=radius*.009;});
 camera.near=radius/1000;camera.far=radius*1000;
-camera.position.copy(center).add(new THREE.Vector3(1.4,-2.1,1.5).multiplyScalar(radius));
+camera.position.copy(center).add((yUp?new THREE.Vector3(1.4,1.2,2.1):new THREE.Vector3(1.4,-2.1,1.5)).multiplyScalar(radius));
 controls.target.copy(center);controls.minDistance=radius*.05;controls.maxDistance=radius*30;
 const grid=new THREE.GridHelper(radius*5,30,'#496174','#2a3949');
-grid.rotation.x=Math.PI/2;grid.position.set(center.x,center.y,0);
+if(yUp){
+  const height=Number.isFinite(data.metadata?.floor_height_m)?data.metadata.floor_height_m:0;
+  grid.position.set(center.x,height,center.z);
+  if(Number.isFinite(data.metadata?.floor_height_m)){
+    const floor=new THREE.Mesh(new THREE.PlaneGeometry(radius*5,radius*5),new THREE.MeshStandardMaterial({color:'#263340',roughness:1,side:THREE.DoubleSide}));
+    floor.rotation.x=-Math.PI/2;floor.position.set(center.x,height-radius*1e-5,center.z);scene.add(floor);
+  }
+}else{
+  grid.rotation.x=Math.PI/2;grid.position.set(center.x,center.y,0);
+}
 grid.material.transparent=true;grid.material.opacity=.45;
 scene.add(grid);
 const topologyEdges=data.topology_edges;

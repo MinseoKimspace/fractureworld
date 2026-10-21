@@ -124,8 +124,21 @@ def _contact_pairs(batch, radius):
     return torch.as_tensor(pairs.reshape(-1, 2), device=batch["positions"].device, dtype=torch.long)
 
 
+def constant_acceleration_prediction(batch):
+    dt = _validated_batch(batch)
+    acceleration = batch["forces"] / batch["masses"][:, None]
+    positions = batch["positions"] + dt * batch["velocities"] + 0.5 * dt.square() * acceleration
+    velocities = batch["velocities"] + dt * acceleration
+    position_increment = dt * batch["velocities"] + 0.5 * dt.square() * acceleration
+    velocity_increment = dt * acceleration
+    return {"positions": torch.where(batch["fixed"][:, None], batch["positions"], positions),
+            "velocities": torch.where(batch["fixed"][:, None], torch.zeros_like(velocities), velocities),
+            "position_increment": torch.where(batch["fixed"][:, None], torch.zeros_like(position_increment), position_increment),
+            "velocity_increment": torch.where(batch["fixed"][:, None], -batch["velocities"], velocity_increment)}
+
+
 def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale=1.0,
-                         material_scale=(1.0, 1.0, 1.0, 1.0), contact_radius=0.1, proposal=None):
+                         material_scale=(1.0, 1.0, 1.0, 1.0), contact_radius=0.1, proposal=None, physical_proposal=None):
     dt = _validated_batch(batch)
     scales = np.asarray([length_scale, velocity_scale, mass_scale, contact_radius, *material_scale], dtype=float)
     if scales.shape != (8,) or not np.isfinite(scales).all() or (scales <= 0).any():
@@ -140,6 +153,9 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
     proposal_features = torch.zeros((count, 6), device=x.device, dtype=x.dtype)
     proposed_release_probability = torch.zeros(count, device=x.device, dtype=x.dtype)
     proposed_probability = torch.zeros(len(pairs), device=x.device, dtype=x.dtype)
+    if physical_proposal is not None:
+        proposal_features = torch.cat(((physical_proposal["positions"] - x) / length_scale,
+                                       (physical_proposal["velocities"] - v) / velocity_scale), dim=-1)
     if proposal is not None:
         for name in ("positions", "velocities"):
             if proposal[name].shape != x.shape or not torch.isfinite(proposal[name]).all():
@@ -199,8 +215,21 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
                                   torch.linalg.vector_norm(x[b] - x[a], dim=-1)[:, None] / length_scale,
                                   torch.zeros((contact_count, 3), device=x.device, dtype=x.dtype),
                                   torch.ones((contact_count, 1), device=x.device, dtype=x.dtype)), dim=-1)
+    floor_features = torch.empty((0, 14), device=x.device, dtype=x.dtype)
+    if "floor_height" in batch:
+        floor = float(batch["floor_height"])
+        if not np.isfinite(floor):
+            raise ValueError("floor_height must be finite")
+        projected = x.clone()
+        projected[:, 1] = floor
+        normals = torch.zeros_like(x)
+        normals[:, 1] = 1
+        floor_features = torch.cat(((projected - center) / length_scale, normals, -v / velocity_scale,
+                                    (x[:, 1:2] - floor) / length_scale, torch.zeros_like(x),
+                                    torch.full_like(mass[:, None], 2.0)), dim=-1)
     graph = HeteroData()
-    features = (corner_features, cell_features, face_features, body_features, torch.cat((load_features, contact_features)))
+    features = (corner_features, cell_features, face_features, body_features,
+                torch.cat((load_features, contact_features, floor_features)))
     for name, value in zip(DYNAMICS_INPUT_DIMS, features):
         graph[name].x = value
     corner_ids = torch.arange(count, device=x.device)
@@ -211,12 +240,14 @@ def build_dynamics_graph(batch, length_scale=1.0, velocity_scale=1.0, mass_scale
     corner_face = torch.stack((pairs[~batch["broken"]].reshape(-1), intact_faces.repeat_interleave(6)))
     load_edges = torch.stack((corner_ids, corner_ids))
     contact_edges = torch.stack((contacts.reshape(-1), torch.arange(count, count + contact_count, device=x.device).repeat_interleave(2)))
-    corner_interaction = torch.cat((load_edges, contact_edges), dim=1)
+    floor_edges = torch.stack((corner_ids, corner_ids + count + contact_count)) if len(floor_features) else load_edges[:, :0]
+    corner_interaction = torch.cat((load_edges, contact_edges, floor_edges), dim=1)
     relations = (corner_cell, corner_cell.flip(0), cell_body, cell_body.flip(0), corner_face, corner_face.flip(0),
                  corner_interaction, corner_interaction.flip(0))
     for relation, edges in zip(DYNAMICS_EDGE_TYPES, relations):
         graph[relation].edge_index = edges
     graph["interaction"].contact_pairs = contacts
+    graph["interaction"].floor_corner_ids = corner_ids if len(floor_features) else corner_ids[:0]
     return graph
 
 
@@ -224,7 +255,7 @@ class TemporalDynamicsModel(nn.Module):
     def __init__(self, hidden=64, heads=4, graph_layers=4, transformer_layers=1,
                  length_scale=1.0, velocity_scale=1.0, mass_scale=1.0,
                  material_scale=(1.0, 1.0, 1.0, 1.0), contact_radius=0.1, learn_support_release=False,
-                 flow_architecture="coupled", flow_layers=2):
+                 flow_architecture="coupled", flow_layers=2, motion_prior="backward_euler"):
         super().__init__()
         if hidden < 1 or heads < 1 or hidden % heads or graph_layers < 2 or transformer_layers < 1:
             raise ValueError("invalid temporal model dimensions")
@@ -235,13 +266,15 @@ class TemporalDynamicsModel(nn.Module):
             raise ValueError("learn_support_release must be boolean")
         if flow_architecture not in {"coupled", "independent"}:
             raise ValueError("flow_architecture must be coupled or independent")
+        if motion_prior not in {"backward_euler", "constant_acceleration"}:
+            raise ValueError("unsupported physical motion prior")
         if not isinstance(flow_layers, int) or isinstance(flow_layers, bool) or flow_layers < 1:
             raise ValueError("flow_layers must be a positive integer")
         self.config = dict(hidden=hidden, heads=heads, graph_layers=graph_layers, transformer_layers=transformer_layers,
                            length_scale=length_scale, velocity_scale=velocity_scale, mass_scale=mass_scale,
                            material_scale=list(material_scale), contact_radius=contact_radius,
                            learn_support_release=learn_support_release, flow_architecture=flow_architecture,
-                           flow_layers=flow_layers)
+                           flow_layers=flow_layers, motion_prior=motion_prior)
         self.fracture_logit_offset = 0.0
         self.support_logit_offset = 0.0
         self.encoders = nn.ModuleDict({name: nn.Linear(width, hidden) for name, width in DYNAMICS_INPUT_DIMS.items()})
@@ -264,8 +297,10 @@ class TemporalDynamicsModel(nn.Module):
         nn.init.zeros_(self.support_head.bias)
 
     def encode(self, batch, proposal=None):
+        physical = constant_acceleration_prediction(batch) if self.config["motion_prior"] == "constant_acceleration" else None
         graph = build_dynamics_graph(batch, **{key: self.config[key] for key in (
-            "length_scale", "velocity_scale", "mass_scale", "material_scale", "contact_radius")}, proposal=proposal)
+            "length_scale", "velocity_scale", "mass_scale", "material_scale", "contact_radius")}, proposal=proposal,
+                                     physical_proposal=physical)
         hidden = {name: F.gelu(self.encoders[name](features)) for name, features in graph.x_dict.items()}
         for layer, norms in zip(self.graph_layers, self.norms):
             updates = layer(hidden, graph.edge_index_dict)
@@ -283,20 +318,30 @@ class TemporalDynamicsModel(nn.Module):
         scale = self.config["velocity_scale"]
         release_logits = self.support_head(corner_context).squeeze(-1)
         if proposal is None:
-            velocities = batch["velocities"] + batch["forces"] * dt / batch["masses"][:, None] + scale * motion[:, 3:]
-            positions = batch["positions"] + dt * velocities + dt * scale * motion[:, :3]
+            velocity_increment = batch["forces"] * dt / batch["masses"][:, None] + scale * motion[:, 3:]
+            velocities = batch["velocities"] + velocity_increment
+            if self.config["motion_prior"] == "constant_acceleration":
+                position_increment = dt * batch["velocities"] + 0.5 * dt.square() * batch["forces"] / batch["masses"][:, None] + dt * scale * motion[:, :3]
+            else:
+                position_increment = dt * velocities + dt * scale * motion[:, :3]
+            positions = batch["positions"] + position_increment
             logits = self.fracture_head(face_context).squeeze(-1)
         else:
             positions = proposal["positions"] + dt * scale * motion[:, :3]
             velocities = proposal["velocities"] + scale * motion[:, 3:]
+            position_increment = proposal.get("position_increment", proposal["positions"] - batch["positions"]) + dt * scale * motion[:, :3]
+            velocity_increment = proposal.get("velocity_increment", proposal["velocities"] - batch["velocities"]) + scale * motion[:, 3:]
             logits = proposal["fracture_logits"] + self.fracture_head(face_context).squeeze(-1)
             release_logits = release_logits + proposal.get("support_release_logits", torch.zeros_like(release_logits))
         release_probability = torch.where(batch["fixed"], (release_logits - self.support_logit_offset).sigmoid(), torch.zeros_like(release_logits))
         next_fixed = batch["fixed"] & (release_probability < 0.5) if self.config["learn_support_release"] else batch["fixed"].clone()
         positions = torch.where(next_fixed[:, None], batch["positions"], positions)
         velocities = torch.where(next_fixed[:, None], torch.zeros_like(velocities), velocities)
+        position_increment = torch.where(next_fixed[:, None], torch.zeros_like(position_increment), position_increment)
+        velocity_increment = torch.where(next_fixed[:, None], -batch["velocities"], velocity_increment)
         probability = torch.where(batch["broken"], torch.ones_like(logits), (logits - self.fracture_logit_offset).sigmoid())
-        return dict(positions=positions, velocities=velocities, fracture_logits=logits,
+        return dict(positions=positions, velocities=velocities, position_increment=position_increment,
+                    velocity_increment=velocity_increment, fracture_logits=logits,
                     fracture_probability=probability, broken=batch["broken"] | (probability >= 0.5),
                     support_release_logits=release_logits, support_release_probability=release_probability,
                     next_fixed=next_fixed)

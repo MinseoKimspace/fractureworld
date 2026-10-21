@@ -167,6 +167,80 @@ def test_infeasible_fixed_contact_is_not_reported_as_converged():
     assert not result.diagnostics["constraints_satisfied"]
 
 
+@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
+def test_constant_acceleration_fixed_support_does_not_enforce_free_fall(solver):
+    mesh = mesh_pair()
+    positions = mesh.nodes[mesh.tets]
+    mass = np.broadcast_to(mesh.volumes[:, None] / 4, (len(mesh.tets), 4))
+    gravity = np.array([0.0, -9.81, 0.0])
+    dt = 0.05
+    fixed = np.ones((len(mesh.tets), 4), dtype=bool)
+    problem = problem_for(mesh, positions=positions, predicted_positions=positions + 0.5 * dt**2 * gravity,
+                          predicted_velocities=np.broadcast_to(dt * gravity, positions.shape), dt=dt, fixed=fixed,
+                          external_impulse=mass[..., None] * gravity * dt, kinematic_rule="constant_acceleration")
+    result = solver(problem, tolerances=CorrectorTolerances(1e-10, 1e-9))
+    assert result.converged, result.status
+    assert_allclose(result.positions, positions, atol=1e-8)
+    assert_allclose(result.velocities, 0, atol=1e-8)
+    assert not any(name.startswith("kinematic:") for name in problem.metadata["factor_names"])
+    assert result.diagnostics["feasibility"]["status"] == "feasible"
+
+
+@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
+def test_unbounded_iteration_configuration_stops_on_proven_infeasibility(solver):
+    mesh = mesh_pair()
+    problem = problem_for(mesh, fixed=np.ones((len(mesh.tets), 4), dtype=bool),
+                          contacts=(LinearizedContact.pair(0, -1, [0, 0, 1], -0.01),))
+    result = solver(problem, max_iterations=None)
+    assert not result.converged
+    assert result.status == "PrimalInfeasible"
+    assert result.iterations == 0
+    assert result.diagnostics["feasibility"]["status"] == "infeasible"
+    assert result.diagnostics["feasibility"]["runtime_seconds"] >= 0
+    assert result.diagnostics["feasibility"]["engine_calls"] == 0
+
+
+@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
+def test_feasibility_solver_failure_is_unknown(solver, monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("test numerical failure")
+
+    monkeypatch.setattr("fracture_world.dynamics_corrector.linprog", fail)
+    result = solver(problem_for(mesh_pair()))
+    assert not result.converged
+    assert result.status == "feasibility_unknown"
+    assert result.iterations == 0
+    assert result.diagnostics["feasibility"]["status"] == "unknown"
+    assert "test numerical failure" in result.diagnostics["feasibility"]["solver_message"]
+
+
+@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
+def test_ballistic_angular_momentum_uses_continuous_external_torque(solver):
+    mesh = mesh_pair()
+    positions = mesh.nodes[mesh.tets]
+    velocity = np.broadcast_to([1.2, 0.3, -0.4], positions.shape).copy()
+    acceleration = np.array([0.1, -9.81, 0.2])
+    dt = 0.05
+    mass = np.broadcast_to(mesh.volumes[:, None] / 4, positions.shape[:2])
+    impulse = dt * mass[..., None] * acceleration
+    predicted_velocity = velocity + dt * acceleration
+    predicted_position = positions + dt * velocity + 0.5 * dt**2 * acceleration
+    problem = problem_for(mesh, velocities=velocity, predicted_positions=predicted_position,
+                          predicted_velocities=predicted_velocity, dt=dt, external_impulse=impulse,
+                          kinematic_rule="constant_acceleration")
+    result = solver(problem)
+    assert result.converged, result.status
+    assert_allclose(result.positions, predicted_position, atol=1e-8)
+    assert_allclose(result.velocities, predicted_velocity, atol=1e-8)
+    assert result.diagnostics["angular_momentum_verified"]
+    assert_allclose(result.diagnostics["angular_residual_or_inferred_boundary_angular_impulse"], 0, atol=1e-8)
+    origin = np.average(positions.reshape(-1, 3), axis=0, weights=mass.ravel())
+    old_lever = positions - origin
+    expected_torque = np.sum(np.cross(old_lever + 0.5 * dt * (predicted_velocity - dt * acceleration), impulse), axis=(0, 1))
+    assert_allclose(result.diagnostics["supplied_external_angular_impulse"], expected_torque, atol=1e-8)
+    assert np.linalg.norm(expected_torque) > 1e-4
+
+
 @pytest.mark.parametrize("change", [{"dt": 0}, {"position_weight": 0}, {"velocity_scale": -1}, {"kinematic_rule": "unknown"}, {"fixed": np.zeros(8, dtype=bool)}])
 def test_invalid_problem_is_rejected(change):
     with pytest.raises(ValueError):

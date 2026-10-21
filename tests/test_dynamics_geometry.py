@@ -10,6 +10,7 @@ from fracture_world.dynamics_geometry import (
     geometry_diagnostics,
     linearized_contacts,
     render_geometry,
+    swept_geometry_diagnostics,
     tetrahedron_separation,
 )
 from fracture_world.mesh import VolumeMesh
@@ -151,3 +152,84 @@ def test_collapsed_tetrahedra_return_invalid_geometry_instead_of_crashing_contac
     assert diagnostics["inverted_tetrahedra"] == 2
     with pytest.raises(ValueError, match="match"):
         geometry_diagnostics(mesh, np.zeros((4, 3)), np.array([True]), 1.e-8)
+
+
+def separate_tetrahedra():
+    first = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
+    return VolumeMesh(np.vstack((first, first + [3., 0., 0.])), np.arange(8).reshape(2, 4))
+
+
+def test_rotated_trial_contact_uses_trial_axis_and_every_active_support_pair():
+    mesh = separate_tetrahedra()
+    current = mesh.nodes[mesh.tets]
+    proposed = np.stack((current[0, [1, 2, 0, 3]], current[0, [1, 2, 0, 3]] + 0.1))
+    displacement = (proposed - current).reshape(-1, 3)
+    old_normal = tetrahedron_separation(*current)[1]
+    old_first = np.argmax(current[0] @ old_normal)
+    old_second = np.argmin(current[1] @ old_normal)
+    assert np.dot(proposed[1, old_second] - proposed[0, old_first], old_normal) > 0
+    separation, normal = tetrahedron_separation(*proposed)
+    assert separation < -0.1
+    contacts = linearized_contacts(mesh, current, proposed, np.empty(0, dtype=bool), 1.e-8)
+    expected = {(first, 4 + second) for first in range(4) for second in range(4)
+                if np.dot(proposed[1, second] - proposed[0, first], normal) <= 1.e-8}
+    assert {tuple(contact.corner_ids) for contact in contacts} == expected
+    evaluated = []
+    for contact in contacts:
+        np.testing.assert_allclose(contact.normal, normal)
+        movement = np.einsum("i,ij->j", contact.weights, displacement[contact.corner_ids])
+        evaluated.append(contact.gap + np.dot(movement, contact.normal))
+    assert min(evaluated) == pytest.approx(separation)
+    first_constraint = contacts[int(np.argmin(evaluated))]
+    assert evaluated[int(np.argmin(evaluated))] < 0
+    assert np.dot(np.einsum("i,ij->j", first_constraint.weights,
+                            current.reshape(-1, 3)[first_constraint.corner_ids]), normal) == pytest.approx(first_constraint.gap)
+
+
+def test_sweep_certifies_shared_translation_and_floor_touch_with_tolerance():
+    mesh = separate_tetrahedra()
+    current = mesh.nodes[mesh.tets]
+    proposed = current + [0.2, 0.1, -0.4]
+    result = swept_geometry_diagnostics(mesh, current, proposed, np.empty(0, dtype=bool), 1.e-8, floor_height=0.0)
+    assert result["valid"]
+    assert result["continuous_collision_unresolved_pair_count"] == 0
+    assert result["maximum_swept_floor_penetration_metres"] == 0
+    proposed[:, :, 1] -= 0.1 + 0.5e-8
+    assert swept_geometry_diagnostics(mesh, current, proposed, np.empty(0, dtype=bool), 1.e-8, 0.0)["valid"]
+    proposed[:, :, 1] -= 2.e-8
+    assert not swept_geometry_diagnostics(mesh, current, proposed, np.empty(0, dtype=bool), 1.e-8, 0.0)["valid"]
+
+
+def test_sweep_certifies_opening_crack_from_initial_touch():
+    mesh = paired_tetrahedra()
+    broken = np.array([True])
+    current = mesh.nodes[mesh.tets]
+    normal = tetrahedron_separation(*current)[1]
+    proposed = current.copy()
+    proposed[1] += 0.1 * normal
+    result = swept_geometry_diagnostics(mesh, current, proposed, broken, 1.e-8)
+    assert result["valid"]
+    assert result["certified_nonpenetrating_pairs"] == 1
+
+
+def test_sweep_rejects_pass_through_even_when_both_endpoint_geometries_are_valid():
+    mesh = separate_tetrahedra()
+    current = mesh.nodes[mesh.tets]
+    proposed = current[::-1].copy()
+    broken = np.empty(0, dtype=bool)
+    assert geometry_diagnostics(mesh, current, broken, 1.e-8)["valid"]
+    assert geometry_diagnostics(mesh, proposed, broken, 1.e-8)["valid"]
+    result = swept_geometry_diagnostics(mesh, current, proposed, broken, 1.e-8)
+    assert not result["valid"]
+    assert result["continuous_collision_unresolved_pairs"] == [[0, 1]]
+
+
+def test_sweep_rejects_interior_inversion_with_positive_endpoint_volumes():
+    mesh = VolumeMesh([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [[0, 1, 2, 3]])
+    current = mesh.nodes[mesh.tets]
+    proposed = current @ np.diag([-1.0, -2.0, 1.0])
+    assert np.linalg.det((proposed[:, 1:] - proposed[:, :1]))[0] > 0
+    result = swept_geometry_diagnostics(mesh, current, proposed, np.empty(0, dtype=bool), 1.e-8)
+    assert not result["valid"]
+    assert result["degenerate_or_inverted_swept_tetrahedra"] == [0]
+    assert result["minimum_normalized_swept_determinant"] < 0

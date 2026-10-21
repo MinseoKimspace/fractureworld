@@ -30,7 +30,8 @@ def test_suite_preserves_teacher_material_and_builds_distinct_mass_weighted_load
     assert specification["record_stride"] == 1
     assert material == {"rest_density": 1000.0, "youngs_modulus": 1e6, "poissons_ratio": 0.25,
                         "fracture_stress_threshold": 1e4}
-    assert specification["scene_options"] == {"friction_coefficient": 0.0}
+    assert specification["scene_options"] == {"friction_coefficient": 0.0, "rayleigh_mass_damping": 0.0,
+                                              "rayleigh_stiffness_damping": 0.0}
     np.testing.assert_array_equal(fixed, np.flatnonzero(mesh.nodes[:, 0] == 0))
     signatures = set()
     for case, parameters in zip(specification["cases"], manifest["cases"], strict=True):
@@ -104,6 +105,30 @@ def test_thousand_case_preset_covers_distinct_loads_and_preserves_original_cases
                 expected = np.zeros_like(mesh.nodes)
                 expected[selected] = speed * np.asarray(direction)
                 assert any(np.allclose(value, expected, rtol=0, atol=1e-14) for value in velocities)
+
+
+def test_fracture_focused_preset_adds_new_loading_conditions_with_a_longer_horizon(tmp_path):
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    preset = configs / "dynamics-fracture-1000.json"
+    values = json.loads(preset.read_text(encoding="utf-8"))
+    original = json.loads((configs / "dynamics-teacher-1000.json").read_text(encoding="utf-8"))
+    assert values["steps"] == 2 * original["steps"]
+    assert values["directions"] == original["directions"]
+    assert values["loaded_regions"] == original["loaded_regions"]
+    assert len(values["velocity_magnitudes"]) == 10
+    assert min(values["velocity_magnitudes"]) >= 1.5
+    assert max(values["velocity_magnitudes"]) <= max(original["velocity_magnitudes"])
+    assert set(values["velocity_magnitudes"]).isdisjoint(original["velocity_magnitudes"])
+    result = create_dynamics_suite(tmp_path / "suite", preset)
+    mesh = VolumeMesh.load(result["mesh"])
+    specification = json.loads(Path(result["specification"]).read_text(encoding="utf-8"))
+    material, fixed = validate_specification(mesh, specification)
+    signatures = {initial_conditions(mesh, material, fixed, case)[0].tobytes() for case in specification["cases"]}
+    assert result["case_count"] == len(signatures) == 1000
+    assert specification["dt"] == 0.0001
+    assert specification["record_stride"] == 1
+    assert material["fracture_stress_threshold"] == 1e4
+    assert not result["simulation_executed"]
 
 
 @pytest.mark.parametrize("change", [

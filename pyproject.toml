@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 native = ["pybind11>=2.13,<4", "cmake>=3.28,<5", "ninja>=1.11,<2"]
+geometry = ["pyvista>=0.46,<1", "pymeshfix>=0.17,<1", "pyacvd>=0.3,<1", "tetgen>=0.7,<1"]
 
 [project.scripts]
 fracture-world = "fracture_world.cli:main"

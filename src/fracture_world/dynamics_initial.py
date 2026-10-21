@@ -53,13 +53,18 @@ def _checked_state(mesh, positions, velocities, broken, fixed, time, dt, gravity
     if not isinstance(metadata, dict):
         raise ValueError("initial metadata must be a JSON object")
     json.dumps(metadata, allow_nan=False)
+    if "floor_height_m" in metadata:
+        floor = metadata["floor_height_m"]
+        if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not np.isfinite(floor) or metadata.get("up_axis") != "y":
+            raise ValueError("floor metadata requires a finite height and an explicit Y-up axis")
     policy = metadata.get("support_policy")
     if policy not in {"prescribed_material_corners", "free", "learned_material_corner_release"}:
         raise ValueError("initial state requires an explicit supported support policy")
     constant = metadata.get("observed_source_support_constant")
-    if not isinstance(constant, bool):
+    current_only = constant is None and metadata.get("source_support_history") == "not_inspected"
+    if not isinstance(constant, bool) and not current_only:
         raise ValueError("initial state requires explicit observed source support availability")
-    if not constant and policy != "learned_material_corner_release":
+    if constant is False and policy != "learned_material_corner_release":
         raise ValueError("support-changing source trajectories require a separate runtime support-release model")
     if policy == "learned_material_corner_release" and metadata.get("support_semantics") != "recorded_numerical_teacher_kinematic_flags":
         raise ValueError("learned support release must identify its numerical teacher flag semantics")
@@ -89,10 +94,7 @@ def export_initial(case_path, trajectory_path, frame, output_file, *, support_po
     trajectory = load_dynamics_trajectory(case_path, trajectory_path)
     if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)) or not 0 <= frame < len(trajectory.times):
         raise ValueError("initial frame must select an explicit recorded state")
-    constant = bool(np.all(trajectory.fixed == trajectory.fixed[0]))
-    if not constant and support_policy != "learned":
-        raise ValueError("support-changing source trajectories require a separate runtime support-release model")
-    if support_policy == "free" and trajectory.fixed.any():
+    if support_policy == "free" and trajectory.fixed[frame].any():
         raise ValueError("free support policy cannot be selected for fixed source supports")
     hashes = trajectory.metadata["source_hashes"]
     source_hashes = {"case": hashes[str(Path(case_path).resolve())],
@@ -103,9 +105,19 @@ def export_initial(case_path, trajectory_path, frame, output_file, *, support_po
                 "source_frame": int(frame), "source": "observed_current_material_state",
                 "support_policy": policies[support_policy],
                 "support_semantics": "recorded_numerical_teacher_kinematic_flags",
-                "observed_source_support_constant": constant, "native_runtime_required": False,
+                "observed_source_support_constant": None, "source_support_history": "not_inspected",
+                "runtime_support_policy_source": "explicit caller policy and selected current observation",
+                "native_runtime_required": False,
                 "future_state_included": False, "dt_policy": "source_native_base_timestep",
+                "shape_family": trajectory.shape_family,
                 "parameter_status": trajectory.metadata.get("parameter_status")}
+    context = trajectory.metadata["conditioning_context"]
+    settings = trajectory.metadata.get("native_settings", {})
+    metadata["teacher_physics"] = {key: settings[key] for key in (
+        "rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient") if key in settings}
+    if "floor_height_m" in context:
+        metadata["floor_height_m"] = context["floor_height_m"]
+        metadata["up_axis"] = "y"
     initial = _checked_state(trajectory.topology.mesh, trajectory.positions[frame], trajectory.velocities[frame],
                              trajectory.broken[frame], trajectory.fixed[frame], trajectory.times[frame],
                              float(np.float32(trajectory.metadata["conditioning_context"]["dt"])), trajectory.gravity,

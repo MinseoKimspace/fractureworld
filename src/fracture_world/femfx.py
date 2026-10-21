@@ -11,7 +11,7 @@ import numpy as np
 
 from .data import _mesh_digest
 from .io import file_hash, write_json
-from .mesh import VolumeMesh
+from .mesh import VolumeMesh, rigid_pose
 from .partition import component_labels
 
 
@@ -161,8 +161,14 @@ def validate_specification(mesh, specification):
             raise ValueError("case IDs must contain only letters, numbers, underscores and hyphens")
         identifiers.append(identifier)
         impulses = case["vertex_impulses"]
-        if not isinstance(impulses, list) or not impulses:
+        if not isinstance(impulses, list) or (not impulses and specification.get("loading") != "gravity_driven_drop"):
             raise ValueError("each loading case needs explicit vertex impulses")
+        rigid_pose(mesh.nodes, case.get("initial_pose"))
+        initial_velocity = np.asarray(case.get("initial_linear_velocity", [0.0, 0.0, 0.0]), dtype=float)
+        if initial_velocity.shape != (3,) or not np.isfinite(initial_velocity).all():
+            raise ValueError("initial_linear_velocity must be a finite three-vector")
+        if np.any(initial_velocity) and fixed.size:
+            raise ValueError("rigid initial velocity cannot move prescribed fixed vertices")
         for impulse in impulses:
             vertex = impulse["vertex"]
             vector = np.asarray(impulse["impulse"], dtype=float)
@@ -174,6 +180,22 @@ def validate_specification(mesh, specification):
                 raise ValueError("impulses must be finite, nonzero three-vectors in newton seconds")
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("case IDs must be unique")
+    if specification.get("loading", "instantaneous_vertex_impulses") not in {"instantaneous_vertex_impulses", "gravity_driven_drop"}:
+        raise ValueError("unsupported loading mode")
+    if specification.get("loading") == "gravity_driven_drop":
+        floor = specification.get("floor_height_m")
+        bounds = specification.get("scene_options", {}).get("collision_bounds", [])
+        if fixed.size or gravity[1] >= 0 or gravity[0] != 0 or gravity[2] != 0:
+            raise ValueError("free-fall datasets require no fixed vertices and downward Y gravity")
+        if not isinstance(floor, (int, float)) or isinstance(floor, bool) or not np.isfinite(floor):
+            raise ValueError("drop datasets require an explicit finite floor_height_m")
+        if len(bounds) != 6 or bounds[2] != floor:
+            raise ValueError("drop floor must match the native minimum-Y collision plane")
+        for case in cases:
+            if case["vertex_impulses"] or "initial_pose" not in case:
+                raise ValueError("gravity-driven drops require an explicit initial pose and empty initial impulses")
+            if rigid_pose(mesh.nodes, case["initial_pose"])[:, 1].min() < floor:
+                raise ValueError("drop initial poses must not penetrate the floor")
     return material, fixed
 
 
@@ -186,13 +208,13 @@ def initial_conditions(mesh, material, fixed, case):
     for impulse in case["vertex_impulses"]:
         momentum[impulse["vertex"]] += impulse["impulse"]
     active = np.flatnonzero(np.linalg.norm(momentum, axis=1) > 0)
-    if not len(active):
+    if not len(active) and case["vertex_impulses"]:
         raise ValueError("vertex impulses cancel exactly; provide a nonzero loading case")
     magnitudes = np.linalg.norm(momentum[active], axis=1)
     impacts = np.column_stack((mesh.nodes[active], momentum[active] / magnitudes[:, None], magnitudes))
     kinematic = np.zeros(len(mesh.nodes), dtype=bool)
     kinematic[fixed] = True
-    return momentum / masses[:, None], kinematic, impacts
+    return momentum / masses[:, None] + np.asarray(case.get("initial_linear_velocity", [0.0, 0.0, 0.0])), kinematic, impacts
 
 
 def native_face_order(mesh, state):
@@ -223,7 +245,29 @@ def validate_state(mesh, state, previous_cuts, order):
         raise RuntimeError("FEMFX fracture labels must be binary and irreversible")
     if state.get("warnings", 0):
         raise RuntimeError(f"FEMFX reported a warning; the trajectory is not accepted as a reference: {state['warnings']}")
+    validate_piece_partition(mesh, state, cuts)
     return cuts.astype(np.int8)
+
+
+def validate_piece_partition(mesh, state, cuts):
+    labels = component_labels(len(mesh.tets), mesh.dual_edges, cuts)
+    native = np.asarray(state["tet_piece_ids"])
+    vertices = np.asarray(state["corner_vertex_ids"])
+    if native.shape != (len(mesh.tets),) or vertices.shape != mesh.tets.shape:
+        raise ValueError("native piece and vertex connectivity dimensions differ from material tetrahedra")
+    owners = np.repeat(np.arange(len(mesh.tets)), 4)
+    ownership = np.unique(np.column_stack((vertices.ravel(), native[owners])), axis=0)
+    groups = mesh.corner_groups(cuts)
+    pairs = np.unique(np.column_stack((groups, vertices.ravel())), axis=0)
+    diagnostic = dict(face_components=len(np.unique(labels)), material_corner_groups=len(np.unique(groups)),
+                      native_vertices=len(np.unique(vertices)), native_mesh_containers=len(np.unique(native)))
+    if len(ownership) != len(np.unique(vertices)):
+        raise RuntimeError("native pieces disagree with current vertex connectivity: " + json.dumps(diagnostic))
+    if len(pairs) != len(np.unique(groups)):
+        raise RuntimeError("native vertices disagree with intact-face welding: " + json.dumps(diagnostic))
+    if len(pairs) != len(np.unique(vertices)):
+        raise RuntimeError("unsupported vertex-only coupling between face-separated components: " + json.dumps(diagnostic))
+    return labels
 
 
 def generate_dataset(mesh_path, specification_path, output_dir, length_scale, build_dir=None, export_replay=True, skip_invalid=False):
@@ -244,12 +288,15 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
         "dt": specification["dt"],
         "steps": specification["steps"],
         "gravity": specification["gravity"],
-        "loading": "instantaneous_vertex_impulses",
+        "loading": specification.get("loading", "instantaneous_vertex_impulses"),
         "scene_options": specification.get("scene_options", {}),
         "threads": specification.get("threads", 1),
         "native_revision": REVISION,
         "binding_sha256": build["binding_sha256"],
     }
+    for key in ("shape_id", "shape_family", "geometry_source", "floor_height_m"):
+        if key in specification:
+            context[key] = specification[key]
     context_hash = context_digest(context)
     output_dir.mkdir(parents=True, exist_ok=True)
     mesh.save(output_dir / "mesh.npz")
@@ -266,10 +313,15 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
                        "corner_vertex_ids", *nodal_fields]
     for case in specification["cases"]:
         velocities, kinematic, impacts = initial_conditions(mesh, material, fixed, case)
-        scene = native.Scene(mesh.nodes, mesh.tets, material, velocities, kinematic,
-                             specification["dt"], specification["gravity"],
-                             specification.get("threads", 1), specification.get("scene_options", {}))
+        scene_arguments = (mesh.nodes, mesh.tets, material, velocities, kinematic,
+                           specification["dt"], specification["gravity"],
+                           specification.get("threads", 1), specification.get("scene_options", {}))
+        scene = None
         try:
+            if "initial_pose" in case:
+                scene = native.Scene(*scene_arguments, deformed_positions=rigid_pose(mesh.nodes, case["initial_pose"]))
+            else:
+                scene = native.Scene(*scene_arguments)
             initial = scene.state()
             order = native_face_order(mesh, initial)
             previous = np.zeros(len(mesh.internal_faces), dtype=np.int8)
@@ -293,11 +345,7 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
                 previous_support = current_support.copy()
                 print(json.dumps({"case": case["id"], "step": step + 1, "time": state["time"],
                                   "cut_facets": int(cuts.sum()), "separate_components": len(np.unique(state["tet_piece_ids"]))}), flush=True)
-            labels = component_labels(len(mesh.tets), mesh.dual_edges, cuts)
-            native_labels = np.asarray(states[-1]["tet_piece_ids"])
-            pairs = np.unique(np.column_stack((labels, native_labels)), axis=0)
-            if len(pairs) != len(np.unique(labels)) or len(pairs) != len(np.unique(native_labels)):
-                raise RuntimeError("native pieces disagree with the cumulative original-face fracture graph")
+            labels = validate_piece_partition(mesh, states[-1], cuts)
             metadata = {
                 "source": "FEMFX", "schema_version": SCHEMA,
                 "supervision_kind": "native_facet_fracture", "units": "SI",
@@ -365,7 +413,8 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
             rejected.append({"case": case["id"], "reason": str(error), "accepted_as_training_reference": False})
             print(json.dumps({"case": case["id"], "status": "rejected", "reason": str(error)}), flush=True)
         finally:
-            scene.close()
+            if scene is not None:
+                scene.close()
     summary = {"source": "FEMFX", "cases": results, "conditioning_context_sha256": context_hash,
                "parameter_status": specification["parameter_status"], "output": str(output_dir.resolve()),
                "requested_cases": len(specification["cases"]), "rejected_cases": rejected,
@@ -400,7 +449,9 @@ def export_reference_replay(mesh, states, cut_history, metadata, path):
         })
     write_json(path, {"title": "FEMFX numerical fracture reference", "source": "femfx_numerical_reference",
                       "metadata": {**metadata, "neural_prediction": False, "proximal_fracture_correction": False,
-                                   "suggested_playback_speed": 0.001},
+                                   "suggested_playback_speed": 0.005 if "floor_height_m" in metadata["conditioning_context"] else 0.001,
+                                   **({"floor_height_m": metadata["conditioning_context"]["floor_height_m"], "up_axis": "y"}
+                                      if "floor_height_m" in metadata["conditioning_context"] else {})},
                       "bodies": [{"id": 0, **geometry}], "frames": frames})
 
 
@@ -442,7 +493,8 @@ def create_trial(output_dir, steps=50):
         "schema": SCHEMA, "parameter_status": "uncalibrated_trial", "material": material,
         "dt": 0.0001, "steps": steps, "gravity": [0.0, 0.0, 0.0],
         "fixed_vertices": fixed.tolist(), "threads": 1, "cases": cases,
-        "scene_options": {"friction_coefficient": 0.0},
+        "scene_options": {"friction_coefficient": 0.0, "rayleigh_mass_damping": 0.0,
+                          "rayleigh_stiffness_damping": 0.0},
         "purpose": "integration test on an uncalibrated fixed-end block with instantaneous end-vertex impulses",
     }
     validate_specification(mesh, specification)

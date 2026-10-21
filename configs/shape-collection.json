@@ -1,0 +1,10 @@
+{
+  "schema": "fracture-world.dynamics-collection.v1",
+  "datasets": [
+    {"path": "../data/drop-box", "shape_family": "primitive_box", "split": "train"},
+    {"path": "../data/drop-sphere", "shape_family": "primitive_sphere", "split": "train"},
+    {"path": "../data/drop-cylinder", "shape_family": "primitive_cylinder", "split": "train"},
+    {"path": "../data/drop-torus", "shape_family": "primitive_torus", "split": "validation"},
+    {"path": "../data/drop-bunny", "shape_family": "stanford_bunny", "split": "test"}
+  ]
+}

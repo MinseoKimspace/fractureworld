@@ -4,7 +4,8 @@ from typing import Callable
 
 import numpy as np
 from scipy import sparse
-from scipy.linalg import pinvh
+from scipy.linalg import null_space, pinvh
+from scipy.optimize import linprog
 
 from .mesh import VolumeMesh
 
@@ -73,7 +74,11 @@ class _Factor:
     inverse_gram: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self):
-        self.inverse_gram = pinvh((self.matrix @ self.matrix.T).toarray())
+        if len(self.bound) == 1:
+            squared_norm = float(self.matrix.data @ self.matrix.data)
+            self.inverse_gram = np.array([[1.0 / squared_norm if squared_norm else 0.0]])
+        else:
+            self.inverse_gram = pinvh((self.matrix @ self.matrix.T).toarray())
 
     def project(self, value):
         residual = self.bound - self.matrix @ value
@@ -117,8 +122,8 @@ class DynamicsProblem:
             raise ValueError("time step, density, and prior weights must be finite")
         if min(self.dt, self.density, self.position_weight, self.velocity_weight) <= 0:
             raise ValueError("time step, density, and prior weights must be positive")
-        if self.kinematic_rule not in ("backward_euler", "trapezoidal"):
-            raise ValueError("kinematic_rule must be backward_euler or trapezoidal")
+        if self.kinematic_rule not in ("backward_euler", "trapezoidal", "constant_acceleration"):
+            raise ValueError("unsupported kinematic integration rule")
         shape = (len(self.mesh.tets), 4, 3)
         for name in ("positions", "velocities", "predicted_positions", "predicted_velocities"):
             setattr(self, name, _finite_array(getattr(self, name), shape, name))
@@ -163,7 +168,9 @@ class DynamicsProblem:
             "momentum_constraint": "exact global linear and angular momentum with supplied point impulses" if closed else "external reaction inferred; boundary momentum not independently verified",
             "boundary_momentum_verified": closed,
             "angular_momentum_constraint": closed,
+            "frictionless_boundary_projection": not self.fixed.any() and any(contact.environment for contact in self.contacts),
             "external_torque_quadrature": "supplied point impulses act at current material-corner positions",
+            "feasibility_check": "shared HiGHS linear feasibility presolve; solver failure is unknown",
             "position_scale": self.position_scale,
             "velocity_scale": self.velocity_scale,
             "prior_objective": "0.5 * sum(corner_mass / total_mass * (position_weight * normalized_position_correction^2 + velocity_weight * normalized_velocity_correction^2))",
@@ -171,6 +178,8 @@ class DynamicsProblem:
             "broken_faces": int(self.broken_faces.sum()),
             "factor_names": [factor.name for factor in self.factors],
         }
+        if self.kinematic_rule == "constant_acceleration":
+            self.metadata["external_torque_quadrature"] = "internal impulse at the initial state followed by continuous constant external acceleration"
 
     @property
     def corner_count(self):
@@ -188,9 +197,16 @@ class DynamicsProblem:
         beta = self.dt * self.velocity_scale / self.position_scale
         if self.kinematic_rule == "trapezoidal":
             beta /= 2
+        groups = self.mesh.corner_groups(self.broken_faces[self.mesh.internal_faces])
+        constrained = np.isin(groups, groups[self.fixed.ravel()])
         for corner in range(count):
+            if constrained[corner]:
+                continue
             columns = np.r_[3 * corner + np.arange(3), 3 * count + 3 * corner + np.arange(3)]
             bound = np.zeros(3) if self.kinematic_rule == "backward_euler" else self.dt * self.velocities.reshape(-1, 3)[corner] / (2 * self.position_scale)
+            if self.kinematic_rule == "constant_acceleration":
+                impulse = self.external_impulse.reshape(-1, 3)[corner]
+                bound = -0.5 * self.dt * impulse / (self.corner_masses.ravel()[corner] * self.position_scale)
             factors.append(self._factor(f"kinematic:{corner}", np.tile(np.arange(3), 2), columns, np.r_[np.ones(3), -beta * np.ones(3)], bound))
         flat_positions = self.positions.reshape(-1, 3)
         for face in self.mesh.internal_faces:
@@ -242,6 +258,35 @@ class DynamicsProblem:
             angular_impulse = np.sum(np.cross(lever, self.external_impulse.reshape(-1, 3)), axis=0)
             target = (old_angular + angular_impulse) / (mass.sum() * angular_length * self.velocity_scale)
             factors.append(self._factor("angular_momentum", rows, columns, values, target))
+        environment = [contact for contact in self.contacts if contact.environment]
+        if not self.fixed.any() and environment:
+            normals = np.stack([contact.normal for contact in environment])
+            tangents = null_space(normals.T @ normals).T
+            mass = self.corner_masses.ravel()
+            columns = 3 * count + np.arange(3 * count)
+            target_momentum = np.sum(mass[:, None] * self.velocities.reshape(-1, 3), axis=0) + self.external_impulse.sum(axis=(0, 1))
+            if len(tangents):
+                coefficients = tangents[:, None, :] * (mass / mass.sum())[None, :, None]
+                factors.append(self._factor("boundary_tangential_momentum", np.repeat(np.arange(len(tangents)), 3 * count),
+                                             np.tile(columns, len(tangents)), coefficients.ravel(),
+                                             tangents @ target_momentum / (mass.sum() * self.velocity_scale)))
+            if np.allclose(normals, normals[0], rtol=1e-10, atol=1e-12):
+                normal = normals[0]
+                coefficients = mass[:, None] * normal / mass.sum()
+                factors.append(self._factor("nonnegative_boundary_normal_impulse", np.zeros(3 * count, dtype=int),
+                                             columns, coefficients.ravel(),
+                                             [float(normal @ target_momentum / (mass.sum() * self.velocity_scale))], True))
+                origin = np.average(flat_positions, axis=0, weights=mass)
+                lever = flat_positions - origin
+                length = float(np.linalg.norm(np.ptp(flat_positions, axis=0)))
+                if length <= 0:
+                    raise ValueError("boundary momentum constraints require nonzero spatial extent")
+                moment_arm = lever + self.dt * self.velocities.reshape(-1, 3) / 2 if self.kinematic_rule == "trapezoidal" else lever
+                coefficients = mass[:, None] * np.cross(normal, moment_arm) / (mass.sum() * length)
+                old_angular = np.sum(np.cross(lever, mass[:, None] * self.velocities.reshape(-1, 3)), axis=0)
+                torque = np.sum(np.cross(lever, self.external_impulse.reshape(-1, 3)), axis=0)
+                factors.append(self._factor("boundary_normal_axis_angular_momentum", np.zeros(3 * count, dtype=int), columns,
+                                             coefficients.ravel(), [float(normal @ (old_angular + torque) / (mass.sum() * length * self.velocity_scale))]))
         return tuple(factors)
 
     def unpack(self, state):
@@ -297,6 +342,8 @@ def _diagnostics(problem, state, tolerance):
     old_angular = np.sum(np.cross(old_lever, mass[:, None] * problem.velocities.reshape(-1, 3)), axis=0)
     new_angular = np.sum(np.cross(positions.reshape(-1, 3) - origin, mass[:, None] * velocities.reshape(-1, 3)), axis=0)
     supplied_angular = np.sum(np.cross(old_lever, problem.external_impulse.reshape(-1, 3)), axis=0)
+    if problem.kinematic_rule == "constant_acceleration":
+        supplied_angular += 0.5 * problem.dt * np.sum(np.cross(velocities.reshape(-1, 3), problem.external_impulse.reshape(-1, 3)), axis=0)
     angular_residual = new_angular - old_angular - supplied_angular
     angular_length = float(np.linalg.norm(np.ptp(problem.positions.reshape(-1, 3), axis=0)))
     bound = tolerance.absolute + tolerance.relative * max(float(np.max(np.abs(state), initial=0)), 1.0)
@@ -315,6 +362,7 @@ def _diagnostics(problem, state, tolerance):
         "supplied_external_angular_impulse": supplied_angular.tolist(),
         "angular_residual_or_inferred_boundary_angular_impulse": angular_residual.tolist(),
         "angular_momentum_origin": origin.tolist(),
+        "external_torque_quadrature": problem.metadata["external_torque_quadrature"],
         "closed_system_momentum_constraint": problem.metadata["boundary_momentum_verified"],
         "boundary_momentum_verified": bool(problem.metadata["boundary_momentum_verified"] and np.max(np.abs(residual)) / (problem.corner_masses.sum() * problem.velocity_scale) <= bound),
         "angular_momentum_verified": bool(problem.metadata["angular_momentum_constraint"] and np.max(np.abs(angular_residual)) / (problem.corner_masses.sum() * angular_length * problem.velocity_scale) <= bound),
@@ -323,9 +371,58 @@ def _diagnostics(problem, state, tolerance):
     }
 
 
-def _result(problem, method, state, tolerance, converged, status, iterations, history, start):
+def _constraint_system(problem):
+    systems = []
+    for inequality in (False, True):
+        rows, columns, values, bounds = [], [], [], []
+        offset = 0
+        sign = -1.0 if inequality else 1.0
+        for factor in problem.factors:
+            if factor.inequality != inequality:
+                continue
+            coo = factor.matrix.tocoo()
+            rows.append(coo.row + offset)
+            columns.append(factor.indices[coo.col])
+            values.append(sign * coo.data)
+            bounds.append(sign * factor.bound)
+            offset += len(factor.bound)
+        matrix = sparse.coo_matrix((np.concatenate(values), (np.concatenate(rows), np.concatenate(columns))),
+                                   shape=(offset, len(problem.prior))).tocsc() if values else sparse.csc_matrix((0, len(problem.prior)))
+        systems.append((matrix, np.concatenate(bounds) if bounds else np.empty(0)))
+    return tuple(systems)
+
+
+def _feasibility(problem, tolerances):
+    start = perf_counter()
+    report = {"method": "scipy.optimize.linprog / HiGHS", "scope": "supplied linear equality and inequality factors", "status": "unknown", "iterations": 0, "engine_calls": 0}
+    prior_diagnostics = _diagnostics(problem, problem.prior, tolerances)
+    if prior_diagnostics["constraints_satisfied"]:
+        report.update(method="direct feasible prior certificate", status="feasible", maximum_violation=prior_diagnostics["constraint_violation"])
+    else:
+        try:
+            (equalities, equality_bounds), (inequalities, inequality_bounds) = _constraint_system(problem)
+            result = linprog(np.zeros(len(problem.prior)), A_ub=inequalities if len(inequality_bounds) else None,
+                             b_ub=inequality_bounds if len(inequality_bounds) else None,
+                             A_eq=equalities if len(equality_bounds) else None, b_eq=equality_bounds if len(equality_bounds) else None,
+                             bounds=(None, None), method="highs",
+                             options={"primal_feasibility_tolerance": max(1e-10, min(tolerances.absolute, 1e-7))})
+            report.update(solver_status=int(result.status), solver_message=str(result.message), iterations=int(getattr(result, "nit", 0) or 0))
+            if result.status == 2:
+                report["status"] = "infeasible"
+            elif result.status == 0 and result.x is not None and np.isfinite(result.x).all():
+                certificate = _diagnostics(problem, result.x, tolerances)
+                report.update(status="feasible" if certificate["constraints_satisfied"] else "unknown", maximum_violation=certificate["constraint_violation"])
+        except Exception as error:
+            report["solver_message"] = f"{type(error).__name__}: {error}"
+    report["runtime_seconds"] = perf_counter() - start
+    return report
+
+
+def _result(problem, method, state, tolerance, converged, status, iterations, history, start, feasibility=None):
     positions, velocities = problem.unpack(state)
-    return CorrectorResult(method, positions, velocities, problem.objective(state), converged, status, iterations, _diagnostics(problem, state, tolerance), history, perf_counter() - start)
+    diagnostics = _diagnostics(problem, state, tolerance)
+    diagnostics["feasibility"] = feasibility or {"method": "not run", "status": "unknown", "iterations": 0, "runtime_seconds": 0.0, "engine_calls": 0}
+    return CorrectorResult(method, positions, velocities, problem.objective(state), converged, status, iterations, diagnostics, history, perf_counter() - start)
 
 
 def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
@@ -338,13 +435,16 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
         return _result(problem, "central", problem.prior, tolerances, False, "interrupted", 0, [], start)
     if max_iterations == 0:
         return _result(problem, "central", problem.prior, tolerances, False, "maximum_iterations", 0, [], start)
-    matrices, bounds, cones = [], [], []
-    for factor in problem.factors:
-        coo = factor.matrix.tocoo()
-        sign = -1.0 if factor.inequality else 1.0
-        matrices.append(sparse.csc_matrix((sign * coo.data, (coo.row, factor.indices[coo.col])), shape=(len(factor.bound), len(problem.prior))))
-        bounds.append(sign * factor.bound)
-        cones.append(clarabel.NonnegativeConeT(len(factor.bound)) if factor.inequality else clarabel.ZeroConeT(len(factor.bound)))
+    feasibility = _feasibility(problem, tolerances)
+    if feasibility["status"] != "feasible":
+        status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
+        return _result(problem, "central", problem.prior, tolerances, False, status, 0, [], start, feasibility)
+    if feasibility["method"] == "direct feasible prior certificate":
+        return _result(problem, "central", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
+    (equalities, equality_bounds), (inequalities, inequality_bounds) = _constraint_system(problem)
+    matrix = sparse.vstack((equalities, inequalities), format="csc")
+    bounds = np.r_[equality_bounds, inequality_bounds]
+    cones = [clarabel.ZeroConeT(len(equality_bounds)), clarabel.NonnegativeConeT(len(inequality_bounds))]
     settings = clarabel.DefaultSettings()
     settings.verbose = False
     settings.tol_feas = max(1e-12, min(tolerances.absolute, tolerances.relative or tolerances.absolute) * 0.01)
@@ -354,7 +454,7 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
         settings.max_iter = int(max_iterations)
     iterations = 0
     while True:
-        solver = clarabel.DefaultSolver(sparse.diags(problem.prior_weights, format="csc"), -problem.prior_weights * problem.prior, sparse.vstack(matrices, format="csc"), np.concatenate(bounds), cones, settings)
+        solver = clarabel.DefaultSolver(sparse.diags(problem.prior_weights, format="csc"), -problem.prior_weights * problem.prior, matrix, bounds, cones, settings)
         if cancel is not None:
             solver.set_termination_callback(lambda info: bool(cancel()))
         solution = solver.solve()
@@ -364,21 +464,36 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
         settings.max_iter *= 2
     state = np.asarray(solution.x, dtype=float) if solution.x is not None else problem.prior.copy()
     if state.shape != problem.prior.shape or not np.isfinite(state).all():
-        return _result(problem, "central", problem.prior, tolerances, False, "invalid_solver_output", iterations, [], start)
+        return _result(problem, "central", problem.prior, tolerances, False, "invalid_solver_output", iterations, [], start, feasibility)
     diagnostics = _diagnostics(problem, state, tolerances)
     converged = str(solution.status) in ("Solved", "AlmostSolved") and diagnostics["constraints_satisfied"]
     status = "interrupted" if cancel is not None and cancel() else "converged" if converged else str(solution.status)
     converged = converged and status != "interrupted"
-    return _result(problem, "central", state, tolerances, converged, status, iterations, [], start)
+    return _result(problem, "central", state, tolerances, converged, status, iterations, [], start, feasibility)
 
 
-def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, cancel: Callable[[], bool] | None = None, adaptive_rho=True):
+def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, cancel: Callable[[], bool] | None = None, adaptive_rho=True,
+                    *, progress=None, _workspace=None):
     start = perf_counter()
     tolerances = tolerances or CorrectorTolerances()
     _limit(max_iterations)
     rho = float(np.median(problem.prior_weights)) if rho is None else float(rho)
     if not np.isfinite(rho) or rho <= 0:
         raise ValueError("rho must be finite and positive")
+    if _workspace is not None:
+        _workspace.clear()
+        _workspace.update(state=problem.prior.copy(), scaled_dual=np.zeros(sum(len(factor.indices) for factor in problem.factors)),
+                          rho=rho, factor_names=tuple(factor.name for factor in problem.factors))
+    if cancel is not None and cancel():
+        return _result(problem, "consensus", problem.prior, tolerances, False, "interrupted", 0, [], start)
+    if max_iterations == 0:
+        return _result(problem, "consensus", problem.prior, tolerances, False, "maximum_iterations", 0, [], start)
+    feasibility = _feasibility(problem, tolerances)
+    if feasibility["status"] != "feasible":
+        status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
+        return _result(problem, "consensus", problem.prior, tolerances, False, status, 0, [], start, feasibility)
+    if feasibility["method"] == "direct feasible prior certificate":
+        return _result(problem, "consensus", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
     state = problem.prior.copy()
     indices = np.concatenate([factor.indices for factor in problem.factors])
     matrix = sparse.block_diag([factor.matrix for factor in problem.factors], format="csr")
@@ -428,6 +543,12 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
             violation = float(np.max(np.abs(constraint_residual), initial=0))
             constraint_tolerance = tolerances.absolute + tolerances.relative * max(float(np.max(np.abs(state), initial=0)), 1.0)
             history.append(CorrectorIteration(iteration, problem.objective(state), primal, dual_residual, primal_tolerance, dual_tolerance, violation, rho))
+            if progress and (iteration == 1 or iteration % 25 == 0):
+                progress(dict(event="corrector_iteration", method="consensus", stage="linear_constraints", iteration=iteration,
+                              objective=history[-1].objective, primal=primal, dual=dual_residual,
+                              primal_tolerance=primal_tolerance, dual_tolerance=dual_tolerance,
+                              constraint_violation=violation, constraint_tolerance=constraint_tolerance,
+                              rho=rho, runtime_seconds=perf_counter() - start))
             if primal <= primal_tolerance and dual_residual <= dual_tolerance and violation <= constraint_tolerance:
                 converged, status = True, "converged"
                 break
@@ -442,4 +563,6 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
             previous = (previous + [snapshot])[-2:]
     except KeyboardInterrupt:
         status = "interrupted"
-    return _result(problem, "consensus", state, tolerances, converged, status, iteration, history, start)
+    if _workspace is not None:
+        _workspace.update(state=state.copy(), scaled_dual=dual.copy(), rho=rho)
+    return _result(problem, "consensus", state, tolerances, converged, status, iteration, history, start, feasibility)

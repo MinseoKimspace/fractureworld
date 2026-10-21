@@ -48,6 +48,7 @@ def _case_report(trajectory, minimum):
     support_opportunities = int(trajectory.fixed[:-1].sum())
     return dict(
         case_id=trajectory.case_id, condition_digest=trajectory.condition_digest,
+        shape_family=trajectory.shape_family, mesh_fingerprint=trajectory.topology.fingerprint,
         recorded_frames=len(trajectory.times), recorded_transitions=len(trajectory),
         native_steps=int(native_steps[-1]) if native_steps is not None else None,
         native_clock_status="known" if native_steps is not None else "unknown",
@@ -73,6 +74,8 @@ def _summary(rows):
             "released_material_corner_copies", "released_original_support_vertices",
             "original_vertex_release_transition_events", "retained_support_corner_transition_examples")
     result = dict(cases=len(rows), loading_conditions=len({row["condition_digest"] for row in rows}),
+                  shape_families=sorted({row["shape_family"] for row in rows}),
+                  mesh_fingerprints=sorted({row["mesh_fingerprint"] for row in rows}),
                   case_ids=[row["case_id"] for row in rows], **{key: sum(row[key] for row in rows) for key in sums})
     for event in ("fracture", "support_release"):
         for kind in ("positive", "negative"):
@@ -86,22 +89,27 @@ def _summary(rows):
     return result
 
 
-def inspect_dynamics_dataset(directory, seed=17, overfit=False, min_post_event_steps=1, event_stratified=False):
+def inspect_dynamics_dataset(directory, seed=17, overfit=False, min_post_event_steps=1, event_stratified=False,
+                             split_unit="loading_condition", trajectories=None, stream_data=False):
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("split seed must be an integer")
     if isinstance(min_post_event_steps, bool) or not isinstance(min_post_event_steps, int) or min_post_event_steps < 1:
         raise ValueError("minimum post-event native steps must be a positive integer")
-    trajectories = load_dynamics_dataset(directory)
+    if trajectories is None:
+        trajectories = load_dynamics_dataset(directory, stream=True) if stream_data else load_dynamics_dataset(directory)
+    else:
+        trajectories = list(trajectories)
     cases = [_case_report(item, min_post_event_steps) for item in trajectories]
     by_id = {row["case_id"]: row for row in cases}
     reasons = []
     try:
-        splits = split_dynamics_cases(trajectories, seed=seed, overfit=overfit, event_stratified=event_stratified)
+        splits = split_dynamics_cases(trajectories, seed=seed, overfit=overfit, event_stratified=event_stratified,
+                                      split_unit=split_unit)
     except ValueError as error:
         splits = dict(train=[], validation=[], test=[])
         reasons.append(dict(code="split_unavailable", detail=str(error)))
     summaries = {name: _summary([by_id[item.case_id] for item in rows]) for name, rows in splits.items()}
-    case_overlap, condition_overlap = [], []
+    case_overlap, condition_overlap, shape_overlap = [], [], []
     for first, second in combinations(splits, 2):
         overlap = sorted({item.case_id for item in splits[first]} & {item.case_id for item in splits[second]})
         if overlap:
@@ -109,12 +117,18 @@ def inspect_dynamics_dataset(directory, seed=17, overfit=False, min_post_event_s
         overlap = sorted({item.condition_digest for item in splits[first]} & {item.condition_digest for item in splits[second]})
         if overlap:
             condition_overlap.append(dict(splits=[first, second], condition_digests=overlap))
-    if case_overlap or condition_overlap:
+        overlap = sorted({item.shape_family for item in splits[first]} & {item.shape_family for item in splits[second]})
+        if overlap:
+            shape_overlap.append(dict(splits=[first, second], shape_families=overlap))
+    if case_overlap or condition_overlap or (split_unit == "shape_family" and shape_overlap):
         reasons.append(dict(code="split_leakage", detail="a complete case or loading condition occurs in multiple splits"))
     if overfit:
         reasons.append(dict(code="overfit_debug", detail="debug training has no held-out validation or test cases"))
+    required_events = ["fracture"]
+    if any(row["has_support_supervision"] for row in cases):
+        required_events.append("support_release")
     for name, summary in summaries.items():
-        for event in ("fracture", "support_release"):
+        for event in required_events:
             for kind in ("positive", "negative"):
                 if summary[f"{event}_{kind}_cases"] == 0:
                     reasons.append(dict(code="missing_event_class", split=name, event=event, missing=kind))
@@ -130,18 +144,25 @@ def inspect_dynamics_dataset(directory, seed=17, overfit=False, min_post_event_s
     return dict(
         schema="fracture-world.dynamics-dataset-readiness.v1",
         status="ready" if not reasons else "not_ready", ready_for_training=not reasons,
-        readiness_scope="minimum event-class and held-out coverage for fracture plus learned support release",
+        readiness_scope="minimum event-class and held-out coverage for applicable events",
+        required_events=required_events,
+        support_release_status="required" if "support_release" in required_events else "not_applicable_no_fixed_vertices",
         minimum_post_event_native_steps=min_post_event_steps,
         post_event_window_rule="at least one positive case per event and split continues after its first event",
         split_seed=seed, overfit_debug=overfit, event_stratified=event_stratified,
-        split_strategy="overfit_debug" if overfit else "event_stratified_loading_conditions" if event_stratified else "hashed_loading_conditions",
+        split_strategy="overfit_debug" if overfit else ("event_stratified_" if event_stratified else "hashed_") +
+                       ("shape_families" if split_unit == "shape_family" else "loading_conditions"),
         reasons=reasons, totals=_summary(cases), splits=summaries, cases=cases,
-        leakage=dict(split_unit="complete_loading_condition", case_ids_disjoint=not case_overlap,
+        leakage=dict(split_unit="complete_shape_family" if split_unit == "shape_family" else "complete_loading_condition",
+                     case_ids_disjoint=not case_overlap,
                      loading_conditions_disjoint=not condition_overlap,
-                     case_overlaps=case_overlap, condition_overlaps=condition_overlap),
+                     shape_families_disjoint=not shape_overlap,
+                     case_overlaps=case_overlap, condition_overlaps=condition_overlap, shape_overlaps=shape_overlap),
         provenance=dict(labels="recorded FEMFX numerical teacher trajectories", physical_ground_truth=False,
                         event_labels_used_for_split_only=bool(event_stratified and not overfit),
-                        native_engine_calls=0, loading="all validated trajectories are loaded into host memory"),
+                        native_engine_calls=0,
+                        loading="validated case-wise streaming" if stream_data or any(hasattr(item, "velocity_rms") for item in trajectories)
+                        else "all validated trajectories are loaded into host memory"),
         limitations=["minimum coverage does not establish dataset size, generalization or physical validity",
                      "original support vertex counts are summed per case; material-corner copies are not independent supports",
                      "release labels may affect only some material copies of an original support vertex"],
