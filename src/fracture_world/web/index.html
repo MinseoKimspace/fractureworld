@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" translate="no">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -14,7 +14,7 @@
 <header><div><div class="eyebrow">Fracture World / Geometry and motion</div><h1 id="title">Recorded fragment motion</h1></div><span id="source">Loading artifact</span></header>
 <main><canvas id="scene"></canvas><div id="status">Loading recorded geometry and poses…</div><button id="topology">Show topology</button><span id="hint">Drag to orbit · Scroll to zoom · Z up</span></main>
 <div class="display-controls"><label><input id="components" type="checkbox" checked>Component colors</label><label class="crack-label"><input id="cracks" type="checkbox" checked>Crack surfaces</label><label><input id="wireframe" type="checkbox">Wireframe</label><label class="support-label"><input id="supports" type="checkbox">Fixed supports</label><button id="screenshot">Save PNG</button></div>
-<div class="controls"><button id="play" disabled>Play</button><input id="scrub" type="range" min="0" max="0" value="0" aria-label="Replay frame"><span id="time">0.000 s</span><select id="speed" aria-label="Playback speed"><option value="0.001">0.001x slow motion</option><option value="0.01">0.01x slow motion</option><option value="0.25">0.25x speed</option><option value="1" selected>1x speed</option><option value="2">2x speed</option></select></div>
+<div class="controls"><button id="play" disabled>Play</button><input id="scrub" type="range" min="0" max="0" value="0" aria-label="Replay frame"><span id="time">0.000 s</span><select id="speed" aria-label="Playback speed"><option value="0.001">0.001x slow motion</option><option value="0.005">0.005x slow motion</option><option value="0.01">0.01x slow motion</option><option value="0.25">0.25x speed</option><option value="1" selected>1x speed</option><option value="2">2x speed</option></select></div>
 <div class="metrics" id="metrics"><select id="metric" aria-label="Recorded metric"></select><canvas id="plot"></canvas></div>
 <details><summary>Artifact details</summary><pre id="metadata"></pre></details>
 <script type="module">import('/replay.js').catch(error=>{document.querySelector('#status').textContent=`Viewer could not load: ${error.message}${error.message.includes('fetch')?'. Check the pinned Three.js CDN connection.':''}`;document.querySelector('#status').classList.add('error');});</script>

@@ -73,10 +73,14 @@ def _read_rollout(directory, teacher):
     return report, arrays
 
 
+def _native_clock(context):
+    return np.r_[0.0, np.cumsum(np.full(context["steps"], np.float32(context["dt"])), dtype=np.float32).astype(float)]
+
+
 def _time_alignment(teacher, times):
     context = teacher.metadata["conditioning_context"]
     dt = float(np.float32(context["dt"]))
-    native_clock = np.r_[0.0, np.cumsum(np.full(context["steps"], np.float32(dt)), dtype=np.float32).astype(float)]
+    native_clock = _native_clock(context)
     epsilon = np.finfo(np.float32).eps
     initial_record = int(np.argmin(np.abs(teacher.times - times[0])))
     if abs(teacher.times[initial_record] - times[0]) > 8 * epsilon * max(dt, abs(float(times[0]))):
@@ -234,6 +238,8 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
                   generalization_protocol=report.get("generalization_protocol", "loading_condition"),
                   held_out_condition=report.get("condition_split") in {"validation", "test", "unseen_condition"} and not report.get("overfit_debug", False),
                   compared_frames=len(frames), compared_future_frames=len(future), unmatched_rollout_frames=len(arrays["times"]) - len(frames),
+                  last_compared_native_step=int(native_steps[predicted_frames[-1]]),
+                  last_rollout_native_step=int(native_steps[-1]),
                   time_alignment="native integer step IDs; float32 accumulated teacher clock and analytic rollout clock",
                   initial_teacher_frame=initial_frame, position_mass_weighted_rmse_m=mean("position_mass_weighted_rmse_m"),
                   velocity_mass_weighted_rmse_m_per_s=mean("velocity_mass_weighted_rmse_m_per_s"),

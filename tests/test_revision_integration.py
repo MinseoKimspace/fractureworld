@@ -75,8 +75,43 @@ def test_physical_correction_can_prefer_a_sampled_fracture_without_reference_lab
     objectives = {}
     for broken in (False, True):
         result, diagnostic = _correct(initial, positions, velocities, proposal, np.array([broken]),
-                                      np.zeros(8, dtype=bool), model, RolloutConfig(), method)
+                                      np.zeros(8, dtype=bool), model, RolloutConfig(), method,
+                                      previous_broken=np.zeros(1, dtype=bool))
         assert result is not None, diagnostic
         assert result.diagnostics["energy"]["energy_satisfied"]
         objectives[broken] = result.objective
     assert objectives[True] < 0.01 * objectives[False]
+
+
+@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("topology_state", ["disconnected", "previously_fractured"])
+def test_full_corrector_prevents_force_free_momentum_exchange_between_separated_fragments(method, topology_state):
+    tetrahedron = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
+    if topology_state == "disconnected":
+        mesh = VolumeMesh(np.concatenate((tetrahedron + [-3, 0, 0], tetrahedron + [3, 0, 0])),
+                          np.arange(8).reshape(2, 4))
+        positions = mesh.nodes[mesh.tets]
+    else:
+        mesh = VolumeMesh(np.concatenate((tetrahedron, [[0., 0., -1.]])), [[0, 1, 2, 3], [0, 2, 1, 4]])
+        positions = mesh.nodes[mesh.tets] + np.array([[0., 0., 3.], [0., 0., -3.]])[:, None]
+    broken = np.ones(len(mesh.internal_faces), dtype=bool)
+    direction = positions[1].mean(axis=0) - positions[0].mean(axis=0)
+    direction /= np.linalg.norm(direction)
+    velocities = np.repeat(np.array([direction, -mesh.volumes[0] / mesh.volumes[1] * direction]), 4, axis=0)
+    positions = positions.reshape(-1, 3)
+    initial = SimpleNamespace(topology=SimpleNamespace(mesh=mesh, masses=np.repeat(mesh.volumes / 4, 4)),
+                              dt=.01, gravity=np.zeros(3), metadata={},
+                              material=dict(rest_density=1., youngs_modulus=1000., poissons_ratio=.25))
+    model = SimpleNamespace(config=dict(velocity_scale=1., motion_prior="constant_acceleration"))
+    proposal = dict(positions=torch.tensor(positions - initial.dt * velocities), velocities=torch.tensor(-velocities))
+    result, diagnostics = _correct(initial, positions, velocities, proposal, broken,
+                                   np.zeros(8, dtype=bool), model, RolloutConfig(), method,
+                                   previous_broken=broken)
+    assert result is not None, diagnostics
+    np.testing.assert_allclose(result.velocities.reshape(-1, 3), velocities, atol=1e-6)
+    assert result.objective > 0
+    assert result.diagnostics["free_momentum_island_count"] == 2
+    assert result.diagnostics["free_momentum_islands_verified"]
+    assert result.diagnostics["energy"]["energy_satisfied"]
+    assert diagnostics["geometry"]["valid"]
+    assert diagnostics["swept_geometry"]["valid"]

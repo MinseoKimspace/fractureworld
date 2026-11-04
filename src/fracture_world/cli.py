@@ -46,6 +46,8 @@ def parser():
     dynamics_training = commands.add_parser("dynamics-train", help="Train engine-free motion, irreversible fracture flow and optional support release")
     dynamics_training.add_argument("--data", type=Path, required=True)
     dynamics_training.add_argument("--output", type=Path, required=True)
+    dynamics_training.add_argument("--resume", type=Path,
+                                   help="Resume a new-format last.pt from its completed epoch, preserving optimizer and random states")
     dynamics_training.add_argument("--epochs", type=int, required=True)
     dynamics_training.add_argument("--corrector-epochs", type=int, default=0)
     dynamics_training.add_argument("--rollout-steps", type=int, default=1,
@@ -164,7 +166,7 @@ def run(args):
         from .dynamics_learning import DynamicsTrainingConfig, train_dynamics
 
         config = DynamicsTrainingConfig(**{name: getattr(args, name) for name in DynamicsTrainingConfig.__dataclass_fields__})
-        output({"checkpoint": str(train_dynamics(args.data, args.output, config))})
+        output({"checkpoint": str(train_dynamics(args.data, args.output, config, resume=args.resume))})
     elif args.command == "dynamics-initial":
         from .dynamics_initial import export_initial
 

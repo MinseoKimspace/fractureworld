@@ -9,10 +9,10 @@ import torch
 
 from fracture_world.dynamics_data import material_topology
 from fracture_world.dynamics_geometry import face_corner_pairs
-from fracture_world.dynamics_initial import SCHEMA
+from fracture_world.dynamics_initial import SCHEMA, load_initial
 from fracture_world.dynamics_learning import FORMAT
 from fracture_world.dynamics_model import NeuralDynamicsCorrector, TemporalDynamicsModel
-from fracture_world.dynamics_runtime import RolloutConfig, release_supports, rollout_dynamics
+from fracture_world.dynamics_runtime import RolloutConfig, _problem, release_supports, rollout_dynamics
 from fracture_world.mesh import VolumeMesh
 
 
@@ -115,6 +115,81 @@ def test_intact_material_corner_group_retains_support_until_all_fixed_copies_req
     assert not separated[~fixed].any()
 
 
+@pytest.mark.parametrize("candidate_broken", [False, True])
+def test_fm_candidate_supports_reapply_unclamped_motion_after_topology_selection(tmp_path, monkeypatch, candidate_broken):
+    checkpoint, initial, topology, fixed = portable_rollout_inputs(tmp_path, learned_supports=True, has_corrector=False)
+    pair = topology.face_pairs[0, 0]
+
+    def predict(self, batch):
+        corner_context = torch.zeros(8, 12)
+        corner_context[pair[0], 0] = 4
+        corner_context[pair[1], 0] = -4
+        with torch.no_grad():
+            self.support_head.weight.zero_()
+            self.support_head.weight[0, 0] = 1
+            self.support_head.bias.zero_()
+            self.fracture_head.bias.fill_(-4 if candidate_broken else 4)
+        return self._prediction(batch, corner_context, torch.zeros(1, 12))
+
+    monkeypatch.setattr(TemporalDynamicsModel, "forward", predict)
+    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise:
+                        torch.full((1,), 1. if candidate_broken else -1.))
+    output = tmp_path / "candidate"
+    report = rollout_dynamics(checkpoint, initial, output, 1, "raw",
+                              RolloutConfig(fracture_samples=1, fracture_policy="shared_sample", flow_steps=1), "cpu")
+    assert report["status"] == "completed"
+    with np.load(output / "trajectory.npz", allow_pickle=False) as archive:
+        assert archive["broken"][1, 0] == candidate_broken
+        if candidate_broken:
+            assert not archive["fixed"][1, pair[0]]
+            assert archive["fixed"][1, pair[1]]
+            assert archive["velocities"][1, pair[0], 2] < 0
+        else:
+            assert_array_equal(archive["fixed"][1], fixed)
+        assert_allclose(archive["velocities"][1, archive["fixed"][1]], 0)
+
+
+@pytest.mark.parametrize("previous", [np.array(False), np.array([], dtype=bool), np.array([False, False]), np.array([0]), np.array([np.nan])])
+def test_previous_fracture_topology_rejects_broadcast_or_nonboolean_inputs(tmp_path, previous):
+    checkpoint, initial_path, _, _ = portable_rollout_inputs(tmp_path)
+    initial = load_initial(initial_path)
+    model = TemporalDynamicsModel(**torch.load(checkpoint, weights_only=True)["model_config"])
+    with pytest.raises(ValueError, match="previous_broken must be a Boolean vector"):
+        _problem(initial, initial.positions, initial.velocities, initial.positions, initial.velocities,
+                 initial.broken, initial.fixed, (), model, RolloutConfig(), previous_broken=previous)
+
+
+@pytest.mark.parametrize("previous", [np.array(False), np.array([], dtype=bool), np.zeros(8, dtype=int), np.zeros((2, 4), dtype=bool)])
+def test_previous_support_state_rejects_broadcast_or_nonboolean_inputs(tmp_path, previous):
+    checkpoint, initial_path, _, _ = portable_rollout_inputs(tmp_path)
+    initial = load_initial(initial_path)
+    model = TemporalDynamicsModel(**torch.load(checkpoint, weights_only=True)["model_config"])
+    with pytest.raises(ValueError, match="previous_fixed must be a Boolean vector"):
+        _problem(initial, initial.positions, initial.velocities, initial.positions, initial.velocities,
+                 initial.broken, initial.fixed, (), model, RolloutConfig(), previous_fixed=previous)
+
+
+def test_runtime_passes_start_supports_when_a_candidate_releases_them(tmp_path, monkeypatch):
+    from fracture_world import dynamics_runtime
+
+    checkpoint, initial_path, _, fixed = portable_rollout_inputs(tmp_path, learned_supports=True)
+    original = dynamics_runtime._correct
+    observed = []
+
+    def recorded(*args, **kwargs):
+        observed.append((args[5].copy(), kwargs["previous_fixed"].copy()))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dynamics_runtime, "_correct", recorded)
+    report = rollout_dynamics(checkpoint, initial_path, tmp_path / "released-consensus", 1, "central",
+                              RolloutConfig(fracture_policy="marginal_search", fracture_samples=0), "cpu")
+    assert report["completed_steps"] == 1
+    assert observed
+    for next_fixed, previous_fixed in observed:
+        assert not next_fixed.any()
+        assert_array_equal(previous_fixed, fixed)
+
+
 def test_missing_neural_corrector_is_rejected_before_rollout(tmp_path):
     checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path, has_corrector=False)
     with pytest.raises(ValueError, match="no trained neural corrector"):
@@ -184,9 +259,39 @@ def test_default_fracture_policy_uses_only_flow_samples():
     assert RolloutConfig(fracture_policy="marginal_search", fracture_samples=0).fracture_policy == "marginal_search"
 
 
+@pytest.mark.parametrize("settings", [
+    {"fracture_samples": 1.5}, {"fracture_samples": True}, {"flow_steps": 1.5}, {"flow_steps": True},
+    {"max_iterations": True}, {"max_contact_iterations": False},
+])
+def test_rollout_configuration_rejects_noninteger_counts_before_execution(settings):
+    with pytest.raises(ValueError, match="integer|iteration budgets"):
+        RolloutConfig(**settings)
+
+
+def test_boolean_rollout_length_is_rejected_before_loading_files(tmp_path):
+    with pytest.raises(ValueError, match="positive number of steps"):
+        rollout_dynamics(tmp_path / "missing.pt", tmp_path / "missing.npz", tmp_path / "output", True)
+    assert not (tmp_path / "output").exists()
+
+
+def test_physics_only_replay_identifies_the_unlearned_baseline(tmp_path):
+    checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
+    directory = tmp_path / "physics-replay"
+    report = rollout_dynamics(checkpoint, initial, directory, 1, "physics", device="cpu")
+    replay = json.loads((directory / "replay.json").read_text())
+    assert report["predictor_calls"] == 0
+    assert report["constitutive_response"] == "none; constant acceleration with prescribed current supports"
+    assert report["fracture_choice"] == "initial fracture topology held fixed; no new fracture generation"
+    assert report["contact_law"] == "not enforced; endpoint and swept geometry are diagnostics only"
+    assert replay["title"] == "Constant-acceleration physics baseline"
+    assert replay["source"] == "constant-acceleration physical prediction; no learned dynamics or fracture generation"
+    assert replay["metadata"]["method"] == "physics"
+
+
 @pytest.mark.parametrize("stage", ["predictor", "neural"])
 @pytest.mark.parametrize("field", ["positions", "velocities", "position_increment", "velocity_increment",
-                                   "fracture_probability", "support_release_probability"])
+                                   "fracture_probability", "support_release_probability",
+                                   "unconstrained_position_increment", "unconstrained_velocity_increment"])
 def test_nonfinite_predictions_save_failure_report_before_geometry_or_optimization(tmp_path, monkeypatch, stage, field):
     checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
     network = TemporalDynamicsModel if stage == "predictor" else NeuralDynamicsCorrector
@@ -215,6 +320,30 @@ def test_nonfinite_predictions_save_failure_report_before_geometry_or_optimizati
         assert len(archive["times"]) == 1
         assert np.isfinite(archive["positions"]).all()
         assert np.isfinite(archive["velocities"]).all()
+
+
+@pytest.mark.parametrize("field", ["unconstrained_position_increment", "unconstrained_velocity_increment"])
+def test_nonfinite_hidden_support_motion_is_rejected_before_fm_can_restore_it(tmp_path, monkeypatch, field):
+    checkpoint, initial, _, fixed = portable_rollout_inputs(tmp_path, learned_supports=True, has_corrector=False)
+    original = TemporalDynamicsModel.forward
+
+    def corrupted(self, batch):
+        with torch.no_grad():
+            self.support_head.bias.fill_(-4)
+        output = original(self, batch)
+        assert output["next_fixed"][batch["fixed"]].all()
+        assert torch.isfinite(output["positions"]).all()
+        assert torch.isfinite(output["velocities"]).all()
+        output[field] = output[field].clone()
+        output[field][torch.as_tensor(fixed), 0] = float("nan")
+        return output
+
+    monkeypatch.setattr(TemporalDynamicsModel, "forward", corrupted)
+    report = rollout_dynamics(checkpoint, initial, tmp_path / "hidden-nonfinite", 1, "raw", device="cpu")
+    assert report["status"] == "nonfinite_prediction"
+    assert report["completed_steps"] == 0
+    assert report["fracture_flow_calls"] == 0
+    assert field in report["events"][-1]["reason"]
 
 
 def test_nonfinite_flow_sample_is_not_silently_thresholded_into_an_unbroken_mask(tmp_path, monkeypatch):

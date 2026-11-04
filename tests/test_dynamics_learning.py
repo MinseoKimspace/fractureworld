@@ -238,3 +238,91 @@ def test_cli_rollout_window_matches_training_config():
 def test_training_rejects_invalid_autoregressive_window_before_loading_data(tmp_path, steps):
     with pytest.raises(ValueError, match="rollout_steps"):
         train_dynamics(tmp_path / "missing", tmp_path / "unused", training_config(rollout_steps=steps))
+
+
+def test_validation_flow_is_repeatable_and_does_not_advance_training_random_state(tmp_path):
+    case, path = recorded_trajectory(tmp_path / "data")
+    trajectory = load_dynamics_trajectory(case, path)
+    model = TemporalDynamicsModel(hidden=12, heads=3, graph_layers=2, **_scales([trajectory])).eval()
+    state = torch.get_rng_state().clone()
+    results = []
+    for _ in range(2):
+        generator = dynamics_learning._validation_generator(trajectory.case_id, 0, 17, "cpu")
+        with torch.no_grad():
+            results.append(_rollout_loss(model, trajectory, 0, "cpu", training_config(rollout_steps=2),
+                                         flow_generator=generator))
+    torch.testing.assert_close(results[0][0], results[1][0], atol=0, rtol=0)
+    for key in results[0][1]:
+        torch.testing.assert_close(results[0][1][key], results[1][1][key], atol=0, rtol=0)
+    torch.testing.assert_close(torch.get_rng_state(), state, atol=0, rtol=0)
+    first = torch.randn(8, generator=dynamics_learning._validation_generator("first", 0, 17, "cpu"))
+    other = torch.randn(8, generator=dynamics_learning._validation_generator("other", 0, 17, "cpu"))
+    assert not torch.equal(first, other)
+
+
+def test_atomic_checkpoint_keeps_previous_file_when_serialization_fails(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "last.pt"
+    dynamics_learning._atomic_checkpoint(checkpoint, {"value": torch.tensor([3.])})
+
+    def fail_save(document, stream):
+        stream.write(b"incomplete serialization")
+        raise OSError("simulated disk error")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    with pytest.raises(OSError, match="simulated disk error"):
+        dynamics_learning._atomic_checkpoint(checkpoint, {"value": torch.tensor([4.])})
+    torch.testing.assert_close(torch.load(checkpoint, weights_only=True)["value"], torch.tensor([3.]))
+    assert list(tmp_path.iterdir()) == [checkpoint]
+
+
+@pytest.mark.parametrize("interrupted_stage", ["predictor", "neural_corrector"])
+def test_completed_epoch_resume_matches_uninterrupted_predictor_and_corrector(tmp_path, monkeypatch, interrupted_stage):
+    recorded_trajectory(tmp_path / "data")
+    config = training_config(epochs=2, corrector_epochs=2, learn_support_release=False)
+    uninterrupted = train_dynamics(tmp_path / "data", tmp_path / "uninterrupted", config)
+    save = dynamics_learning._atomic_checkpoint
+
+    def stop_after_completed_epoch(path, checkpoint):
+        save(path, checkpoint)
+        state = checkpoint.get("training_state", {})
+        if state.get("stage") == interrupted_stage and state.get("completed_epoch") == 1:
+            raise KeyboardInterrupt("simulated interruption")
+
+    monkeypatch.setattr(dynamics_learning, "_atomic_checkpoint", stop_after_completed_epoch)
+    output = tmp_path / "resumed"
+    with pytest.raises(KeyboardInterrupt, match="simulated interruption"):
+        train_dynamics(tmp_path / "data", output, config)
+    assert (output / "best.pt").is_file()
+    load_dynamics_model(output / "best.pt", "cpu")
+    last = torch.load(output / "last.pt", weights_only=True)
+    assert last["training_state"]["optimizer"]["state"]
+    assert set(last["training_state"]["random_state"]) == {"python", "numpy", "torch", "cuda"}
+    monkeypatch.setattr(dynamics_learning, "_atomic_checkpoint", save)
+    resumed = train_dynamics(tmp_path / "data", output, config, resume=output / "last.pt")
+    expected = torch.load(uninterrupted, weights_only=True)
+    actual = torch.load(resumed, weights_only=True)
+    for name in ("model", "corrector"):
+        for key in expected[name]:
+            torch.testing.assert_close(actual[name][key], expected[name][key], atol=0, rtol=0)
+    expected_last = torch.load(uninterrupted.parent / "last.pt", weights_only=True)
+    actual_last = torch.load(resumed.parent / "last.pt", weights_only=True)
+    torch.testing.assert_close(actual_last["training_state"]["random_state"]["torch"],
+                               expected_last["training_state"]["random_state"]["torch"], atol=0, rtol=0)
+
+
+def test_resume_rejects_inference_only_legacy_checkpoint_without_overwriting_it(tmp_path):
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save({"format": dynamics_learning.FORMAT, "model": {}}, checkpoint)
+    with pytest.raises(ValueError, match="legacy model weights remain valid for inference"):
+        train_dynamics(tmp_path / "missing", tmp_path / "output", training_config(), resume=checkpoint)
+    assert torch.load(checkpoint, weights_only=True) == {"format": dynamics_learning.FORMAT, "model": {}}
+
+
+def test_cli_exposes_epoch_checkpoint_resume_without_changing_training_configuration():
+    from fracture_world.cli import parser
+
+    arguments = parser().parse_args(["dynamics-train", "--data", "data", "--output", "output", "--epochs", "2",
+                                    "--resume", "output/last.pt"])
+    assert arguments.resume.name == "last.pt"
+    config = DynamicsTrainingConfig(**{name: getattr(arguments, name) for name in DynamicsTrainingConfig.__dataclass_fields__})
+    assert config.epochs == 2

@@ -505,5 +505,7 @@ def split_dynamics_cases(trajectories, seed=17, overfit=False, event_stratified=
             selections["validation"].extend(ordered[:count])
             selections["test"].extend(ordered[count:count * 2])
             selections["train"].extend(ordered[count * 2:])
+    if any(not keys for keys in selections.values()):
+        raise ValueError("event-stratified splitting requires nonempty train, validation and test partitions; add loading groups or disable event stratification")
     return {name: sorted((item for key in keys for item in groups[key]), key=lambda item: item.case_id)
             for name, keys in selections.items()}

@@ -8,6 +8,7 @@ from scipy.linalg import null_space, pinvh
 from scipy.optimize import linprog
 
 from .mesh import VolumeMesh
+from .partition import component_labels
 
 
 def _finite_array(value, shape, name):
@@ -109,11 +110,14 @@ class DynamicsProblem:
     position_weight: float = 1.0
     velocity_weight: float = 1.0
     kinematic_rule: str = "backward_euler"
+    previous_broken_faces: np.ndarray | None = None
+    previous_fixed: np.ndarray | None = None
     corner_masses: np.ndarray = field(init=False)
     prior: np.ndarray = field(init=False, repr=False)
     prior_weights: np.ndarray = field(init=False, repr=False)
     factors: tuple[_Factor, ...] = field(init=False, repr=False)
     metadata: dict = field(init=False)
+    momentum_islands: tuple[np.ndarray, ...] = field(init=False, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.mesh, VolumeMesh):
@@ -140,6 +144,16 @@ class DynamicsProblem:
             setattr(self, name, value)
         if self.broken_faces[self.mesh.faces.cells[:, 1] < 0].any():
             raise ValueError("only internal material faces can be broken")
+        previous = self.broken_faces if self.previous_broken_faces is None else np.asarray(self.previous_broken_faces)
+        if previous.shape != self.broken_faces.shape or previous.dtype != np.dtype(bool):
+            raise ValueError("previous_broken_faces must match the Boolean material-face array")
+        if np.any(previous & ~self.broken_faces):
+            raise ValueError("previously broken material faces cannot become intact")
+        self.previous_broken_faces = previous.copy()
+        previous_fixed = self.fixed if self.previous_fixed is None else np.asarray(self.previous_fixed)
+        if previous_fixed.shape != shape[:2] or previous_fixed.dtype != np.dtype(bool):
+            raise ValueError("previous_fixed must match the Boolean material-corner support array")
+        self.previous_fixed = previous_fixed.copy()
         self.external_impulse = np.zeros(shape) if self.external_impulse is None else _finite_array(self.external_impulse, shape, "external_impulse")
         self.contacts = tuple(self.contacts)
         count = 4 * len(self.mesh.tets)
@@ -156,8 +170,10 @@ class DynamicsProblem:
         fractions = np.repeat((self.corner_masses / self.corner_masses.sum()).ravel(), 3)
         self.prior_weights = np.r_[self.position_weight * fractions, self.velocity_weight * fractions]
         self.prior = np.r_[((self.predicted_positions - self.positions) / self.position_scale).ravel(), (self.predicted_velocities / self.velocity_scale).ravel()]
+        self.momentum_islands = self._momentum_islands()
         self.factors = self._build_factors()
-        closed = not self.fixed.any() and not any(contact.environment for contact in self.contacts)
+        supported = bool(self.fixed.any() or self.previous_fixed.any())
+        closed = not supported and not any(contact.environment for contact in self.contacts)
         self.metadata = {
             "engine_calls": 0,
             "state_representation": "one Lagrangian corner per material tetrahedron vertex",
@@ -165,10 +181,15 @@ class DynamicsProblem:
             "kinematic_rule": self.kinematic_rule,
             "contact_geometry": "supplied frozen linearized normal constraints",
             "contact_law": "nonpenetration only; no verified impulse or restitution law",
-            "momentum_constraint": "exact global linear and angular momentum with supplied point impulses" if closed else "external reaction inferred; boundary momentum not independently verified",
+            "momentum_constraint": "linear and angular momentum per closed interaction island; external reaction inferred on supported or environment-contact islands",
+            "momentum_partition": "start-of-step intact material connectivity plus current contact hyperedges",
+            "momentum_island_count": len(self.momentum_islands),
+            "newly_broken_faces": int(np.count_nonzero(self.broken_faces & ~self.previous_broken_faces)),
+            "released_support_corners": int(np.count_nonzero(self.previous_fixed & ~self.fixed)),
+            "support_reaction_interval": "supports present at either endpoint may contribute an unmeasured reaction during the step",
             "boundary_momentum_verified": closed,
             "angular_momentum_constraint": closed,
-            "frictionless_boundary_projection": not self.fixed.any() and any(contact.environment for contact in self.contacts),
+            "frictionless_boundary_projection": not supported and any(contact.environment for contact in self.contacts),
             "external_torque_quadrature": "supplied point impulses act at current material-corner positions",
             "feasibility_check": "shared HiGHS linear feasibility presolve; solver failure is unknown",
             "position_scale": self.position_scale,
@@ -190,6 +211,19 @@ class DynamicsProblem:
         indices, local = np.unique(columns, return_inverse=True)
         matrix = sparse.csr_matrix((values, (rows, local)), shape=(len(bound), len(indices)))
         return _Factor(name, indices, matrix, np.asarray(bound, dtype=float), inequality)
+
+    def _momentum_islands(self):
+        edges = list(self.mesh.dual_edges[~self.previous_broken_faces[self.mesh.internal_faces]])
+        for contact in self.contacts:
+            cells = np.unique(contact.corner_ids[contact.weights != 0] // 4)
+            edges.extend((cells[0], cell) for cell in cells[1:])
+        edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+        labels = component_labels(len(self.mesh.tets), edges, np.zeros(len(edges), dtype=bool))
+        return tuple(np.flatnonzero(np.repeat(labels, 4) == label) for label in np.unique(labels))
+
+    def _island_environment(self, corners):
+        return [contact for contact in self.contacts if contact.environment
+                and np.isin(contact.corner_ids[contact.weights != 0], corners).any()]
 
     def _build_factors(self):
         factors = []
@@ -233,61 +267,58 @@ class DynamicsProblem:
             values = (contact.weights[:, None] * contact.normal).ravel()
             bound = [(-contact.gap + self.dt * contact.environment_velocity) / self.position_scale]
             factors.append(self._factor(f"contact:{index}", np.zeros(len(columns), dtype=int), columns, values, bound, True))
-        if not self.fixed.any() and not any(contact.environment for contact in self.contacts):
-            mass = self.corner_masses.ravel()
-            rows = np.tile(np.arange(3), count)
-            columns = 3 * count + np.arange(3 * count)
-            values = np.repeat(mass / mass.sum(), 3)
-            target = (np.sum(self.corner_masses[..., None] * self.velocities, axis=(0, 1)) + self.external_impulse.sum(axis=(0, 1))) / (mass.sum() * self.velocity_scale)
-            factors.append(self._factor("linear_momentum", rows, columns, values, target))
-            origin = np.average(flat_positions, axis=0, weights=mass)
-            lever = flat_positions - origin
-            angular_length = float(np.linalg.norm(np.ptp(flat_positions, axis=0)))
-            if angular_length <= 0:
-                raise ValueError("current material corners must have nonzero spatial extent")
-            moment_arm = lever.copy()
-            if self.kinematic_rule == "trapezoidal":
-                moment_arm += self.dt * self.velocities.reshape(-1, 3) / 2
-            rows, columns, values = [], [], []
-            for corner, arm in enumerate(moment_arm / angular_length):
-                cross = np.array([[0, -arm[2], arm[1]], [arm[2], 0, -arm[0]], [-arm[1], arm[0], 0]])
-                rows.extend(np.repeat(np.arange(3), 3))
-                columns.extend(np.tile(3 * count + 3 * corner + np.arange(3), 3))
-                values.extend((mass[corner] / mass.sum() * cross).ravel())
-            old_angular = np.sum(np.cross(lever, mass[:, None] * self.velocities.reshape(-1, 3)), axis=0)
-            angular_impulse = np.sum(np.cross(lever, self.external_impulse.reshape(-1, 3)), axis=0)
-            target = (old_angular + angular_impulse) / (mass.sum() * angular_length * self.velocity_scale)
-            factors.append(self._factor("angular_momentum", rows, columns, values, target))
-        environment = [contact for contact in self.contacts if contact.environment]
-        if not self.fixed.any() and environment:
+        for island, corners in enumerate(self.momentum_islands):
+            factors.extend(self._momentum_factors(corners, "" if len(self.momentum_islands) == 1 else f":{island}"))
+        return tuple(factors)
+
+    def _momentum_factors(self, corners, suffix):
+        if (self.fixed | self.previous_fixed).ravel()[corners].any():
+            return []
+        factors = []
+        mass = self.corner_masses.ravel()[corners]
+        positions = self.positions.reshape(-1, 3)[corners]
+        velocities = self.velocities.reshape(-1, 3)[corners]
+        impulse = self.external_impulse.reshape(-1, 3)[corners]
+        columns = 3 * self.corner_count + (3 * corners[:, None] + np.arange(3)).ravel()
+        target_momentum = np.sum(mass[:, None] * velocities + impulse, axis=0)
+        origin = np.average(positions, axis=0, weights=mass)
+        lever = positions - origin
+        length = float(np.linalg.norm(np.ptp(positions, axis=0)))
+        if length <= 0:
+            raise ValueError("momentum islands require nonzero spatial extent")
+        moment_arm = lever + self.dt * velocities / 2 if self.kinematic_rule == "trapezoidal" else lever
+        old_angular = np.sum(np.cross(lever, mass[:, None] * velocities), axis=0)
+        torque = np.sum(np.cross(lever, impulse), axis=0)
+        environment = self._island_environment(corners)
+        if not environment:
+            factors.append(self._factor(f"linear_momentum{suffix}", np.tile(np.arange(3), len(corners)), columns,
+                                        np.repeat(mass / mass.sum(), 3), target_momentum / (mass.sum() * self.velocity_scale)))
+            cross = np.zeros((len(corners), 3, 3))
+            cross[:, 0, 1], cross[:, 0, 2] = -moment_arm[:, 2], moment_arm[:, 1]
+            cross[:, 1, 0], cross[:, 1, 2] = moment_arm[:, 2], -moment_arm[:, 0]
+            cross[:, 2, 0], cross[:, 2, 1] = -moment_arm[:, 1], moment_arm[:, 0]
+            factors.append(self._factor(f"angular_momentum{suffix}", np.tile(np.repeat(np.arange(3), 3), len(corners)),
+                                        (3 * self.corner_count + 3 * corners[:, None] + np.tile(np.arange(3), 3)).ravel(),
+                                        (mass[:, None, None] * cross / (mass.sum() * length)).ravel(),
+                                        (old_angular + torque) / (mass.sum() * length * self.velocity_scale)))
+        else:
             normals = np.stack([contact.normal for contact in environment])
             tangents = null_space(normals.T @ normals).T
-            mass = self.corner_masses.ravel()
-            columns = 3 * count + np.arange(3 * count)
-            target_momentum = np.sum(mass[:, None] * self.velocities.reshape(-1, 3), axis=0) + self.external_impulse.sum(axis=(0, 1))
             if len(tangents):
                 coefficients = tangents[:, None, :] * (mass / mass.sum())[None, :, None]
-                factors.append(self._factor("boundary_tangential_momentum", np.repeat(np.arange(len(tangents)), 3 * count),
+                factors.append(self._factor(f"boundary_tangential_momentum{suffix}", np.repeat(np.arange(len(tangents)), 3 * len(corners)),
                                              np.tile(columns, len(tangents)), coefficients.ravel(),
                                              tangents @ target_momentum / (mass.sum() * self.velocity_scale)))
             if np.allclose(normals, normals[0], rtol=1e-10, atol=1e-12):
                 normal = normals[0]
                 coefficients = mass[:, None] * normal / mass.sum()
-                factors.append(self._factor("nonnegative_boundary_normal_impulse", np.zeros(3 * count, dtype=int),
+                factors.append(self._factor(f"nonnegative_boundary_normal_impulse{suffix}", np.zeros(3 * len(corners), dtype=int),
                                              columns, coefficients.ravel(),
                                              [float(normal @ target_momentum / (mass.sum() * self.velocity_scale))], True))
-                origin = np.average(flat_positions, axis=0, weights=mass)
-                lever = flat_positions - origin
-                length = float(np.linalg.norm(np.ptp(flat_positions, axis=0)))
-                if length <= 0:
-                    raise ValueError("boundary momentum constraints require nonzero spatial extent")
-                moment_arm = lever + self.dt * self.velocities.reshape(-1, 3) / 2 if self.kinematic_rule == "trapezoidal" else lever
                 coefficients = mass[:, None] * np.cross(normal, moment_arm) / (mass.sum() * length)
-                old_angular = np.sum(np.cross(lever, mass[:, None] * self.velocities.reshape(-1, 3)), axis=0)
-                torque = np.sum(np.cross(lever, self.external_impulse.reshape(-1, 3)), axis=0)
-                factors.append(self._factor("boundary_normal_axis_angular_momentum", np.zeros(3 * count, dtype=int), columns,
+                factors.append(self._factor(f"boundary_normal_axis_angular_momentum{suffix}", np.zeros(3 * len(corners), dtype=int), columns,
                                              coefficients.ravel(), [float(normal @ (old_angular + torque) / (mass.sum() * length * self.velocity_scale))]))
-        return tuple(factors)
+        return factors
 
     def unpack(self, state):
         state = _finite_array(state, self.prior.shape, "corrector state")
@@ -330,6 +361,38 @@ def _limit(value):
         raise ValueError("max_iterations must be a nonnegative integer or None")
 
 
+def _island_momentum_diagnostics(problem, positions, velocities, bound):
+    reports = []
+    for island, corners in enumerate(problem.momentum_islands):
+        mass = problem.corner_masses.ravel()[corners]
+        previous_position = problem.positions.reshape(-1, 3)[corners]
+        previous_velocity = problem.velocities.reshape(-1, 3)[corners]
+        next_position = positions.reshape(-1, 3)[corners]
+        next_velocity = velocities.reshape(-1, 3)[corners]
+        impulse = problem.external_impulse.reshape(-1, 3)[corners]
+        origin = np.average(previous_position, axis=0, weights=mass)
+        lever = previous_position - origin
+        residual = np.sum(mass[:, None] * (next_velocity - previous_velocity) - impulse, axis=0)
+        old_angular = np.sum(np.cross(lever, mass[:, None] * previous_velocity), axis=0)
+        new_angular = np.sum(np.cross(next_position - origin, mass[:, None] * next_velocity), axis=0)
+        angular_impulse = np.sum(np.cross(lever, impulse), axis=0)
+        if problem.kinematic_rule == "constant_acceleration":
+            angular_impulse += 0.5 * problem.dt * np.sum(np.cross(next_velocity, impulse), axis=0)
+        angular_residual = new_angular - old_angular - angular_impulse
+        length = float(np.linalg.norm(np.ptp(previous_position, axis=0)))
+        supported = bool((problem.fixed | problem.previous_fixed).ravel()[corners].any())
+        environment = bool(problem._island_environment(corners))
+        closed = not supported and not environment
+        scale = mass.sum() * problem.velocity_scale
+        reports.append(dict(island=island, tetrahedra=(corners[::4] // 4).tolist(),
+                            boundary="support" if supported else "environment_contact" if environment else "closed",
+                            linear_residual_or_inferred_reaction=residual.tolist(),
+                            angular_residual_or_inferred_reaction=angular_residual.tolist(),
+                            linear_momentum_verified=bool(closed and np.max(np.abs(residual)) / scale <= bound),
+                            angular_momentum_verified=bool(closed and np.max(np.abs(angular_residual)) / (scale * length) <= bound)))
+    return reports
+
+
 def _diagnostics(problem, state, tolerance):
     positions, velocities = problem.unpack(state)
     violations = {factor.name: float(np.max(factor.violation(state[factor.indices]), initial=0)) for factor in problem.factors}
@@ -348,6 +411,8 @@ def _diagnostics(problem, state, tolerance):
     angular_length = float(np.linalg.norm(np.ptp(problem.positions.reshape(-1, 3), axis=0)))
     bound = tolerance.absolute + tolerance.relative * max(float(np.max(np.abs(state), initial=0)), 1.0)
     violation = max(violations.values(), default=0.0)
+    island_reports = _island_momentum_diagnostics(problem, positions, velocities, bound)
+    free_islands = [item for item in island_reports if item["boundary"] == "closed"]
     contacts = [float(contact.gap + np.dot(contact.normal, np.sum(contact.weights[:, None] * (positions - problem.positions).reshape(-1, 3)[contact.corner_ids], axis=0)) - problem.dt * contact.environment_velocity) for contact in problem.contacts]
     return {
         "constraint_violation": violation,
@@ -367,6 +432,11 @@ def _diagnostics(problem, state, tolerance):
         "boundary_momentum_verified": bool(problem.metadata["boundary_momentum_verified"] and np.max(np.abs(residual)) / (problem.corner_masses.sum() * problem.velocity_scale) <= bound),
         "angular_momentum_verified": bool(problem.metadata["angular_momentum_constraint"] and np.max(np.abs(angular_residual)) / (problem.corner_masses.sum() * angular_length * problem.velocity_scale) <= bound),
         "contact_impulse_law_verified": False,
+        "momentum_partition": problem.metadata["momentum_partition"],
+        "momentum_islands": island_reports,
+        "free_momentum_island_count": len(free_islands),
+        "free_momentum_islands_verified": all(item["linear_momentum_verified"] and item["angular_momentum_verified"]
+                                               for item in free_islands) if free_islands else None,
         "engine_calls": 0,
     }
 

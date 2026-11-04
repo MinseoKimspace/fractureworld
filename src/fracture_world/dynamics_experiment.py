@@ -1,13 +1,54 @@
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
 
-from .dynamics_evaluation import evaluate_dynamics
+from .dynamics_evaluation import _native_clock, evaluate_dynamics
 from .dynamics_data import load_dynamics_dataset
 from .dynamics_initial import export_initial
 from .dynamics_learning import load_dynamics_model
 from .dynamics_runtime import RolloutConfig, rollout_dynamics
 from .io import file_hash, new_directory, write_json
+
+
+_ACCURACY_METRICS = (
+    "position_mass_weighted_rmse_m", "velocity_mass_weighted_rmse_m_per_s",
+    "linear_momentum_error_kg_m_per_s", "angular_momentum_about_origin_error_kg_m2_per_s",
+    "kinetic_energy_absolute_error_j", "elastic_energy_absolute_error_j", "gravitational_energy_absolute_error_j",
+    "total_mechanical_energy_absolute_error_j", "maximum_floor_penetration_m", "maximum_reference_floor_penetration_m",
+    "component_count_absolute_error",
+    *[f"mean_{prefix}{name}_energy_j" for prefix in ("", "reference_")
+      for name in ("kinetic", "elastic", "gravitational", "total")],
+    *[f"maximum_{prefix}{name}_mechanical_energy_increment{unit}" for prefix in ("", "reference_")
+      for name, unit in (("positive", "_j"), ("relative_positive", ""))],
+)
+
+
+def _paired_accuracy(rows, methods, metrics):
+    methods = tuple(methods)
+    indexed = {method: {item["benchmark_case_id"]: item for item in rows[method]} for method in methods}
+    all_cases = set().union(*(set(items) for items in indexed.values()))
+    completed = [{case for case, item in items.items() if item["full_horizon_evaluated"]}
+                 for items in indexed.values()]
+    common = sorted(set.intersection(*completed)) if completed else []
+    summaries = {}
+    for metric in metrics:
+        available = [case for case in common if all(
+            item[case]["evaluation"].get(metric) is not None
+            and np.isfinite(item[case]["evaluation"][metric]) for item in indexed.values())]
+        values = {method: [items[case]["evaluation"][metric] for case in available]
+                  for method, items in indexed.items()}
+        summary = dict(cases=len(available), case_ids=available,
+                       comparison_available=len(methods) > 1 and bool(available),
+                       means={method: float(np.mean(data)) if data else None for method, data in values.items()})
+        if len(methods) == 2:
+            first, second = methods
+            differences = np.asarray(values[second]) - np.asarray(values[first])
+            summary["mean_difference_second_minus_first"] = float(np.mean(differences)) if len(differences) else None
+        summaries[metric] = summary
+    return dict(methods=list(methods), total_cases=len(all_cases), common_full_horizon_cases=len(common),
+                common_full_horizon_case_ids=common, excluded_case_ids=sorted(all_cases.difference(common)),
+                comparison_available=len(methods) > 1 and bool(common), metrics=summaries)
 
 
 def _runtime_support_policy(checkpoint, current_fixed):
@@ -78,6 +119,8 @@ def compare_dynamics(checkpoint, initial, output, steps, config=None, device="au
 
 
 def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="auto", methods=None, split="test", progress=None):
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("benchmark steps must be a positive integer number of native timesteps")
     if split not in {"validation", "test"}:
         raise ValueError("benchmark split must select validation or test")
     _, _, saved, _ = load_dynamics_model(checkpoint, device)
@@ -92,8 +135,12 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
     directory = new_directory(output)
     records, rows = [], {}
     for index, item in enumerate(cases, start=1):
-        if steps > len(item):
+        clock = _native_clock(item.metadata["conditioning_context"])
+        if steps >= len(clock):
             raise ValueError("benchmark horizon exceeds the recorded teacher trajectory")
+        recorded_steps = np.searchsorted(clock, item.times)
+        if steps not in recorded_steps:
+            raise ValueError("benchmark horizon must end at a recorded numerical teacher step")
         if progress:
             progress(dict(event="benchmark_case", case=item.case_id, index=index, cases=len(cases), split=split))
         case_path = next(Path(path) for path in item.metadata["source_hashes"] if Path(path).parent.name == "cases")
@@ -105,12 +152,13 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
         export_initial(case_path, trajectory_path, 0, initial, support_policy=policy)
         comparison = compare_dynamics(checkpoint, initial, case_directory / "comparison", steps, config, device, methods,
                                       case_path, trajectory_path, progress)
-        target_has_new_fracture = bool(np.any(item.broken[1:steps + 1] & ~item.broken[0]))
+        target_has_new_fracture = bool(np.any(item.broken[(recorded_steps > 0) & (recorded_steps <= steps)] & ~item.broken[0]))
         records.append(dict(case=item.case_id, shape_family=item.shape_family, directory=case_directory.name,
                             support_policy=policy, all_rollouts_completed=comparison["all_rollouts_completed"]))
         for method, result in comparison["conditions"].items():
+            result["benchmark_case_id"] = item.case_id
             result["requested_horizon_target_has_new_fracture"] = target_has_new_fracture
-            result["full_horizon_evaluated"] = result["status"] == "completed" and result["evaluation"]["compared_future_frames"] == steps
+            result["full_horizon_evaluated"] = result["status"] == "completed" and result["evaluation"]["last_compared_native_step"] == steps
             rows.setdefault(method, []).append(result)
     summaries = {}
     for method, results in rows.items():
@@ -120,15 +168,7 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
         negative = [item["evaluation"]["new_fracture"]["predicted_broken_facets"] > 0
                     for item in results if not item["requested_horizon_target_has_new_fracture"] and item["full_horizon_evaluated"]]
         mean = lambda values: float(np.mean(values)) if values else None
-        metrics = ("position_mass_weighted_rmse_m", "velocity_mass_weighted_rmse_m_per_s",
-                   "linear_momentum_error_kg_m_per_s", "angular_momentum_about_origin_error_kg_m2_per_s",
-                   "kinetic_energy_absolute_error_j", "elastic_energy_absolute_error_j", "gravitational_energy_absolute_error_j",
-                   "total_mechanical_energy_absolute_error_j", "maximum_floor_penetration_m", "maximum_reference_floor_penetration_m",
-                   "component_count_absolute_error",
-                   *[f"mean_{prefix}{name}_energy_j" for prefix in ("", "reference_")
-                     for name in ("kinetic", "elastic", "gravitational", "total")],
-                   *[f"maximum_{prefix}{name}_mechanical_energy_increment{unit}" for prefix in ("", "reference_")
-                     for name, unit in (("positive", "_j"), ("relative_positive", ""))])
+        metrics = _ACCURACY_METRICS
         summaries[method] = dict(cases=len(results), completed_rate=mean([item["status"] == "completed" for item in results]),
                                   completed_and_geometry_valid_rate=mean([item["status"] == "completed" and item.get("all_committed_geometry_valid") is True for item in results]),
                                   **_checked_constraint_summary(results),
@@ -139,10 +179,16 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                                   held_out_shape_family_cases=sum(item.get("held_out_shape_family", False) for item in results),
                                   metric_availability_cases={key: sum(item.get(key) is not None for item in evaluations) for key in metrics},
                                   **{key: mean([item[key] for item in evaluations if item.get(key) is not None]) for key in metrics})
+    paired = dict(all_methods=_paired_accuracy(rows, rows, _ACCURACY_METRICS),
+                  pairwise=[_paired_accuracy(rows, pair, _ACCURACY_METRICS) for pair in combinations(rows, 2)],
+                  interpretation="accuracy conditional on shared completed horizons; every metric uses the same cases across its methods; completion rates and failed cases must also be reported",
+                  difference_semantics="second method minus first method on each shared case; negative differences are lower values, not an automatic claim of better physics")
     report = dict(schema="fracture-world.dynamics-benchmark.v1", cases=records, conditions=summaries,
+                  paired_accuracy=paired,
                   split=split, generalization_protocol=saved.get("generalization_protocol", "loading_condition"),
                   inference_engine_calls=0, reference_used_only_for_evaluation=True,
                   positive_and_negative_fracture_scores_reported_separately=True,
+                  horizon_semantics="steps counts native base timesteps; accuracy uses recorded teacher states through the requested endpoint",
                   fracture_score_semantics="new broken-facet states over future frames only; initially broken facets excluded",
                   support_policy_selection="checkpoint support-release capability and current fixed corners only; teacher support future not inspected",
                   checked_constraint_success_semantics="completion plus verified endpoint geometry, swept geometry and mechanical energy; missing diagnostics remain unknown and do not count as verified success",

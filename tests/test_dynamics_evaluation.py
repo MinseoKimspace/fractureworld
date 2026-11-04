@@ -1,11 +1,12 @@
 import json
+from types import SimpleNamespace
 
 import numpy as np
 from numpy.testing import assert_allclose
 import pytest
 
 from fracture_world.dynamics_data import load_dynamics_trajectory
-from fracture_world.dynamics_evaluation import _classification, _energy_interval, _new_fracture_classification, evaluate_dynamics
+from fracture_world.dynamics_evaluation import _classification, _energy_interval, _native_clock, _new_fracture_classification, _time_alignment, evaluate_dynamics
 from fracture_world.dynamics_experiment import _checked_constraint_summary
 from test_dynamics_data import recorded_trajectory
 from test_dynamics_energy import energy_fixture
@@ -47,6 +48,8 @@ def test_exact_numerical_teacher_scores_zero_without_modifying_inference_files(t
     assert result["fracture_timing"]["mean_absolute_observed_time_error_s"] == 0
     assert result["fracture_timing"]["matched_events"] == 3
     assert result["compared_future_frames"] == 3
+    assert result["last_compared_native_step"] == 3
+    assert result["last_rollout_native_step"] == 3
     assert result["held_out_condition"]
     assert result["engine_calls"] == 0
     assert result["kinetic_energy_absolute_error_j"] == 0
@@ -109,9 +112,22 @@ def test_float32_clock_roundoff_and_unmatched_future_horizon_are_reported(tmp_pa
     result = evaluate_dynamics(rollout, case, output_file=output)
     assert result["unmatched_rollout_frames"] == 2
     assert result["compared_future_frames"] == 3
+    assert result["last_compared_native_step"] == 3
+    assert result["last_rollout_native_step"] == 5
     assert json.loads(output.read_text(encoding="utf-8"))["fracture"]["f1"] == 1
     with pytest.raises(ValueError, match="already exists"):
         evaluate_dynamics(rollout, case, output_file=output)
+
+
+def test_sparse_teacher_alignment_keeps_native_steps_distinct_from_recorded_frame_counts():
+    context = dict(dt=.001, steps=10)
+    clock = _native_clock(context)
+    teacher = SimpleNamespace(times=clock[[0, 5, 10]], metadata=dict(conditioning_context=context))
+    times = np.arange(11) * float(np.float32(context["dt"]))
+    pairs, native_steps, reconstructed = _time_alignment(teacher, times)
+    np.testing.assert_array_equal(pairs, [[0, 0], [5, 1], [10, 2]])
+    np.testing.assert_array_equal(native_steps, np.arange(11))
+    np.testing.assert_array_equal(reconstructed, clock)
 
 
 @pytest.mark.parametrize("corruption,match", [

@@ -1,7 +1,11 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
+import random
+import tempfile
 from time import perf_counter
 
 import numpy as np
@@ -16,6 +20,43 @@ from .learning import choose_device, seed_all
 
 FORMAT = "fracture-world.temporal-dynamics.v1"
 MATERIAL_KEYS = ("rest_density", "youngs_modulus", "poissons_ratio", "fracture_stress_threshold")
+
+
+def _atomic_checkpoint(path, checkpoint):
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            torch.save(checkpoint, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _random_state():
+    numpy_state = np.random.get_state()
+    return dict(python=random.getstate(), numpy=[numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
+                torch=torch.get_rng_state(), cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [])
+
+
+def _restore_random_state(state):
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state((numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32), *numpy_state[2:]))
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"]:
+        if not torch.cuda.is_available() or len(state["cuda"]) != torch.cuda.device_count():
+            raise ValueError("resuming this checkpoint requires the same number of CUDA devices")
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+
+
+def _validation_generator(case_id, frame, seed, device):
+    digest = hashlib.sha256(f"{seed}:{case_id}:{frame}".encode()).digest()
+    return torch.Generator(device=device).manual_seed(int.from_bytes(digest[:8], "little") % (2**63 - 1))
 
 
 @dataclass(frozen=True)
@@ -115,7 +156,7 @@ def _scales(trajectories):
 
 
 def _loss(model, batch, target_positions, target_velocities, target_broken, target_fixed, config, proposal=None,
-          flow=True, fracture_positive_weight=1.0, support_positive_weight=1.0, return_output=False):
+          flow=True, fracture_positive_weight=1.0, support_positive_weight=1.0, return_output=False, flow_generator=None):
     context = None
     if flow and proposal is None and hasattr(model, "forward_with_flow_context"):
         output, context = model.forward_with_flow_context(batch)
@@ -134,8 +175,8 @@ def _loss(model, batch, target_positions, target_velocities, target_broken, targ
         fracture = F.binary_cross_entropy_with_logits(output["fracture_logits"][intact], target[intact],
                                                        pos_weight=motion.new_tensor(fracture_positive_weight))
         if flow:
-            noise = torch.randn_like(target)
-            time = torch.rand((), device=target.device)
+            noise = torch.randn(target.shape, dtype=target.dtype, device=target.device, generator=flow_generator)
+            time = torch.rand((), device=target.device, generator=flow_generator)
             destination = 2 * target - 1
             field = (1 - time) * noise + time * destination
             field = torch.where(batch["broken"], torch.ones_like(field), field)
@@ -164,7 +205,7 @@ def _validate_autoregressive_prediction(output, case_id, frame):
 
 
 def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor=None,
-                  fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None):
+                  fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generator=None):
     batch = transition_batch(trajectory, frame, device) if prepared is None else prepared.batch(frame)
     horizon = min(config.rollout_steps, len(trajectory) - frame)
     losses, components = [], []
@@ -181,7 +222,7 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
         proposal = fixed_predictor(batch) if fixed_predictor is not None else None
         loss, terms, output = _loss(network, batch, *target_values, config, proposal,
                                     flow=fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
-                                    support_positive_weight=support_positive_weight, return_output=True)
+                                    support_positive_weight=support_positive_weight, return_output=True, flow_generator=flow_generator)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"nonfinite temporal dynamics training loss in {trajectory.case_id} at frame {frame + offset}")
         if config.rollout_steps > 1:
@@ -194,7 +235,7 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
                                       for key in components[0]}
 
 
-def train_dynamics(data_dir, output_dir, config):
+def train_dynamics(data_dir, output_dir, config, *, resume=None):
     if not isinstance(config, DynamicsTrainingConfig):
         raise TypeError("config must be DynamicsTrainingConfig")
     if config.epochs < 1 or config.corrector_epochs < 0 or config.learning_rate <= 0:
@@ -205,6 +246,22 @@ def train_dynamics(data_dir, output_dir, config):
         raise ValueError("training weights must be finite")
     if config.fracture_weight <= 0 or config.flow_weight <= 0:
         raise ValueError("fracture and flow weights must be positive")
+    resumed = torch.load(Path(resume), map_location="cpu", weights_only=True) if resume is not None else None
+    if resumed is not None:
+        if resumed.get("format") != FORMAT or "training_state" not in resumed:
+            raise ValueError("resume requires a resumable last.pt checkpoint; legacy model weights remain valid for inference")
+        previous = resumed["training"]
+        variable_options = {"epochs", "corrector_epochs", "device", "stream_data"}
+        if any(previous.get(key) != value for key, value in asdict(config).items() if key not in variable_options):
+            raise ValueError("resuming requires unchanged model, loss, split, seed and rollout settings")
+        state = resumed["training_state"]
+        if state["stage"] not in {"predictor", "neural_corrector"}:
+            raise ValueError("unsupported resumable training stage")
+        target_epochs = config.epochs if state["stage"] == "predictor" else config.corrector_epochs
+        if target_epochs < state["completed_epoch"]:
+            raise ValueError("target epoch count cannot precede the saved completed epoch")
+        if state["stage"] == "neural_corrector" and config.epochs != previous["epochs"]:
+            raise ValueError("predictor epochs cannot change after neural-corrector training has begun")
     setup_started = perf_counter()
 
     def setup_progress(update):
@@ -213,6 +270,8 @@ def train_dynamics(data_dir, output_dir, config):
 
     setup_progress(dict(phase="initialization", status="started", data=str(Path(data_dir).resolve())))
     device = choose_device(config.device)
+    if resumed is not None and resumed["training_state"]["device_type"] != device.type:
+        raise ValueError("resuming requires the same training device type")
     if device.type == "cpu":
         torch.set_num_threads(min(torch.get_num_threads(), 4))
     options = dict(progress=setup_progress)
@@ -259,12 +318,22 @@ def train_dynamics(data_dir, output_dir, config):
     model = TemporalDynamicsModel(**model_config).to(device)
     model.fracture_logit_offset = float(np.log(fracture_positive_weight))
     model.support_logit_offset = float(np.log(support_positive_weight))
-    directory = new_directory(output_dir)
     manifest = {name: [item.case_id for item in rows] for name, rows in splits.items()}
     conditions = {name: sorted({item.condition_digest for item in rows}) for name, rows in splits.items()}
     shape_families = {name: sorted({item.shape_family for item in rows}) for name, rows in splits.items()}
     mesh_fingerprints = {name: sorted({item.topology.fingerprint for item in rows}) for name, rows in splits.items()}
     provenance = {item.case_id: item.metadata for item in trajectories}
+    if resumed is not None:
+        matching = {"model_config": model_config, "splits": manifest, "condition_splits": conditions,
+                    "source": provenance,
+                    "class_weights": dict(fracture_positive=fracture_positive_weight, support_release_positive=support_positive_weight)}
+        if any(resumed.get(key) != value for key, value in matching.items()):
+            raise ValueError("resume checkpoint does not match the dataset, model normalization or supervision")
+    directory = Path(output_dir).resolve()
+    if resumed is None or directory != Path(resume).resolve().parent:
+        directory = new_directory(directory)
+    elif not directory.is_dir():
+        raise ValueError("resume output must be a directory")
     write_json(directory / "split.json", dict(cases=manifest, conditions=conditions,
                                               shape_families=shape_families, mesh_fingerprints=mesh_fingerprints,
                                               unit="complete shape family" if config.split_unit == "shape_family" else "complete loading condition",
@@ -286,6 +355,8 @@ def train_dynamics(data_dir, output_dir, config):
                   "training_state_policy": "autoregressive predicted motion, irreversible classifier fracture state and support release inside each window",
                   "training_gradient_policy": "motion gradients retained through every predicted state in the window; discrete topology transitions are nondifferentiable",
                   "training_window_steps": config.rollout_steps,
+                  "validation_flow_policy": "fixed independent Gaussian noise and flow time per seed, case and window",
+                  "checkpoint_policy": "atomic best-on-improvement and resumable completed-epoch state",
                   "training_mesh_fingerprints": mesh_fingerprints["train"],
                   "evaluation_mesh_fingerprints": sorted(set(mesh_fingerprints["validation"] + mesh_fingerprints["test"])),
                   "shape_family_splits": shape_families, "mesh_fingerprint_splits": mesh_fingerprints,
@@ -300,9 +371,19 @@ def train_dynamics(data_dir, output_dir, config):
         if fixed_predictor is not None:
             fixed_predictor.requires_grad_(False)
             fixed_predictor.eval()
-        best, best_state = float("inf"), None
+        best, best_state, first_epoch = float("inf"), None, 0
+        key = "model" if stage == "predictor" else "corrector"
+        if resumed is not None and resumed["training_state"]["stage"] == stage:
+            saved = resumed["training_state"]
+            network.load_state_dict(resumed[key], strict=True)
+            optimizer.load_state_dict(saved["optimizer"])
+            best, best_state, first_epoch = saved["best_loss"], saved["best_state"], saved["completed_epoch"]
+            _restore_random_state(saved["random_state"])
+            _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state})
+            setup_progress(dict(phase="resume", status="completed", stage=stage, completed_epoch=first_epoch,
+                                target_epochs=epochs, checkpoint=str(Path(resume).resolve())))
         last_progress = perf_counter()
-        for epoch in range(epochs):
+        for epoch in range(first_epoch, epochs):
             epoch_started = perf_counter()
             scores = {}
             timings = {}
@@ -320,11 +401,13 @@ def train_dynamics(data_dir, output_dir, config):
                     prepare_seconds += perf_counter() - prepare_started
                     order = np.random.permutation(len(trajectory)) if is_training else range(len(trajectory))
                     for transition_index, frame in enumerate(order, start=1):
+                        generator = None if is_training else _validation_generator(trajectory.case_id, int(frame), config.seed, device)
                         with torch.set_grad_enabled(is_training):
                             loss, terms = _rollout_loss(network, trajectory, int(frame), device, config,
                                                         fixed_predictor=fixed_predictor,
                                                         fracture_positive_weight=fracture_positive_weight,
-                                                        support_positive_weight=support_positive_weight, prepared=prepared)
+                                                        support_positive_weight=support_positive_weight, prepared=prepared,
+                                                        flow_generator=generator)
                             if is_training:
                                 optimizer.zero_grad(set_to_none=True)
                                 loss.backward()
@@ -361,26 +444,35 @@ def train_dynamics(data_dir, output_dir, config):
             record = dict(stage=stage, epoch=epoch + 1, losses=scores, seconds=perf_counter() - started,
                           epoch_seconds=perf_counter() - epoch_started, split_timing=timings,
                           device=str(device), overfit_debug=config.overfit, rollout_steps=config.rollout_steps)
-            with (directory / "training.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, allow_nan=False) + "\n")
-            print(json.dumps(record, allow_nan=False), flush=True)
             if criterion < best:
                 best = criterion
                 best_state = {key: value.detach().cpu().clone() for key, value in network.state_dict().items()}
-            if stage == "predictor":
-                torch.save({**checkpoint, "model": network.state_dict(), "epoch": epoch + 1}, directory / "last.pt")
+                _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state})
+            training_state = dict(stage=stage, completed_epoch=epoch + 1, device_type=device.type,
+                                  optimizer=optimizer.state_dict(), random_state=_random_state(),
+                                  best_loss=best, best_state=best_state)
+            _atomic_checkpoint(directory / "last.pt", {**checkpoint, key: network.state_dict(), "epoch": epoch + 1,
+                                                        "training_state": training_state})
+            with (directory / "training.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, allow_nan=False) + "\n")
+            print(json.dumps(record, allow_nan=False), flush=True)
         network.load_state_dict(best_state)
         network.eval()
         return best_state
 
-    checkpoint["model"] = train_stage(model, config.epochs, "predictor")
-    torch.save(checkpoint, directory / "best.pt")
+    if resumed is not None and resumed["training_state"]["stage"] == "neural_corrector":
+        checkpoint["model"] = resumed["model"]
+        model.load_state_dict(checkpoint["model"], strict=True)
+        model.eval()
+    else:
+        checkpoint["model"] = train_stage(model, config.epochs, "predictor")
+        _atomic_checkpoint(directory / "best.pt", checkpoint)
     if config.corrector_epochs:
         corrector = NeuralDynamicsCorrector(**model_config).to(device)
         corrector.fracture_logit_offset = model.fracture_logit_offset
         corrector.support_logit_offset = model.support_logit_offset
         checkpoint["corrector"] = train_stage(corrector, config.corrector_epochs, "neural_corrector", model)
-        torch.save(checkpoint, directory / "best.pt")
+        _atomic_checkpoint(directory / "best.pt", checkpoint)
     return directory / "best.pt"
 
 

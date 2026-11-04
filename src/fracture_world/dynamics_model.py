@@ -58,6 +58,19 @@ def _cached(cache, name, tensors, build):
     return build() if cache is None else cache.resolve(name, tensors, build)
 
 
+def support_release_mask(face_pairs, broken, fixed, release_probability):
+    if not fixed.any():
+        return fixed.clone()
+    pairs = face_pairs[~broken].detach().cpu().numpy().reshape(-1, 2)
+    adjacency = coo_matrix((np.ones(len(pairs), dtype=np.int8), (pairs[:, 0], pairs[:, 1])),
+                           shape=(len(fixed), len(fixed))).tocsr()
+    labels = connected_components(adjacency, directed=False, return_labels=True)[1]
+    groups = torch.as_tensor(labels, dtype=torch.long, device=fixed.device)
+    retained = torch.zeros(len(fixed), dtype=torch.long, device=fixed.device)
+    retained.scatter_add_(0, groups, (fixed & (release_probability < 0.5)).to(torch.long))
+    return fixed & (retained[groups] > 0)
+
+
 def build_fracture_adjacency(face_pairs):
     face_cells = (face_pairs[:, 0] // 4).detach().cpu().numpy()
     incident_faces = {}
@@ -386,22 +399,30 @@ class TemporalDynamicsModel(nn.Module):
             positions = batch["positions"] + position_increment
             logits = self.fracture_head(face_context).squeeze(-1)
         else:
-            positions = proposal["positions"] + dt * scale * motion[:, :3]
-            velocities = proposal["velocities"] + scale * motion[:, 3:]
-            position_increment = proposal.get("position_increment", proposal["positions"] - batch["positions"]) + dt * scale * motion[:, :3]
-            velocity_increment = proposal.get("velocity_increment", proposal["velocities"] - batch["velocities"]) + scale * motion[:, 3:]
+            base_position_increment = proposal.get("position_increment", proposal["positions"] - batch["positions"])
+            base_velocity_increment = proposal.get("velocity_increment", proposal["velocities"] - batch["velocities"])
+            position_increment = proposal.get("unconstrained_position_increment", base_position_increment) + dt * scale * motion[:, :3]
+            velocity_increment = proposal.get("unconstrained_velocity_increment", base_velocity_increment) + scale * motion[:, 3:]
+            positions = batch["positions"] + position_increment
+            velocities = batch["velocities"] + velocity_increment
             logits = proposal["fracture_logits"] + self.fracture_head(face_context).squeeze(-1)
             release_logits = release_logits + proposal.get("support_release_logits", torch.zeros_like(release_logits))
+        probability = torch.where(batch["broken"], torch.ones_like(logits), (logits - self.fracture_logit_offset).sigmoid())
+        next_broken = batch["broken"] | (probability >= 0.5)
         release_probability = torch.where(batch["fixed"], (release_logits - self.support_logit_offset).sigmoid(), torch.zeros_like(release_logits))
-        next_fixed = batch["fixed"] & (release_probability < 0.5) if self.config["learn_support_release"] else batch["fixed"].clone()
+        next_fixed = (support_release_mask(batch["face_pairs"], next_broken, batch["fixed"], release_probability)
+                      if self.config["learn_support_release"] else batch["fixed"].clone())
+        unconstrained_position_increment = position_increment
+        unconstrained_velocity_increment = velocity_increment
         positions = torch.where(next_fixed[:, None], batch["positions"], positions)
         velocities = torch.where(next_fixed[:, None], torch.zeros_like(velocities), velocities)
         position_increment = torch.where(next_fixed[:, None], torch.zeros_like(position_increment), position_increment)
         velocity_increment = torch.where(next_fixed[:, None], -batch["velocities"], velocity_increment)
-        probability = torch.where(batch["broken"], torch.ones_like(logits), (logits - self.fracture_logit_offset).sigmoid())
         return dict(positions=positions, velocities=velocities, position_increment=position_increment,
                     velocity_increment=velocity_increment, fracture_logits=logits,
-                    fracture_probability=probability, broken=batch["broken"] | (probability >= 0.5),
+                    unconstrained_position_increment=unconstrained_position_increment,
+                    unconstrained_velocity_increment=unconstrained_velocity_increment,
+                    fracture_probability=probability, broken=next_broken,
                     support_release_logits=release_logits, support_release_probability=release_probability,
                     next_fixed=next_fixed)
 
@@ -454,10 +475,13 @@ class TemporalDynamicsModel(nn.Module):
 
     @torch.no_grad()
     def sample_fracture(self, batch, steps=8, noise=None):
-        if not isinstance(steps, int) or steps < 1:
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("fracture flow steps must be a positive integer")
         if noise is None:
             noise = torch.randn_like(batch["broken"], dtype=batch["positions"].dtype)
+        if (not isinstance(noise, torch.Tensor) or not noise.is_floating_point()
+                or noise.dtype != batch["positions"].dtype or noise.device != batch["positions"].device):
+            raise ValueError("fracture noise must share the floating point dtype and device of the current state")
         if noise.shape != batch["broken"].shape or not torch.isfinite(noise).all():
             raise ValueError("fracture noise must be finite with one value per internal face")
         initial = torch.where(batch["broken"], torch.ones_like(noise), noise)

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from fracture_world import dynamics_experiment
-from fracture_world.dynamics_experiment import _rollout_agreement, _runtime_support_policy, benchmark_dynamics
+from fracture_world.dynamics_experiment import _paired_accuracy, _rollout_agreement, _runtime_support_policy, benchmark_dynamics
 
 
 class MetadataWithoutSupportFuture(dict):
@@ -60,7 +60,10 @@ def test_support_policy_uses_checkpoint_capability_and_current_flags(checkpoint,
 
 
 @pytest.mark.parametrize("learned", [False, True])
-def test_benchmark_does_not_select_support_policy_from_teacher_events(tmp_path, monkeypatch, learned):
+@pytest.mark.parametrize("native_step_stride", [1, 5])
+@pytest.mark.parametrize("recorded_horizon", [1, 2])
+def test_benchmark_does_not_select_support_policy_from_teacher_events(tmp_path, monkeypatch, learned,
+                                                                    native_step_stride, recorded_horizon):
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"test-checkpoint")
     cases = []
@@ -73,8 +76,9 @@ def test_benchmark_does_not_select_support_policy_from_teacher_events(tmp_path, 
             broken[-1, 1] = True
         source = tmp_path / "source" / "cases" / f"{name}.npz"
         cases.append(BenchmarkCase(case_id=name, condition_digest=f"condition-{index}", shape_family="fixture",
-                                   fixed=fixed, broken=broken,
-                                   metadata=MetadataWithoutSupportFuture(source_hashes={str(source): "digest"})))
+                                   fixed=fixed, broken=broken, times=np.array([0., 1., 2.]) * native_step_stride,
+                                   metadata=MetadataWithoutSupportFuture(source_hashes={str(source): "digest"},
+                                                                        conditioning_context=dict(dt=1., steps=2 * native_step_stride))))
     saved = dict(training=dict(overfit=False, learn_support_release=learned),
                  model_config=dict(learn_support_release=learned),
                  condition_splits={"test": [item.condition_digest for item in cases]},
@@ -90,7 +94,8 @@ def test_benchmark_does_not_select_support_policy_from_teacher_events(tmp_path, 
 
     def compare(checkpoint, initial, output, steps, config, device, methods, reference_case, reference_trajectory, progress):
         name, policy = exported[Path(initial)]
-        evaluation = dict(compared_future_frames=steps, fracture=dict(f1=0.999, predicted_broken_facets=100),
+        evaluation = dict(compared_future_frames=recorded_horizon, last_compared_native_step=steps,
+                          fracture=dict(f1=0.999, predicted_broken_facets=100),
                           new_fracture=dict(f1=0.0 if name == "fixed-positive" else 1.0,
                                             predicted_broken_facets=int(name == "fixed-negative")))
         metrics = ("position_mass_weighted_rmse_m", "velocity_mass_weighted_rmse_m_per_s",
@@ -103,14 +108,86 @@ def test_benchmark_does_not_select_support_policy_from_teacher_events(tmp_path, 
 
     monkeypatch.setattr(dynamics_experiment, "export_initial", export)
     monkeypatch.setattr(dynamics_experiment, "compare_dynamics", compare)
-    report = benchmark_dynamics(checkpoint, tmp_path / "unused-data", tmp_path / "benchmark", 2, methods=["raw"])
+    report = benchmark_dynamics(checkpoint, tmp_path / "unused-data", tmp_path / "benchmark",
+                                recorded_horizon * native_step_stride, methods=["raw"])
     expected = "learned" if learned else "prescribed"
     assert {name: policy for name, policy in exported.values()} == {
         "fixed-negative": expected, "fixed-positive": expected, "free-negative": "free"}
     summary = report["conditions"]["raw"]
-    assert summary["fracture_positive_cases"] == 1
-    assert summary["fracture_positive_case_f1_failure_penalized"] == 0
-    assert summary["completed_fracture_negative_cases"] == 2
-    assert summary["fracture_negative_case_false_positive_rate"] == 0.5
+    assert summary["fracture_positive_cases"] == (1 if recorded_horizon == 2 else 0)
+    assert summary["fracture_positive_case_f1_failure_penalized"] == (0 if recorded_horizon == 2 else None)
+    assert summary["completed_fracture_negative_cases"] == (2 if recorded_horizon == 2 else 3)
+    assert summary["fracture_negative_case_false_positive_rate"] == (0.5 if recorded_horizon == 2 else 1 / 3)
+    assert summary["full_horizon_accuracy_cases"] == 3
     assert report["reference_used_only_for_evaluation"]
     assert "initially broken facets excluded" in report["fracture_score_semantics"]
+    paired = report["paired_accuracy"]
+    assert paired["all_methods"]["common_full_horizon_cases"] == 3
+    assert paired["all_methods"]["common_full_horizon_case_ids"] == sorted(item.case_id for item in cases)
+    assert paired["all_methods"]["comparison_available"] is False
+    assert paired["pairwise"] == []
+
+
+def benchmark_result(case, completed, **metrics):
+    return dict(benchmark_case_id=case, full_horizon_evaluated=completed, evaluation=metrics)
+
+
+def test_paired_accuracy_excludes_method_specific_failures_from_every_method_mean():
+    rows = {
+        "raw": [benchmark_result("a", True, error=10.), benchmark_result("b", True, error=1000.),
+                benchmark_result("c", False, error=0.)],
+        "central": [benchmark_result("a", True, error=9.), benchmark_result("b", True, error=500.),
+                    benchmark_result("c", True, error=10000.)],
+        "consensus": [benchmark_result("a", True, error=8.), benchmark_result("b", False, error=0.),
+                      benchmark_result("c", True, error=9000.)],
+    }
+    common = _paired_accuracy(rows, rows, ["error"])
+    assert common["common_full_horizon_case_ids"] == ["a"]
+    assert common["excluded_case_ids"] == ["b", "c"]
+    assert common["metrics"]["error"]["means"] == {"raw": 10., "central": 9., "consensus": 8.}
+    paired = _paired_accuracy(rows, ["raw", "central"], ["error"])
+    assert paired["total_cases"] == 3
+    assert paired["common_full_horizon_cases"] == 2
+    assert paired["common_full_horizon_case_ids"] == ["a", "b"]
+    assert paired["metrics"]["error"]["means"] == {"raw": 505., "central": 254.5}
+    assert paired["metrics"]["error"]["mean_difference_second_minus_first"] == -250.5
+
+
+def test_paired_accuracy_uses_shared_available_cases_for_each_metric():
+    rows = {
+        "raw": [benchmark_result("a", True, position=1.), benchmark_result("b", True, position=None),
+                benchmark_result("c", True, position=5.), benchmark_result("d", True, position=float("inf")),
+                benchmark_result("e", True, position=4.)],
+        "consensus": [benchmark_result("a", True, position=3.), benchmark_result("b", True, position=2.),
+                      benchmark_result("c", True, position=None), benchmark_result("d", True, position=4.),
+                      benchmark_result("e", True, position=8.)],
+    }
+    report = _paired_accuracy(rows, rows, ["position", "velocity"])
+    assert report["common_full_horizon_cases"] == 5
+    assert report["metrics"]["position"]["cases"] == 2
+    assert report["metrics"]["position"]["case_ids"] == ["a", "e"]
+    assert report["metrics"]["position"]["means"] == {"raw": 2.5, "consensus": 5.5}
+    assert report["metrics"]["position"]["mean_difference_second_minus_first"] == 3.
+    assert report["metrics"]["velocity"]["cases"] == 0
+    assert report["metrics"]["velocity"]["comparison_available"] is False
+    assert report["metrics"]["velocity"]["means"] == {"raw": None, "consensus": None}
+    assert report["metrics"]["velocity"]["mean_difference_second_minus_first"] is None
+
+
+def test_paired_accuracy_does_not_report_accuracy_when_no_case_completes_in_both_methods():
+    rows = {
+        "raw": [benchmark_result("a", True, error=1.), benchmark_result("b", False, error=0.)],
+        "consensus": [benchmark_result("a", False, error=0.), benchmark_result("b", True, error=2.)],
+    }
+    report = _paired_accuracy(rows, rows, ["error"])
+    assert report["common_full_horizon_cases"] == 0
+    assert report["common_full_horizon_case_ids"] == []
+    assert report["comparison_available"] is False
+    assert report["metrics"]["error"]["means"] == {"raw": None, "consensus": None}
+    assert report["metrics"]["error"]["mean_difference_second_minus_first"] is None
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, 1.5])
+def test_benchmark_rejects_invalid_native_step_counts_before_loading_model(tmp_path, steps):
+    with pytest.raises(ValueError, match="positive integer number of native timesteps"):
+        benchmark_dynamics(tmp_path / "missing.pt", tmp_path / "data", tmp_path / "output", steps)

@@ -10,6 +10,7 @@ from fracture_world.dynamics_model import (
     TemporalDynamicsModel,
     build_dynamics_graph,
     build_fracture_adjacency,
+    support_release_mask,
 )
 
 
@@ -316,6 +317,58 @@ def test_optional_support_release_head_learns_without_repinning_free_corners():
     assert not torch.equal(released["positions"][batch["fixed"]], batch["positions"][batch["fixed"]])
 
 
+def test_support_release_agrees_across_transitively_connected_corner_copies():
+    pairs = torch.tensor([[[0, 4], [1, 5], [2, 6]], [[4, 8], [5, 9], [6, 10]]])
+    fixed = torch.zeros(12, dtype=torch.bool)
+    fixed[[0, 4, 8]] = True
+    probability = torch.ones(12)
+    probability[8] = 0.1
+    intact = support_release_mask(pairs, torch.tensor([False, False]), fixed, probability)
+    torch.testing.assert_close(intact, fixed)
+    separated = support_release_mask(pairs, torch.tensor([False, True]), fixed, probability)
+    assert not separated[[0, 4]].any()
+    assert separated[8]
+    assert not separated[~fixed].any()
+
+
+def test_predicted_fracture_controls_grouped_support_release_during_training():
+    batch = dynamics_batch()
+    pair = batch["face_pairs"][0, 0]
+    batch["fixed"].zero_()
+    batch["fixed"][pair] = True
+    model = TemporalDynamicsModel(**{**small_model().config, "learn_support_release": True})
+    corner_context = torch.zeros(8, 12)
+    corner_context[pair[0], 0] = 4
+    corner_context[pair[1], 0] = -4
+    with torch.no_grad():
+        model.support_head.weight[0, 0] = 1
+        model.fracture_head.weight.zero_()
+        model.fracture_head.bias.fill_(-4)
+        intact = model._prediction(batch, corner_context, torch.zeros(1, 12))
+        model.fracture_head.bias.fill_(4)
+        separated = model._prediction(batch, corner_context, torch.zeros(1, 12))
+    torch.testing.assert_close(intact["next_fixed"], batch["fixed"])
+    assert not separated["next_fixed"][pair[0]]
+    assert separated["next_fixed"][pair[1]]
+    assert intact["unconstrained_velocity_increment"][pair[0], 2] < 0
+    assert intact["velocity_increment"][pair[0], 2] == 0
+    assert separated["velocities"][pair[0], 2] < 0
+
+
+def test_neural_corrector_can_release_a_support_held_by_the_predictor():
+    batch = dynamics_batch()
+    predictor = TemporalDynamicsModel(**{**small_model().config, "learn_support_release": True})
+    corrector = NeuralDynamicsCorrector(**{**small_model().config, "learn_support_release": True})
+    with torch.no_grad():
+        predictor.support_head.bias.fill_(-2)
+        corrector.support_head.bias.fill_(4)
+    proposal = predictor(batch)
+    corrected = corrector(batch, proposal)
+    assert proposal["next_fixed"][batch["fixed"]].all()
+    assert not corrected["next_fixed"].any()
+    assert (corrected["velocities"][batch["fixed"], 2] < 0).all()
+
+
 def test_support_release_is_disabled_by_default_and_neural_corrector_starts_with_shared_logits():
     batch = dynamics_batch()
     predictor = small_model()
@@ -391,3 +444,27 @@ def test_proposal_graph_uses_calibrated_probabilities_and_rejects_invalid_probab
         invalid = {**proposal, key: torch.full_like(proposal[key], 1.1)}
         with pytest.raises(ValueError, match=key):
             build_dynamics_graph(batch, proposal=invalid)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.long, torch.float64])
+def test_fracture_sampling_requires_state_compatible_noise_even_without_internal_faces(empty, dtype):
+    batch = dynamics_batch()
+    if empty:
+        batch["face_pairs"] = batch["face_pairs"][:0]
+        batch["broken"] = batch["broken"][:0]
+    noise = torch.zeros(len(batch["broken"]), dtype=dtype)
+    with pytest.raises(ValueError, match="dtype and device"):
+        small_model().sample_fracture(batch, noise=noise)
+
+
+def test_fracture_sampling_rejects_an_incompatible_noise_device_before_integrating():
+    batch = dynamics_batch()
+    noise = torch.empty(len(batch["broken"]), device="meta")
+    with pytest.raises(ValueError, match="dtype and device"):
+        small_model().sample_fracture(batch, noise=noise)
+
+
+def test_fracture_sampling_rejects_a_boolean_integration_step_count():
+    with pytest.raises(ValueError, match="positive integer"):
+        small_model().sample_fracture(dynamics_batch(), steps=True)

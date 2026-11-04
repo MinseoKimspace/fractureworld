@@ -11,7 +11,7 @@ from .dynamics_corrector import CorrectorTolerances, DynamicsProblem, solve_cent
 from .dynamics_energy import CorotationalEnergy, EnergyProjection
 from .dynamics_energy_solvers import solve_energy
 from .dynamics_geometry import corner_groups, floor_contacts, geometry_diagnostics, linearized_contacts, render_geometry, swept_geometry_diagnostics
-from .dynamics_model import constant_acceleration_prediction
+from .dynamics_model import constant_acceleration_prediction, support_release_mask
 from .dynamics_initial import load_initial
 from .dynamics_learning import load_dynamics_model, state_batch
 from .io import file_hash, new_directory, write_json
@@ -35,8 +35,10 @@ class RolloutConfig:
     seed: int = 17
 
     def __post_init__(self):
-        if self.fracture_samples < 0 or self.flow_steps < 1:
-            raise ValueError("fracture_samples must be nonnegative and flow_steps positive")
+        for name, minimum in (("fracture_samples", 0), ("flow_steps", 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         if self.fracture_policy not in {"marginal_search", "shared_sample", "fm_search"}:
             raise ValueError("fracture_policy must select fm_search, marginal_search or shared_sample")
         if self.fracture_policy == "shared_sample" and self.fracture_samples != 1:
@@ -47,7 +49,7 @@ class RolloutConfig:
         if not np.isfinite([*values, self.relative_tolerance]).all() or min(values) <= 0 or self.relative_tolerance < 0:
             raise ValueError("rollout weights and tolerances must be finite and positive")
         for value in (self.max_iterations, self.max_contact_iterations):
-            if value is not None and (not isinstance(value, int) or value < 1):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
                 raise ValueError("explicit iteration budgets must be positive or null")
         if self.kinematic_rule not in ("auto", "backward_euler", "trapezoidal", "constant_acceleration"):
             raise ValueError("unsupported kinematic rule")
@@ -69,9 +71,23 @@ def _proposal_arrays(proposal, positions, velocities):
     return next_positions, next_velocities
 
 
+def _candidate_proposal(proposal, positions, velocities, fixed):
+    template = proposal["positions"]
+    current_positions = torch.as_tensor(positions, dtype=template.dtype, device=template.device)
+    current_velocities = torch.as_tensor(velocities, dtype=template.dtype, device=template.device)
+    position_increment = proposal.get("unconstrained_position_increment", proposal.get("position_increment", template - current_positions))
+    velocity_increment = proposal.get("unconstrained_velocity_increment", proposal.get("velocity_increment", proposal["velocities"] - current_velocities))
+    held = torch.as_tensor(fixed, dtype=torch.bool, device=template.device)[:, None]
+    position_increment = torch.where(held, torch.zeros_like(position_increment), position_increment)
+    velocity_increment = torch.where(held, -current_velocities, velocity_increment)
+    return {**proposal, "positions": current_positions + position_increment, "velocities": current_velocities + velocity_increment,
+            "position_increment": position_increment, "velocity_increment": velocity_increment}
+
+
 def _validate_proposal(proposal, positions, velocities):
     fields = ("positions", "velocities", "position_increment", "velocity_increment", "fracture_probability",
-              "support_release_probability", "fracture_logits", "support_release_logits")
+              "support_release_probability", "fracture_logits", "support_release_logits",
+              "unconstrained_position_increment", "unconstrained_velocity_increment")
     invalid = [key for key in fields if key in proposal and not torch.isfinite(proposal[key]).all()]
     if invalid:
         raise FloatingPointError(f"nonfinite prediction fields: {', '.join(invalid)}")
@@ -104,17 +120,30 @@ def _fracture_cost(mask, probability, old):
     return float(-np.mean(np.where(mask[active], np.log(probability), np.log1p(-probability))))
 
 
-def _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed, contacts, model, config):
+def _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed, contacts, model, config, *, previous_broken=None, previous_fixed=None):
     mesh = initial.topology.mesh
     full_broken = np.zeros(len(mesh.faces.vertices), dtype=bool)
     full_broken[mesh.internal_faces] = broken
+    previous_full_broken = None
+    if previous_broken is not None:
+        previous_broken = np.asarray(previous_broken)
+        if previous_broken.shape != (len(mesh.internal_faces),) or previous_broken.dtype != np.dtype(bool):
+            raise ValueError("previous_broken must be a Boolean vector over internal material faces")
+        previous_full_broken = np.zeros(len(mesh.faces.vertices), dtype=bool)
+        previous_full_broken[mesh.internal_faces] = previous_broken
     shape = (len(mesh.tets), 4, 3)
+    if previous_fixed is not None:
+        previous_fixed = np.asarray(previous_fixed)
+        if previous_fixed.shape != (4 * len(mesh.tets),) or previous_fixed.dtype != np.dtype(bool):
+            raise ValueError("previous_fixed must be a Boolean vector over material corners")
+        previous_fixed = previous_fixed.reshape(shape[:2])
     return DynamicsProblem(mesh, positions.reshape(shape), velocities.reshape(shape), proposed_positions.reshape(shape),
                            proposed_velocities.reshape(shape), initial.dt, initial.material["rest_density"],
                            full_broken, fixed.reshape(-1, 4),
                            (initial.dt * initial.topology.masses[:, None] * initial.gravity).reshape(shape), contacts,
                            initial.dt * model.config["velocity_scale"], model.config["velocity_scale"],
-                           kinematic_rule=model.config.get("motion_prior", "backward_euler") if config.kinematic_rule == "auto" else config.kinematic_rule)
+                           kinematic_rule=model.config.get("motion_prior", "backward_euler") if config.kinematic_rule == "auto" else config.kinematic_rule,
+                           previous_broken_faces=previous_full_broken, previous_fixed=previous_fixed)
 
 
 def _mechanical_energy(initial):
@@ -123,7 +152,7 @@ def _mechanical_energy(initial):
                               material["poissons_ratio"], initial.gravity)
 
 
-def _correct(initial, positions, velocities, proposal, broken, fixed, model, config, method, cancel=None, *, energy_model=None, progress=None):
+def _correct(initial, positions, velocities, proposal, broken, fixed, model, config, method, cancel=None, *, energy_model=None, progress=None, previous_broken=None, previous_fixed=None):
     mesh = initial.topology.mesh
     proposed_positions, proposed_velocities = _proposal_arrays(proposal, positions, velocities)
     rule = model.config.get("motion_prior", "backward_euler") if config.kinematic_rule == "auto" else config.kinematic_rule
@@ -146,7 +175,7 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
         except ValueError as error:
             return None, dict(status="invalid_contact_geometry", reason=str(error), outer_iterations=outer)
         problem = _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed,
-                           tuple(contacts), model, config)
+                           tuple(contacts), model, config, previous_broken=previous_broken, previous_fixed=previous_fixed)
         if progress:
             progress(dict(event="corrector_started", method=method, contact_outer_iteration=outer + 1,
                           contact_constraints=len(contacts), material_corners=problem.corner_count))
@@ -188,11 +217,9 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
 
 
 def release_supports(mesh, broken, fixed, release_probability):
-    proposed = fixed & (np.asarray(release_probability) < 0.5)
-    groups = corner_groups(mesh, broken)
-    retained = np.zeros(groups.max() + 1, dtype=bool)
-    np.logical_or.at(retained, groups, proposed)
-    return fixed & retained[groups]
+    return support_release_mask(torch.tensor(mesh.corner_face_pairs.copy(), dtype=torch.long),
+                                torch.as_tensor(broken, dtype=torch.bool), torch.as_tensor(fixed, dtype=torch.bool),
+                                torch.as_tensor(release_probability)).numpy()
 
 
 def _replay(initial, positions, broken, fixed, times, metrics, metadata):
@@ -202,7 +229,10 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
         frames.append(dict(time=float(time), poses=[dict(position=[0, 0, 0], orientation=[0, 0, 0, 1])],
                            geometries=[render_geometry(mesh, state, cuts, supports)], metrics=values))
     first = frames[0]["geometries"][0]
-    return dict(title="Engine-free neural fracture rollout", source="trained neural dynamics with optional proximal consensus",
+    physics_only = metadata.get("method") == "physics"
+    return dict(title="Constant-acceleration physics baseline" if physics_only else "Engine-free neural fracture rollout",
+                source="constant-acceleration physical prediction; no learned dynamics or fracture generation" if physics_only
+                       else "trained neural dynamics with optional proximal consensus",
                 bodies=[dict(id=0, **first, color="#d3ab75")], frames=frames,
                 metadata={**metadata, **{key: initial.metadata[key] for key in ("floor_height_m", "up_axis") if key in initial.metadata},
                           "simulation_executed": True, "suggested_playback_speed": 0.005 if "floor_height_m" in initial.metadata else 0.001,
@@ -212,7 +242,7 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
 @torch.no_grad()
 def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="consensus", config=None, device="auto", progress=None,
                      *, cancel=None):
-    if method not in ("physics", "raw", "neural", "central", "consensus") or not isinstance(steps, int) or steps < 1:
+    if method not in ("physics", "raw", "neural", "central", "consensus") or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError("select physics/raw/neural/central/consensus and a positive number of steps")
     config = config or RolloutConfig()
     initial = load_initial(initial_path)
@@ -285,9 +315,10 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                     continue
                 next_fixed = release_supports(initial.topology.mesh, mask, fixed,
                                               _array(corrected["support_release_probability"])) if learned_supports else fixed.copy()
+                candidate_proposal = _candidate_proposal(corrected, positions, velocities, next_fixed) if learned_supports else corrected
                 if method in ("central", "consensus"):
-                    result, diagnostic = _correct(initial, positions, velocities, proposal, mask, next_fixed, model, config, method, cancel,
-                                                  energy_model=energy_model, progress=progress)
+                    result, diagnostic = _correct(initial, positions, velocities, candidate_proposal, mask, next_fixed, model, config, method, cancel,
+                                                  energy_model=energy_model, progress=progress, previous_broken=old, previous_fixed=fixed)
                     optimization_solves += len(diagnostic.get("solves", []))
                     iterations += sum(item["iterations"] for item in diagnostic.get("solves", []))
                     if result is None:
@@ -299,7 +330,7 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                     next_positions, next_velocities = result.positions.reshape(-1, 3), result.velocities.reshape(-1, 3)
                     objective = prior + result.objective
                 else:
-                    next_positions, next_velocities = _proposal_arrays(corrected, positions, velocities)
+                    next_positions, next_velocities = _proposal_arrays(candidate_proposal, positions, velocities)
                     next_positions[next_fixed] = positions[next_fixed]
                     next_velocities[next_fixed] = 0
                     geometry = geometry_diagnostics(initial.topology.mesh, next_positions, mask, config.geometry_tolerance,
@@ -389,9 +420,12 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                   mechanical_energy_law="corotational elastic + kinetic + gravitational; static boundaries, no supplied fracture-energy credit",
                   energy_balance_enforced=bool(config.energy_balance and method in {"central", "consensus"}),
                   energy_velocity_scale=float(model.config["velocity_scale"]),
-                  contact_law="frictionless normal nonpenetration correction; restitution and contact impulse law not independently enforced",
-                  constitutive_response="learned predictor; no explicit elastic constitutive solve",
-                  fracture_choice=("one shared flow sample; fixed fracture mask during each state correction" if config.fracture_policy == "shared_sample"
+                  contact_law=("frictionless normal nonpenetration correction; restitution and contact impulse law not independently enforced"
+                               if method in {"central", "consensus"} else "not enforced; endpoint and swept geometry are diagnostics only"),
+                  constitutive_response=("none; constant acceleration with prescribed current supports" if method == "physics"
+                                         else "learned predictor; no explicit elastic constitutive solve"),
+                  fracture_choice=("initial fracture topology held fixed; no new fracture generation" if method == "physics"
+                                   else "one shared flow sample; fixed fracture mask during each state correction" if config.fracture_policy == "shared_sample"
                                    else "FM samples only; independent-marginal surrogate plus feasible motion/energy correction cost; not joint flow likelihood" if config.fracture_policy == "fm_search"
                                    else "legacy candidate search with independent-marginal surrogate plus motion correction cost; not joint flow likelihood"),
                   events=events)

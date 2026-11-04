@@ -170,6 +170,22 @@ def test_complete_conditions_stay_together_and_split_is_order_independent(tmp_pa
     assert split_dynamics_cases([trajectory], overfit=True)["train"] == [trajectory]
 
 
+def test_event_stratification_cannot_silently_remove_held_out_partitions(tmp_path):
+    case, path = recorded_trajectory(tmp_path)
+    source = load_dynamics_trajectory(case, path)
+    intact = np.zeros_like(source.broken)
+    free = np.zeros_like(source.fixed)
+    released = np.ones_like(source.fixed)
+    released[-1] = False
+    cases = [replace(source, case_id="negative", condition_digest="negative", broken=intact, fixed=free),
+             replace(source, case_id="fracture", condition_digest="fracture", fixed=free),
+             replace(source, case_id="support", condition_digest="support", broken=intact, fixed=released)]
+    with pytest.raises(ValueError, match="nonempty train, validation and test"):
+        split_dynamics_cases(cases, event_stratified=True)
+    normal = split_dynamics_cases(cases, event_stratified=False)
+    assert all(len(rows) == 1 for rows in normal.values())
+
+
 def test_loading_context_replicates_group_despite_case_name_and_time_horizon(tmp_path):
     first, trajectory = recorded_trajectory(tmp_path / "one")
     original = load_dynamics_trajectory(first, trajectory)

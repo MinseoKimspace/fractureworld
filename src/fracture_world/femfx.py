@@ -410,6 +410,8 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
         except (RuntimeError, ValueError) as error:
             if not skip_invalid:
                 raise
+            for folder, extension in (("cases", ".npz"), ("cases", ".json"), ("trajectories", ".npz"), ("replays", ".json")):
+                (output_dir / folder / f"{case['id']}{extension}").unlink(missing_ok=True)
             rejected.append({"case": case["id"], "reason": str(error), "accepted_as_training_reference": False})
             print(json.dumps({"case": case["id"], "status": "rejected", "reason": str(error)}), flush=True)
         finally:
