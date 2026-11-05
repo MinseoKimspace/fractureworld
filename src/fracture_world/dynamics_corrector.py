@@ -9,6 +9,7 @@ from scipy.optimize import linprog
 
 from .mesh import VolumeMesh
 from .partition import component_labels
+from .dynamics_solver_workspace import consensus_setup, inverse_gram, save_consensus
 
 
 def _finite_array(value, shape, name):
@@ -848,30 +849,28 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
     rho = float(np.median(problem.prior_weights)) if rho is None else float(rho)
     if not np.isfinite(rho) or rho <= 0:
         raise ValueError("rho must be finite and positive")
-    if _workspace is not None:
-        _workspace.clear()
-        _workspace.update(state=problem.prior.copy(), scaled_dual=np.zeros(sum(len(factor.indices) for factor in problem.factors)),
-                          rho=rho, factor_names=tuple(factor.name for factor in problem.factors))
+    state, rho, dual, operators, reuse = consensus_setup(problem, _workspace, rho)
+    save_consensus(problem, _workspace, state, dual, rho, operators)
     if cancel is not None and cancel():
         return _result(problem, "consensus", problem.prior, tolerances, False, "interrupted", 0, [], start)
     if max_iterations == 0:
         return _result(problem, "consensus", problem.prior, tolerances, False, "maximum_iterations", 0, [], start)
-    feasibility = _feasibility(problem, tolerances)
+    continued = _diagnostics(problem, state, tolerances) if reuse["state_reused"] else None
+    feasibility = (dict(method="validated continuation state", status="feasible", iterations=0, runtime_seconds=0.,
+                        engine_calls=0, maximum_violation=continued["constraint_violation"])
+                   if continued is not None and continued["constraints_satisfied"] else _feasibility(problem, tolerances))
     if feasibility["status"] != "feasible":
         status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
         return _result(problem, "consensus", problem.prior, tolerances, False, status, 0, [], start, feasibility)
     if feasibility["method"] == "direct feasible prior certificate" and _prior_is_minimum(problem):
+        save_consensus(problem, _workspace, problem.prior, np.zeros_like(dual), rho, operators)
         return _result(problem, "consensus", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
-    state = problem.prior.copy()
-    indices = np.concatenate([factor.indices for factor in problem.factors])
-    matrix = sparse.block_diag([factor.matrix for factor in problem.factors], format="csr")
-    transpose = matrix.T.tocsr()
-    inverse_gram = _factor_inverse_gram(problem, rho)
+    indices = operators["indices"]
+    matrix, transpose = operators["matrix"], operators["transpose"]
+    gram = inverse_gram(problem, operators, rho, _factor_inverse_gram)
     bound = np.concatenate([factor.bound for factor in problem.factors])
-    inequality = np.concatenate([np.full(len(factor.bound), factor.inequality, dtype=bool) for factor in problem.factors])
-    soft_rows = np.concatenate([np.full(len(factor.bound), factor.penalty is not None, dtype=bool) for factor in problem.factors])
+    inequality, soft_rows = operators["inequality"], operators["soft_rows"]
     local = state[indices].copy()
-    dual = np.zeros_like(local)
     counts = np.bincount(indices, minlength=len(state))
     local_dimension = len(indices)
     history = []
@@ -888,7 +887,7 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
             local = state[indices] - dual
             projection_residual = bound - matrix @ local
             projection_residual[inequality] = np.maximum(projection_residual[inequality], 0)
-            local += transpose @ (inverse_gram @ projection_residual)
+            local += transpose @ (gram @ projection_residual)
             totals = np.bincount(indices, weights=local + dual, minlength=len(state))
             state = (problem.prior_weights * problem.prior + rho * totals) / (problem.prior_weights + rho * counts)
             if not np.isfinite(state).all():
@@ -927,7 +926,7 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
                 rho *= multiplier
                 dual /= multiplier
                 if multiplier != 1.0:
-                    inverse_gram = _factor_inverse_gram(problem, rho)
+                    gram = inverse_gram(problem, operators, rho, _factor_inverse_gram)
             snapshot = (state.copy(), dual.copy(), rho)
             if any(snapshot[2] == prior[2] and np.array_equal(snapshot[0], prior[0]) and np.array_equal(snapshot[1], prior[1]) for prior in previous):
                 status = "numerical_cycle"
@@ -935,6 +934,7 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
             previous = (previous + [snapshot])[-2:]
     except KeyboardInterrupt:
         status = "interrupted"
-    if _workspace is not None:
-        _workspace.update(state=state.copy(), scaled_dual=dual.copy(), rho=rho)
-    return _result(problem, "consensus", state, tolerances, converged, status, iteration, history, start, feasibility)
+    save_consensus(problem, _workspace, state, dual, rho, operators)
+    result = _result(problem, "consensus", state, tolerances, converged, status, iteration, history, start, feasibility)
+    result.diagnostics["continuation"] = reuse
+    return result

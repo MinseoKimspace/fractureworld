@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import hashlib
 from time import perf_counter
 
 import numpy as np
@@ -16,37 +17,64 @@ class QuadraticEnergyModel:
     constant: float
 
 
+def _coefficient_digest(arrays):
+    digest = hashlib.sha256()
+    for value in arrays:
+        array = np.ascontiguousarray(value)
+        digest.update(str((array.dtype.str, array.shape)).encode())
+        digest.update(array.tobytes())
+    return digest.digest()
+
+
 def quadratic_energy_coefficients(projection):
     energy = projection.energy.energy if isinstance(projection.energy, TransportEnergy) else projection.energy
     if not isinstance(energy, FrozenQuadraticEnergy):
         return None
     problem = projection.problem
     dimension = len(problem.prior)
-    key = (id(problem), id(projection.energy), projection.energy_scale)
+    corners = energy.masses.size
+    state_indices = vars(problem).get("state_indices", np.arange(6 * corners))
+    if len(state_indices) != 6 * corners or np.max(state_indices, initial=-1) >= dimension:
+        raise ValueError("quadratic energy requires the full or shared affine material-corner coordinates")
+    stiffness = energy.stiffness.tocsr()
+    hessian_key = (dimension, problem.position_scale, problem.velocity_scale, projection.energy_scale,
+                   len(energy.node_masses), _coefficient_digest((state_indices, energy.corner_weights,
+                       energy.groups, energy.masses, stiffness.data, stiffness.indices, stiffness.indptr,
+                       np.asarray(stiffness.shape))))
+    stabilization = projection.energy.stabilization if isinstance(projection.energy, TransportEnergy) else np.empty(0)
+    key = (id(problem), id(projection.energy), hessian_key, projection.budget, energy.reference_elastic_energy,
+           tuple(sorted(projection.reference_components.items())),
+           _coefficient_digest((energy.linear_term, energy.reference_positions, energy.gravity, stabilization,
+                                problem.positions, problem.velocities)))
     cached = getattr(projection, "_quadratic_coefficients", None)
+    projection._quadratic_coefficients_reused = cached is not None and cached[0] == key
     if cached is None or cached[0] != key:
-        corners = energy.masses.size
-        state_indices = vars(problem).get("state_indices", np.arange(6 * corners))
-        if len(state_indices) != 6 * corners or np.max(state_indices, initial=-1) >= dimension:
-            raise ValueError("quadratic energy requires the full or shared affine material-corner coordinates")
-        rows = np.arange(3 * corners)
-        position_map = sparse.csr_matrix((np.full(3 * corners, problem.position_scale),
-                                          (rows, state_indices[:3 * corners])), shape=(3 * corners, dimension))
-        velocity_map = sparse.csr_matrix((np.full(3 * corners, problem.velocity_scale),
-                                          (rows, state_indices[3 * corners:])), shape=(3 * corners, dimension))
-        average = sparse.csr_matrix((energy.corner_weights, (energy.groups, np.arange(corners))),
-                                     shape=(len(energy.node_masses), corners))
-        nodal_map = sparse.kron(average, sparse.eye(3, format="csr"), format="csr") @ position_map
-        mass = sparse.diags(np.repeat(energy.masses.ravel(), 3), format="csr")
-        hessian = (nodal_map.T @ energy.stiffness @ nodal_map + velocity_map.T @ mass @ velocity_map) / projection.energy_scale
-        hessian = (0.5 * (hessian + hessian.T)).tocsc()
-        hessian.eliminate_zeros()
+        shared = getattr(energy, "_quadratic_state_hessian", None)
+        projection._quadratic_hessian_reused = shared is not None and shared[0] == hessian_key
+        if shared is None or shared[0] != hessian_key:
+            rows = np.arange(3 * corners)
+            position_map = sparse.csr_matrix((np.full(3 * corners, problem.position_scale),
+                                              (rows, state_indices[:3 * corners])), shape=(3 * corners, dimension))
+            velocity_map = sparse.csr_matrix((np.full(3 * corners, problem.velocity_scale),
+                                              (rows, state_indices[3 * corners:])), shape=(3 * corners, dimension))
+            average = sparse.csr_matrix((energy.corner_weights, (energy.groups, np.arange(corners))),
+                                         shape=(len(energy.node_masses), corners))
+            nodal_map = sparse.kron(average, sparse.eye(3, format="csr"), format="csr") @ position_map
+            mass = sparse.diags(np.repeat(energy.masses.ravel(), 3), format="csr")
+            hessian = (nodal_map.T @ stiffness @ nodal_map + velocity_map.T @ mass @ velocity_map) / projection.energy_scale
+            hessian = (0.5 * (hessian + hessian.T)).tocsc()
+            hessian.eliminate_zeros()
+            shared = (hessian_key, hessian)
+            energy._quadratic_state_hessian = shared
+        hessian = shared[1]
         linear = projection.state_gradient(np.zeros(dimension))
         if not np.isfinite(hessian.data).all() or not np.isfinite(linear).all():
             raise ValueError("quadratic energy coefficients must be finite")
-        cached = (key, hessian, linear)
+        cached = (key, hessian, linear, float(projection.state_value(np.zeros(dimension))))
         projection._quadratic_coefficients = cached
-    return QuadraticEnergyModel(cached[1], cached[2], float(projection.state_value(np.zeros(dimension))))
+    else:
+        projection._quadratic_hessian_reused = True
+    return QuadraticEnergyModel(cached[1], cached[2], cached[3])
 
 
 class _PositiveDefinitenessBoundary(Exception):
@@ -96,6 +124,8 @@ def project_quadratic_energy(projection, state, cancel=None):
                       linear_refinement_steps=refinements, energy_evaluations=evaluations,
                       nonlinear_optimization_variables=0, linear_system_variables=len(state),
                       proximal_state_variables=len(state), proximal_set_normalized_slack=target,
+                      quadratic_coefficients_reused=projection._quadratic_coefficients_reused,
+                      quadratic_hessian_reused=projection._quadratic_hessian_reused,
                       positive_definiteness=last_certificate, runtime_seconds=perf_counter() - started)
         report.update(extra)
         return EnergyProjectionResult(np.array(value, copy=True), converged, status, report)

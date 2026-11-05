@@ -9,15 +9,18 @@ import numpy as np
 import torch
 
 from . import dynamics_runtime as runtime
+from .dynamics_ablation_metrics import motion_ablation_comparisons, summarize_motion_ablation
 from .dynamics_data import _frozen, _teacher_physics, load_dynamics_dataset, load_dynamics_trajectory
 from .dynamics_evaluation import _native_clock, _new_fracture_classification
 from .dynamics_geometry import floor_contacts, geometry_diagnostics, linearized_contacts, swept_geometry_diagnostics
 from .dynamics_initial import DynamicsInitial
 from .dynamics_learning import load_dynamics_model, state_batch
+from .dynamics_model import physics_motion_prediction
 from .io import file_hash, new_directory, write_json
 
 
 METHODS = ("raw", "central", "consensus")
+MOTION_ABLATION_METHODS = ("no_motion_central", "no_motion_consensus")
 
 
 def _state_hash(arrays, context):
@@ -31,6 +34,14 @@ def _state_hash(arrays, context):
 
 def _proposal_copy(proposal):
     return {key: value.detach().clone() if isinstance(value, torch.Tensor) else value for key, value in proposal.items()}
+
+
+def _current_elastic_hash(initial, positions, broken, fixed):
+    state = runtime.current_elastic_state(initial, positions, broken, fixed)
+    if state is None:
+        return None
+    names = ("rotations", "centers_of_mass", "nodal_masses", "corner_vertex_ids", "tetrahedron_local_ids", "piece_ids")
+    return _state_hash([state[name] for name in names], dict(fields=names))
 
 
 def _frozen_objective(initial, positions, velocities, old, fixed, candidate, model, config):
@@ -70,6 +81,19 @@ def _compact_diagnostics(diagnostic):
     return report
 
 
+def _solver_agreement(prepared, indexed, states, first, second):
+    reports = []
+    for candidate in prepared:
+        key = candidate["index"]
+        a, b = indexed.get((key, first)), indexed.get((key, second))
+        available = bool(a and b and a["accepted"] and b["accepted"])
+        reports.append(dict(candidate=key, comparison_available=available,
+                            objective_difference_consensus_minus_central=b["selection_objective"] - a["selection_objective"] if available else None,
+                            positions_rms_metres=float(np.sqrt(np.mean((states[(key, first)][0] - states[(key, second)][0])**2))) if available else None,
+                            velocities_rms_metres_per_second=float(np.sqrt(np.mean((states[(key, first)][1] - states[(key, second)][1])**2))) if available else None))
+    return reports
+
+
 def _accumulate_summary(methods, pairwise, row):
     count = row.get("candidate_count")
     if isinstance(count, int):
@@ -84,6 +108,7 @@ def _accumulate_summary(methods, pairwise, row):
         values["unknown_candidates"] += int(record["verified_constraints"] is None)
         values["verified_candidates"] += int(record["verified_constraints"] is True)
         values["invalid_candidates"] += int(record["verified_constraints"] is False)
+        values["corrector_runtime_seconds_total"] = values.get("corrector_runtime_seconds_total", 0.) + record.get("corrector_runtime_seconds", 0.)
     for method, selected in row.get("methods", {}).items():
         if selected["selection_complete"] and selected["selected_candidate"] is not None:
             methods[method]["completed_selections"] += 1
@@ -111,10 +136,16 @@ def _reference_metrics(initial, positions, velocities, mask, fixed, reference):
 
 
 @torch.no_grad()
-def compare_matched_step(initial, model, config=None, step=0, *, reference=None, progress=None, cancel=None):
+def compare_matched_step(initial, model, config=None, step=0, *, reference=None, progress=None, cancel=None, motion_ablation=False,
+                         cold_corrector=False):
     config = config or runtime.RolloutConfig()
     if isinstance(step, bool) or not isinstance(step, (int, np.integer)) or step < 0:
         raise ValueError("matched step must be a nonnegative integer")
+    if not isinstance(motion_ablation, bool):
+        raise ValueError("motion ablation must be Boolean")
+    if not isinstance(cold_corrector, bool):
+        raise ValueError("cold corrector must be Boolean")
+    methods = (*METHODS, *MOTION_ABLATION_METHODS) if motion_ablation else METHODS
     model.eval()
     device = next(model.parameters()).device
     if device.type == "cpu":
@@ -129,6 +160,8 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
     old, fixed = np.array(initial.broken, copy=True), np.array(initial.fixed, copy=True)
     batch = state_batch(initial.topology, positions, velocities, old, fixed, initial.gravity, initial.material,
                         initial.dt, device, initial.metadata.get("floor_height_m"))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     started = perf_counter()
     if config.fracture_samples and len(old):
         proposal, context = model.forward_with_flow_context(batch)
@@ -136,7 +169,11 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
         proposal, context = model(batch), None
     runtime._validate_proposal(proposal, positions, velocities)
     masks = runtime.fracture_candidates(model, batch, proposal, config, int(step), context=context)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     proposal_seconds = perf_counter() - started
+    preparation_started = perf_counter()
+    physical_proposal = {**proposal, **physics_motion_prediction(batch, model.config.get("motion_prior", "backward_euler"))} if motion_ablation else None
     probability = runtime._array(proposal["fracture_probability"])
     learned_supports = initial.metadata.get("support_policy") == "learned_material_corner_release"
     if learned_supports and not model.config.get("learn_support_release", False):
@@ -145,6 +182,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                              dict(mesh=initial.topology.fingerprint, material=initial.material, dt=initial.dt,
                                   time=initial.time, floor_height_m=initial.metadata.get("floor_height_m"),
                                   support_policy=initial.metadata.get("support_policy"),
+                                  elastic_state_hash=_current_elastic_hash(initial, positions, old, fixed),
                                   configuration=asdict(config), sample_step=int(step)))
     prepared = []
     for index, mask in enumerate(masks):
@@ -160,17 +198,35 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                              proposal=_proposal_copy(candidate), positions=_frozen(xhat), velocities=_frozen(vhat),
                              candidate_hash=candidate_hash, prior=prior,
                              proposal_hash=_state_hash((xhat, vhat, mask, next_fixed), dict(input_hash=input_hash))))
+        if motion_ablation:
+            physical = runtime._candidate_proposal(physical_proposal, positions, velocities,
+                                                    fixed if config.mechanics_mode != "disabled" else next_fixed)
+            physical_positions, physical_velocities = runtime._proposal_arrays(physical, positions, velocities)
+            physical_positions[next_fixed], physical_velocities[next_fixed] = positions[next_fixed], 0
+            candidate_domain = np.maximum.reduce((np.abs(velocities), np.abs(vhat), np.abs(physical_velocities),
+                                                   np.full_like(velocities, model.config["velocity_scale"])))
+            prepared[-1]["physical_motion"] = dict(proposal=_proposal_copy(physical), positions=_frozen(physical_positions),
+                                                    velocities=_frozen(physical_velocities),
+                                                    proposal_hash=_state_hash((physical_positions, physical_velocities, mask, next_fixed), dict(input_hash=input_hash)))
+            prepared[-1]["shared_velocity_envelope"] = _frozen(runtime.velocity_publication_domain(candidate_domain))
     positions, velocities, old, fixed = (_frozen(value) for value in (positions, velocities, old, fixed))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    preparation_seconds = perf_counter() - preparation_started
     energy = runtime._mechanical_energy(initial, config.mechanics_mode != "disabled")
     records, states = [], {}
     interrupted = False
     for candidate in prepared:
         evaluation_problem = _frozen_objective(initial, positions, velocities, old, fixed, candidate, model, config)
-        for method in METHODS:
+        for method in methods:
             if cancel is not None and cancel():
                 interrupted = True
                 break
             start = perf_counter()
+            motion_source = "physical_prior" if method in MOTION_ABLATION_METHODS else "learned"
+            selected_proposal = candidate["physical_motion"] if motion_source == "physical_prior" else candidate
+            solver_method = method.removeprefix("no_motion_")
+            solver_seconds = 0.
             solution = None
             if method == "raw":
                 next_positions, next_velocities = candidate["positions"].copy(), candidate["velocities"].copy()
@@ -185,19 +241,32 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 objective, accepted = 0.0, True
             else:
                 try:
-                    solution, diagnostic = runtime._correct(initial, positions, velocities, _proposal_copy(candidate["proposal"]),
-                                                           candidate["mask"], candidate["fixed"], model, config, method, cancel,
-                                                           energy_model=energy, progress=progress,
-                                                           previous_broken=old, previous_fixed=fixed)
+                    options = dict(initial_velocity_envelope=candidate["shared_velocity_envelope"]) if motion_ablation else {}
+                    if cold_corrector:
+                        options["reuse_state"] = False
+                    method_progress = (lambda event, name=method, source=motion_source, index=candidate["index"]:
+                                       progress({**event, "comparison_method": name, "motion_source": source,
+                                                 "case": initial.case_id, "input_native_step": int(step),
+                                                 "candidate": index})) if progress is not None else None
+                    solver_started = perf_counter()
+                    solution, diagnostic = runtime._correct(initial, positions, velocities, _proposal_copy(selected_proposal["proposal"]),
+                                                           candidate["mask"], candidate["fixed"], model, config, solver_method, cancel,
+                                                           energy_model=energy, progress=method_progress,
+                                                           previous_broken=old, previous_fixed=fixed, **options)
+                    solver_seconds = perf_counter() - solver_started
                 except KeyboardInterrupt:
                     solution, diagnostic = None, dict(status="interrupted", solves=[])
+                    solver_seconds = perf_counter() - solver_started
                 accepted = solution is not None and solution.converged
                 objective = solution.objective if solution is not None else None
                 if accepted:
                     next_positions = np.array(solution.positions, copy=True).reshape(positions.shape)
                     next_velocities = np.array(solution.velocities, copy=True).reshape(velocities.shape)
             record = dict(candidate=candidate["index"], method=method, input_hash=input_hash,
-                          candidate_hash=candidate["candidate_hash"], proposal_hash=candidate["proposal_hash"],
+                          candidate_hash=candidate["candidate_hash"], proposal_hash=selected_proposal["proposal_hash"],
+                          learned_proposal_hash=candidate["proposal_hash"], motion_source=motion_source, solver_method=solver_method,
+                          objective_comparability_group=motion_source, corrector_runtime_seconds=solver_seconds,
+                          shared_velocity_envelope_hash=_state_hash([candidate["shared_velocity_envelope"]], {}) if motion_ablation else None,
                           prior=candidate["prior"], correction_objective=objective,
                           selection_objective=candidate["prior"] + objective if accepted else None,
                           accepted=bool(accepted), solver_converged=bool(accepted) if method != "raw" else None,
@@ -209,7 +278,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 state = evaluation_problem.encode_state(next_positions.reshape(evaluation_problem.positions.shape),
                                                          next_velocities.reshape(evaluation_problem.velocities.shape))
                 record["frozen_problem_objective"] = candidate["prior"] + evaluation_problem.objective(state)
-                record["frozen_objective_scope"] = "identical prediction, start-state coefficients and physical-free-motion contact partition for every method"
+                record["frozen_objective_scope"] = "shared learned-proposal fidelity anchor, current coefficients and physical-free-motion contacts; diagnostic only, not a reference accuracy measure"
                 balance = runtime.step_energy_diagnostics(initial, positions, velocities, next_positions, next_velocities,
                                                            old, fixed, model, config, nonlinear=energy)
                 record["diagnostic"]["energy"] = balance
@@ -223,7 +292,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
         if interrupted:
             break
     selections = {}
-    for method in METHODS:
+    for method in methods:
         eligible = [record for record in records if record["method"] == method and record["accepted"]]
         selected = min(eligible, key=lambda record: (record["selection_objective"], record["candidate"])) if eligible else None
         selections[method] = dict(selected_candidate=selected["candidate"] if selected else None,
@@ -231,6 +300,8 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                                   selection_complete=not interrupted,
                                   verified_constraints=selected["verified_constraints"] if selected else None,
                                   status="selected" if selected else "no_accepted_candidate")
+        selections[method].update(motion_source="physical_prior" if method in MOTION_ABLATION_METHODS else "learned",
+                                  solver_method=method.removeprefix("no_motion_"))
     reference_values = reference() if callable(reference) else reference
     if reference_values is not None:
         for record in records:
@@ -242,18 +313,11 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
             if selected["selected_candidate"] is not None:
                 selected["evaluation"] = next(record["evaluation"] for record in records
                                                if record["method"] == method and record["candidate"] == selected["selected_candidate"])
-    agreement = []
     indexed = {(record["candidate"], record["method"]): record for record in records}
-    for candidate in prepared:
-        key = candidate["index"]
-        central, consensus = indexed.get((key, "central")), indexed.get((key, "consensus"))
-        available = bool(central and consensus and central["accepted"] and consensus["accepted"])
-        agreement.append(dict(candidate=key, comparison_available=available,
-                              objective_difference_consensus_minus_central=(consensus["selection_objective"] - central["selection_objective"]) if available else None,
-                              positions_rms_metres=float(np.sqrt(np.mean((states[(key, "central")][0] - states[(key, "consensus")][0])**2))) if available else None,
-                              velocities_rms_metres_per_second=float(np.sqrt(np.mean((states[(key, "central")][1] - states[(key, "consensus")][1])**2))) if available else None))
+    agreement = _solver_agreement(prepared, indexed, states, "central", "consensus")
+    physical_agreement = _solver_agreement(prepared, indexed, states, *MOTION_ABLATION_METHODS) if motion_ablation else []
     selected_pairs = []
-    for first, second in combinations(METHODS, 2):
+    for first, second in combinations(methods, 2):
         a, b = selections[first]["selected_candidate"], selections[second]["selected_candidate"]
         available = not interrupted and a is not None and b is not None
         selected_pairs.append(dict(methods=[first, second], comparison_available=available,
@@ -261,19 +325,27 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                                    positions_rms_metres=float(np.sqrt(np.mean((states[(a, first)][0] - states[(b, second)][0])**2))) if available else None,
                                    velocities_rms_metres_per_second=float(np.sqrt(np.mean((states[(a, first)][1] - states[(b, second)][1])**2))) if available else None,
                                    fracture_disagreements=int(np.count_nonzero(prepared[a]["mask"] != prepared[b]["mask"])) if available else None))
+    ablation_comparisons = motion_ablation_comparisons(records, selections, candidate_count=len(prepared)) if motion_ablation else []
     return dict(format="fracture-world.matched-step.v1", status="interrupted" if interrupted else "completed",
                 case_id=initial.case_id, time_s=initial.time, dt=initial.dt, input_hash=input_hash,
                 candidate_pool=[item["candidate_hash"] for item in prepared], candidate_count=len(prepared),
                 proposal_generation_seconds=proposal_seconds, predictor_calls=1, fracture_flow_calls=config.fracture_samples,
-                requested_method_runs=len(prepared) * len(METHODS), attempted_method_runs=len(records),
-                unattempted_method_runs=len(prepared) * len(METHODS) - len(records),
+                shared_preparation_seconds=preparation_seconds, shared_generation_seconds=proposal_seconds + preparation_seconds,
+                requested_method_runs=len(prepared) * len(methods), attempted_method_runs=len(records),
+                unattempted_method_runs=len(prepared) * len(methods) - len(records),
+                motion_ablation=motion_ablation, physical_motion_prior=model.config.get("motion_prior", "backward_euler"),
+                corrector_reuse=not cold_corrector,
+                neural_fracture_and_support_shared=True, fully_neural_free_baseline=False,
                 methods=selections, candidates=records, central_consensus=agreement, selected_state_comparisons=selected_pairs,
+                no_motion_central_consensus=physical_agreement,
+                motion_ablation_comparisons=ablation_comparisons,
                 reference_used_for_proposals=False, reference_used_for_selection=False,
                 reference_used_only_for_evaluation=reference_values is not None, engine_calls=0,
                 protocol="one frozen current state, one predictor output, one shared candidate pool; all methods evaluate every candidate without pruning",
                 completion_semantics="completed means all requested method evaluations were attempted, not solver convergence or physical validity",
                 constraint_scope="recorded endpoint geometry, conservative swept geometry, energy and supplied solver constraints; unknown is not verified",
-                nonlinear_comparison="same nominal objective and inputs; different local nonlinear algorithms; no global optimum or consensus superiority certificate")
+                timing_scope="generation is shared once; per-method times exclude shared encoding/FM and later independent reference evaluation",
+                nonlinear_comparison="same objective within each motion-source central/consensus pair; fidelity centers differ across motion sources; compare held-out accuracy, not cross-source objective values")
 
 
 def _initial_observation(item, frame, model):
@@ -295,9 +367,18 @@ def _initial_observation(item, frame, model):
                            item.case_id, item.condition_digest, metadata)
 
 
-def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto", *, split="test", frames=None, progress=None, cancel=None):
+def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto", *, split="test", frames=None, progress=None, cancel=None,
+                             motion_ablation=False, cold_corrector=False, case_ids=None):
     if split not in {"train", "validation", "test", "all"}:
         raise ValueError("matched comparison split must select train, validation, test or all")
+    if not isinstance(motion_ablation, bool):
+        raise ValueError("motion ablation must be Boolean")
+    if not isinstance(cold_corrector, bool):
+        raise ValueError("cold corrector must be Boolean")
+    if case_ids is not None and (not isinstance(case_ids, (list, tuple)) or not case_ids or
+                                 any(not isinstance(name, str) or not name for name in case_ids) or len(set(case_ids)) != len(case_ids)):
+        raise ValueError("matched case IDs must be unique nonempty strings")
+    method_names = (*METHODS, *MOTION_ABLATION_METHODS) if motion_ablation else METHODS
     if frames is not None and (not isinstance(frames, (list, tuple)) or not frames or
                                any(isinstance(frame, bool) or not isinstance(frame, int) or frame < 0 for frame in frames) or len(set(frames)) != len(frames)):
         raise ValueError("matched frames must be unique nonnegative recorded frame indices")
@@ -310,17 +391,27 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
     if split != "all":
         names, conditions = set(saved["splits"][split]), set(saved["condition_splits"][split])
         items = [item for item in items if item.case_id in names and item.condition_digest in conditions]
-        if len(items) != len(names):
+        if len(items) != len(names) or {item.case_id for item in items} != names:
             raise ValueError("matched dataset must contain every recorded split case and loading condition")
     if not items:
         raise ValueError("matched comparison requires at least one selected case")
+    available_cases = len(items)
+    if case_ids is not None:
+        unknown = set(case_ids).difference(item.case_id for item in items)
+        if unknown:
+            raise ValueError(f"matched case IDs must belong to the selected split: {sorted(unknown)}")
+        items = [item for item in items if item.case_id in case_ids]
     directory = new_directory(output)
     cases, interrupted = [], False
     methods = {method: dict.fromkeys(("requested_candidates", "attempted_candidates", "completed_candidates", "failed_candidates",
                                       "interrupted_candidates", "unknown_candidates", "verified_candidates", "invalid_candidates",
-                                      "completed_selections", "verified_selections"), 0) for method in METHODS}
+                                      "completed_selections", "verified_selections"), 0) for method in method_names}
+    for values in methods.values():
+        values["corrector_runtime_seconds_total"] = 0.
     pairwise = {pair: dict.fromkeys(("common_selected_observations", "positions_rms_metres", "velocities_rms_metres_per_second",
-                                     "fracture_disagreements"), 0) for pair in combinations(METHODS, 2)}
+                                     "fracture_disagreements"), 0) for pair in combinations(method_names, 2)}
+    shared_generation_seconds = 0.
+    ablation_summary = None
     for item in items:
         trajectory = load_dynamics_trajectory(item.case_path) if hasattr(item, "case_path") else item
         known = set(saved["training_mesh_fingerprints"])
@@ -346,8 +437,13 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
             def reference():
                 return {key: getattr(trajectory, key)[frame + 1] for key in ("positions", "velocities", "broken", "fixed")}
 
+            if progress:
+                progress(dict(event="matched_step_started", case=trajectory.case_id, frame=frame,
+                              input_native_step=int(native_steps[frame]), corrector_reuse=not cold_corrector))
             try:
-                row = compare_matched_step(initial, model, config, int(native_steps[frame]), reference=reference, progress=progress, cancel=cancel)
+                options = dict(cold_corrector=True) if cold_corrector else {}
+                row = compare_matched_step(initial, model, config, int(native_steps[frame]), reference=reference, progress=progress,
+                                           cancel=cancel, motion_ablation=motion_ablation, **options)
             except KeyboardInterrupt:
                 row = dict(status="interrupted", case_id=trajectory.case_id, candidate_count=None, attempted_method_runs=None)
             row.update(frame=frame, input_native_step=int(native_steps[frame]))
@@ -372,6 +468,9 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
                     row["teacher_constraint_audit"] = dict(status="unknown", reason=f"{type(error).__name__}: {error}",
                                                            evaluated_after_selection=True)
             rows.append(row)
+            shared_generation_seconds += row.get("shared_generation_seconds", 0.)
+            if motion_ablation:
+                ablation_summary = summarize_motion_ablation([row], ablation_summary)
             if progress:
                 progress(dict(event="matched_step_completed", case=trajectory.case_id, frame=frame, status=row["status"],
                               candidate_count=row["candidate_count"], attempted_method_runs=row["attempted_method_runs"]))
@@ -387,7 +486,7 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
                           unknown_frames=sum(row["status"].startswith("unknown") for row in rows),
                           unknown_candidate_pools=sum(not isinstance(row.get("candidate_count"), int) for row in rows),
                           all_methods_common_selected_observations=sum(
-                              row["status"] == "completed" and len(row.get("methods", {})) == len(METHODS)
+                              row["status"] == "completed" and len(row.get("methods", {})) == len(method_names)
                               and all(item["selected_candidate"] is not None for item in row["methods"].values()) for row in rows)))
         if interrupted:
             break
@@ -401,7 +500,13 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
                                    for key in ("positions_rms_metres", "velocities_rms_metres_per_second", "fracture_disagreements")}))
     report = dict(format="fracture-world.matched-comparison.v1", status="interrupted" if interrupted else "completed",
                   checkpoint_sha256=file_hash(checkpoint), split=split, requested_cases=len(items), attempted_cases=len(cases),
-                  unattempted_cases=len(items) - len(cases), cases=cases, methods=list(METHODS),
+                  unattempted_cases=len(items) - len(cases), cases=cases, methods=list(method_names),
+                  motion_ablation=motion_ablation, neural_fracture_and_support_shared=True, fully_neural_free_baseline=False,
+                  corrector_reuse=not cold_corrector, available_split_cases=available_cases,
+                  selected_case_ids=[item.case_id for item in items],
+                  shared_generation_seconds_total=shared_generation_seconds,
+                  motion_ablation_summary=ablation_summary,
+                  timing_scope="shared encoder, FM, support and candidate preparation counted once; condition totals count only corrector wall time",
                   requested_observations=sum(len(item) if frames is None else len(frames) for item in items),
                   attempted_observations=sum(case["attempted_frames"] for case in cases),
                   unknown_candidate_pool_observations=sum(case["unknown_candidate_pools"] for case in cases),

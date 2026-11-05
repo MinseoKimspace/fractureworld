@@ -23,6 +23,23 @@ _ACCURACY_METRICS = (
       for name, unit in (("positive", "_j"), ("relative_positive", ""))],
 )
 
+_AUTONOMOUS_PROPOSAL_CONTROL = (
+    "same checkpoint, initial state, configuration, seed and Gaussian noise schedule; each method feeds back "
+    "its own predictions; fracture and support candidates are regenerated from that method's current state "
+    "and need not match after trajectories diverge"
+)
+
+
+def _motion_ablation_protocol(methods):
+    pairs = [[solver, f"no_motion_{solver}"] for solver in ("central", "consensus")]
+    return dict(enabled=any(method.startswith("no_motion_") for method in methods),
+                comparison_pairs=[pair for pair in pairs if set(pair).issubset(methods)],
+                removed="learned motion residual only",
+                retained="learned encoder, fracture flow, fracture probabilities and support-release predictions",
+                fully_neural_free=False,
+                state_feedback="each method uses its own committed state; no teacher forcing or cross-method state sharing",
+                candidate_control="same learned generator and noise schedule; identical candidate pools are not enforced after divergence")
+
 
 def _paired_accuracy(rows, methods, metrics):
     methods = tuple(methods)
@@ -78,7 +95,8 @@ def _rollout_agreement(central, consensus, completed):
                     positions_rms_metres=float(np.sqrt(np.mean((a["positions"][future] - b["positions"][future])**2))) if available else None,
                     velocities_rms_metres_per_second=float(np.sqrt(np.mean((a["velocities"][future] - b["velocities"][future])**2))) if available else None,
                     fracture_disagreements=int(np.count_nonzero(a["broken"][future] != b["broken"][future])) if available else None,
-                    same_objective=True,
+                    same_objective=None, same_objective_formulation=True,
+                    objective_scope="same formulation within a motion-source pair; autonomous current states and candidate pools may differ, so identical per-step objectives are not enforced",
                     interpretation="shared future predictions only; incomplete rollouts do not validate the full horizon; agreement is not evidence of proximal superiority"
                     if available else "no shared future prediction; initial-state equality provides no implementation validation")
 
@@ -86,8 +104,9 @@ def _rollout_agreement(central, consensus, completed):
 def _comparison_methods(methods, learned_corrector):
     selected = list(methods or (["raw", "neural", "central", "consensus"] if learned_corrector is not None
                                 else ["raw", "central", "consensus"]))
-    if len(set(selected)) != len(selected) or not set(selected).issubset({"physics", "raw", "neural", "central", "consensus"}):
-        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus values")
+    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
+    if len(set(selected)) != len(selected) or not set(selected).issubset(allowed):
+        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus values")
     if "neural" in selected and learned_corrector is None:
         raise ValueError("neural baseline requested but checkpoint has no trained corrector")
     return selected
@@ -116,11 +135,19 @@ def compare_dynamics(checkpoint, initial, output, steps, config=None, device="au
     if {"central", "consensus"}.issubset(conditions):
         agreement = _rollout_agreement(directory / "central" / "trajectory.npz", directory / "consensus" / "trajectory.npz",
                                        all(conditions[method]["status"] == "completed" for method in ("central", "consensus")))
+    no_motion_agreement = None
+    if {"no_motion_central", "no_motion_consensus"}.issubset(conditions):
+        no_motion_agreement = _rollout_agreement(
+            directory / "no_motion_central" / "trajectory.npz", directory / "no_motion_consensus" / "trajectory.npz",
+            all(conditions[method]["status"] == "completed" for method in ("no_motion_central", "no_motion_consensus")))
     report = dict(format="fracture-world.neural-comparison.v1", status="interrupted" if interrupted else "comparison_finished", engine_calls=0,
                   conditions=conditions, central_consensus_agreement=agreement,
+                  no_motion_central_consensus_agreement=no_motion_agreement,
+                  motion_ablation=_motion_ablation_protocol(methods),
                   requested_methods=methods, attempted_methods=list(conditions),
                   unattempted_methods=[method for method in methods if method not in conditions],
-                  proposal_control="same predictor, seed and Gaussian samples; autonomous states may diverge after the first step",
+                  proposal_control=_AUTONOMOUS_PROPOSAL_CONTROL,
+                  protocol="autonomous rollout from one initial state; every committed prediction is the next step's input",
                   numerical_reference_used_for_inference=False,
                   neural_baseline_available=learned_corrector is not None,
                   all_rollouts_completed=not interrupted and len(conditions) == len(methods)
@@ -215,6 +242,9 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                   requested_methods=methods, requested_method_runs=len(cases) * len(methods),
                   attempted_method_runs=attempted_runs, unattempted_method_runs=len(cases) * len(methods) - attempted_runs,
                   paired_accuracy=paired,
+                  motion_ablation=_motion_ablation_protocol(methods),
+                  proposal_control=_AUTONOMOUS_PROPOSAL_CONTROL,
+                  protocol="autonomous rollout from each held-out initial state; teacher future is evaluated only after inference",
                   split=split, generalization_protocol=saved.get("generalization_protocol", "loading_condition"),
                   inference_engine_calls=0, reference_used_only_for_evaluation=True,
                   positive_and_negative_fracture_scores_reported_separately=True,

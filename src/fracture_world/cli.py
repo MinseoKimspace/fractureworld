@@ -77,6 +77,7 @@ def parser():
     initial.add_argument("--frame", type=int, default=0)
     initial.add_argument("--support-policy", choices=["prescribed", "free", "learned"], required=True)
     initial.add_argument("--output", type=Path, required=True)
+    rollout_methods = ["physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"]
     for name in ("dynamics-rollout", "dynamics-compare"):
         command = commands.add_parser(name, help="Run learned fracture dynamics without a runtime physics engine")
         command.add_argument("--checkpoint", type=Path, required=True)
@@ -86,9 +87,9 @@ def parser():
         command.add_argument("--specification", type=Path)
         command.add_argument("--device", default="auto")
         if name == "dynamics-rollout":
-            command.add_argument("--method", choices=["physics", "raw", "neural", "central", "consensus"], default="consensus")
+            command.add_argument("--method", choices=rollout_methods, default="consensus")
         else:
-            command.add_argument("--methods", nargs="+", choices=["physics", "raw", "neural", "central", "consensus"])
+            command.add_argument("--methods", nargs="+", choices=rollout_methods)
             command.add_argument("--reference-case", type=Path)
             command.add_argument("--reference-trajectory", type=Path)
     dynamics_evaluation = commands.add_parser("dynamics-evaluate", help="Evaluate frozen neural rollouts against held-out numerical trajectories")
@@ -104,7 +105,10 @@ def parser():
     benchmark.add_argument("--specification", type=Path)
     benchmark.add_argument("--device", default="auto")
     benchmark.add_argument("--split", choices=["validation", "test"], default="test")
-    benchmark.add_argument("--methods", nargs="+", choices=["physics", "raw", "neural", "central", "consensus"])
+    benchmark.add_argument("--methods", nargs="+", choices=rollout_methods)
+    merge = commands.add_parser("dynamics-merge-benchmarks", help="Merge compatible saved benchmark conditions without rerunning inference")
+    merge.add_argument("--inputs", nargs="+", type=Path, required=True)
+    merge.add_argument("--output", type=Path, required=True)
     teacher = commands.add_parser("dynamics-teacher-audit", help="Check recorded teacher states against correction constraints and pinned mechanics")
     teacher.add_argument("--data", type=Path, required=True)
     normalization = teacher.add_mutually_exclusive_group(required=True)
@@ -121,6 +125,9 @@ def parser():
     matched.add_argument("--device", default="auto")
     matched.add_argument("--split", choices=["validation", "test"], default="test")
     matched.add_argument("--frames", nargs="+", type=int)
+    matched.add_argument("--case-ids", nargs="+", help="Evaluate only named cases from the recorded split")
+    matched.add_argument("--cold-corrector", action="store_true", help="Disable corrector state and outer-loop cache reuse for a controlled comparison")
+    matched.add_argument("--motion-ablation", action="store_true", help="Add physical-motion-prior central/consensus arms sharing the same learned fracture and support candidate pool")
     return root
 
 
@@ -204,7 +211,9 @@ def run(args):
                                       args.methods, args.reference_case, args.reference_trajectory, progress)
             output({"status": report["status"], "all_rollouts_completed": report["all_rollouts_completed"],
                     "engine_calls": 0, "report": str((args.output / "comparison.json").resolve()),
-                    "central_consensus_agreement": report["central_consensus_agreement"]})
+                    "central_consensus_agreement": report["central_consensus_agreement"],
+                    "no_motion_central_consensus_agreement": report.get("no_motion_central_consensus_agreement"),
+                    "motion_ablation": report.get("motion_ablation")})
         if report["status"] == "interrupted":
             raise SystemExit(130)
     elif args.command == "dynamics-evaluate":
@@ -224,6 +233,13 @@ def run(args):
                     all_rollouts_completed=report["all_rollouts_completed"], conditions=report["conditions"]))
         if report["status"] == "interrupted":
             raise SystemExit(130)
+    elif args.command == "dynamics-merge-benchmarks":
+        from .dynamics_benchmark_merge import merge_dynamics_benchmarks
+
+        report = merge_dynamics_benchmarks(args.inputs, args.output)
+        output(dict(status=report["status"], report=str(args.output.resolve()),
+                    methods=report["requested_methods"], all_rollouts_completed=report["all_rollouts_completed"],
+                    merge_simulation_calls=0))
     elif args.command == "dynamics-teacher-audit":
         from .dynamics_runtime import load_rollout_config
         from .dynamics_teacher_audit import inspect_teacher_constraints
@@ -238,9 +254,15 @@ def run(args):
         from .dynamics_runtime import load_rollout_config
 
         progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
+        options = {}
+        if args.cold_corrector:
+            options["cold_corrector"] = True
+        if args.case_ids is not None:
+            options["case_ids"] = args.case_ids
         report = compare_matched_dynamics(args.checkpoint, args.data, args.output, load_rollout_config(args.specification),
-                                          args.device, split=args.split, frames=args.frames, progress=progress)
+                                          args.device, split=args.split, frames=args.frames, progress=progress, motion_ablation=args.motion_ablation, **options)
         output(dict(status=report["status"], report=str((args.output / "matched.json").resolve()),
+                    motion_ablation=report["motion_ablation"],
                     conditions=report["conditions"]))
         if report["status"] == "interrupted":
             raise SystemExit(130)

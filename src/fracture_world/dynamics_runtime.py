@@ -14,7 +14,8 @@ from .dynamics_energy_solvers import solve_energy
 from .dynamics_geometry import boundary_triangles, corner_groups, floor_contacts, geometry_diagnostics, linearized_contacts, phase_swept_geometry_diagnostics, render_geometry, swept_geometry_diagnostics
 from .dynamics_frozen_energy import FrozenQuadraticEnergy, TransportEnergy
 from .dynamics_stabilization import solve_stabilization
-from .dynamics_model import constant_acceleration_prediction, support_release_mask
+from .dynamics_solver_workspace import translate_consensus
+from .dynamics_model import constant_acceleration_prediction, physics_motion_prediction, support_release_mask
 from .dynamics_mechanics import FrozenElasticBalance, elastic_kernel_arguments, fracture_initiation_diagnostics
 from .dynamics_initial import load_initial
 from .dynamics_learning import load_dynamics_model, state_batch
@@ -146,8 +147,25 @@ def _fracture_cost(mask, probability, old):
     return float(-np.mean(np.where(mask[active], np.log(probability), np.log1p(-probability))))
 
 
+def _contact_signature(contacts):
+    return tuple((np.asarray(contact.corner_ids).tobytes(), np.asarray(contact.weights).tobytes(),
+                  np.asarray(contact.normal).tobytes(), float(contact.gap),
+                  float(contact.environment_velocity), bool(contact.environment)) for contact in contacts)
+
+
+def _elastic_state_signature(state):
+    if state is None:
+        return None
+    digest = hashlib.sha256()
+    for name in ("rotations", "centers_of_mass", "nodal_masses", "corner_vertex_ids", "tetrahedron_local_ids", "piece_ids"):
+        values = np.ascontiguousarray(state[name])
+        digest.update(str((name, values.shape, values.dtype.str)).encode())
+        digest.update(values.tobytes())
+    return digest.digest()
+
+
 def _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed, contacts, model, config, *, previous_broken=None, previous_fixed=None,
-             stabilization_offset=None, velocity_envelope=None):
+             stabilization_offset=None, velocity_envelope=None, reusable_balance=None):
     mesh = initial.topology.mesh
     full_broken = np.zeros(len(mesh.faces.vertices), dtype=bool)
     full_broken[mesh.internal_faces] = broken
@@ -172,10 +190,30 @@ def _problem(initial, positions, velocities, proposed_positions, proposed_veloci
         full_broken[mesh.internal_faces] = integration_broken
         fixed = integration_fixed
         rule = "backward_euler"
-        balance = FrozenElasticBalance(mesh, initial.material, positions, velocities, initial.dt, initial.gravity,
-                                        integration_broken, integration_fixed, tuple(contacts), model.config["velocity_scale"],
-                                        config.absolute_tolerance, config.relative_tolerance, coefficient_model="native_float32",
-                                        current_elastic_state=current_elastic_state(initial, positions, integration_broken, integration_fixed))
+        elastic_state = current_elastic_state(initial, positions, integration_broken, integration_fixed)
+        if reusable_balance is None:
+            balance = FrozenElasticBalance(mesh, dict(initial.material), positions, velocities, initial.dt, initial.gravity,
+                                            integration_broken, integration_fixed, tuple(contacts), model.config["velocity_scale"],
+                                            config.absolute_tolerance, config.relative_tolerance, coefficient_model="native_float32",
+                                            current_elastic_state=elastic_state)
+            balance._runtime_elastic_state_signature = _elastic_state_signature(elastic_state)
+        else:
+            balance = reusable_balance
+            compatible = (isinstance(balance, FrozenElasticBalance) and balance.mesh is mesh
+                          and balance.material == initial.material and balance.dt == initial.dt
+                          and balance.velocity_scale == model.config["velocity_scale"]
+                          and balance.absolute_tolerance == config.absolute_tolerance
+                          and balance.relative_tolerance == config.relative_tolerance
+                          and balance.coefficient_model == "native_float32"
+                          and np.array_equal(balance.positions, positions)
+                          and np.array_equal(balance.velocities, velocities)
+                          and np.array_equal(balance.broken, integration_broken)
+                          and np.array_equal(balance.fixed, integration_fixed)
+                          and np.array_equal(balance.gravity, np.asarray(initial.gravity, dtype=np.float32).astype(float))
+                          and _contact_signature(balance.contacts) == _contact_signature(contacts)
+                          and getattr(balance, "_runtime_elastic_state_signature", None) == _elastic_state_signature(elastic_state))
+            if not compatible:
+                raise ValueError("reusable elastic balance must match the complete current state and contact geometry")
     masses = initial.topology.masses if balance is None else balance.corner_masses
     gravity = initial.gravity if balance is None else balance.gravity
     roundoff = None
@@ -343,7 +381,11 @@ def _mechanical_energy(initial, native_precision=False):
                    material["poissons_ratio"], initial.gravity)
 
 
-def _correct(initial, positions, velocities, proposal, broken, fixed, model, config, method, cancel=None, *, energy_model=None, progress=None, previous_broken=None, previous_fixed=None):
+def _correct(initial, positions, velocities, proposal, broken, fixed, model, config, method, cancel=None, *, energy_model=None, progress=None, previous_broken=None, previous_fixed=None,
+             initial_velocity_envelope=None, reuse_state=True, record_history=False):
+    if not isinstance(reuse_state, bool) or not isinstance(record_history, bool):
+        raise ValueError("corrector reuse and history recording must be Boolean")
+    started = perf_counter()
     mesh = initial.topology.mesh
     proposed_positions, proposed_velocities = _proposal_arrays(proposal, positions, velocities)
     rule = model.config.get("motion_prior", "backward_euler") if config.kinematic_rule == "auto" else config.kinematic_rule
@@ -362,41 +404,146 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
     energy_model = energy_model or _mechanical_energy(initial, config.mechanics_mode != "disabled")
     stabilization_offset = None
     velocity_envelope = velocity_publication_domain(np.maximum(np.maximum(np.abs(velocities), np.abs(proposed_velocities)), model.config["velocity_scale"]))
-    histories, previous_trials = [], []
+    if initial_velocity_envelope is not None:
+        supplied = np.asarray(initial_velocity_envelope, dtype=float)
+        if supplied.shape != velocity_envelope.shape or not np.isfinite(supplied).all() or np.any(supplied < velocity_envelope):
+            raise ValueError("shared initial velocity envelope must cover the physical and predicted motion domains")
+        velocity_envelope = supplied.copy()
+    histories, previous_trials, retries = [], [], []
+    energy_workspace, linear_workspace = ({}, {}) if reuse_state else (None, None)
+    counts = dict(contact_builds=0, contact_cache_hits=0, elastic_balance_builds=0, elastic_balance_reuses=0,
+                  frozen_energy_builds=0, frozen_energy_reuses=0, pending_problem_reuses=0,
+                  contact_geometry_invalidations=0, solver_workspace_resets=0)
+    last_trial, last_contacts, last_contact_key = None, None, None
+    last_balance, last_frozen = None, None
+    pending_problem = None
+    retry_states = set()
     outer = 0
+
+    def finish(solution, diagnostic):
+        performance = dict(reuse_enabled=reuse_state, **counts,
+                           inner_iterations_total=sum(item["iterations"] for item in histories),
+                           inner_solver_seconds_total=sum(item["runtime_seconds"] for item in histories),
+                           runtime_seconds=perf_counter() - started,
+                           retry_counts={reason: sum(item["reason"] == reason for item in retries)
+                                         for reason in dict.fromkeys(item["reason"] for item in retries)})
+        diagnostic.update(performance=performance, outer_retries=retries)
+        if solution is not None:
+            solution.diagnostics["runtime_reuse"] = performance
+        if progress:
+            progress(dict(event="corrector_finished", method=method, status=diagnostic["status"],
+                          contact_outer_iterations=outer, **performance))
+        return solution, diagnostic
+
+    def problem_for(contacts, offset):
+        nonlocal last_balance
+        options = dict(previous_broken=previous_broken, previous_fixed=previous_fixed,
+                       stabilization_offset=offset, velocity_envelope=velocity_envelope)
+        if reuse_state and last_balance is not None:
+            options["reusable_balance"] = last_balance
+        problem = _problem(initial, positions, velocities, proposed_positions, proposed_velocities,
+                           broken, fixed, contacts, model, config, **options)
+        if problem.elastic_balance is not None:
+            name = "elastic_balance_reuses" if reuse_state and last_balance is not None else "elastic_balance_builds"
+            counts[name] += 1
+            last_balance = problem.elastic_balance if reuse_state else None
+        return problem
+
+    def energy_for(problem, offset):
+        nonlocal last_frozen
+        if config.mechanics_mode == "disabled":
+            return energy_model, energy_model.value(positions, velocities)
+        if reuse_state and last_frozen is not None and last_frozen.balance_model is problem.elastic_balance:
+            frozen = last_frozen
+            counts["frozen_energy_reuses"] += 1
+        else:
+            frozen = FrozenQuadraticEnergy(problem.elastic_balance, energy_model)
+            counts["frozen_energy_builds"] += 1
+            if reuse_state:
+                last_frozen = frozen
+        energy = frozen if offset is None else TransportEnergy(frozen, offset)
+        return energy, frozen.value(positions, velocities)
+
+    def retry(reason, solution, contact_key, **details):
+        digest = hashlib.sha256(reason.encode())
+        digest.update(repr(contact_key).encode())
+        for value in (trial_positions, velocity_envelope, stabilization_offset, solution.positions, solution.velocities):
+            array = np.ascontiguousarray(value) if value is not None else np.array([], dtype=float)
+            digest.update(str((array.shape, array.dtype.str)).encode())
+            digest.update(array.tobytes())
+        for workspace in (energy_workspace, linear_workspace):
+            if workspace is None:
+                continue
+            for phase in (workspace, workspace.get("linear", {}), workspace.get("nonlinear", {})):
+                for key in ("state", "scaled_dual", "energy_scaled_dual", "rho", "energy_key", "phase"):
+                    value = phase.get(key)
+                    if isinstance(value, np.ndarray):
+                        digest.update(str((key, value.shape, value.dtype.str)).encode())
+                        digest.update(np.ascontiguousarray(value).tobytes())
+                    elif value is not None:
+                        digest.update(repr((key, value)).encode())
+        signature = digest.digest()
+        repeated = signature in retry_states
+        retry_states.add(signature)
+        record = dict(reason=reason, contact_outer_iteration=outer,
+                      cumulative_iterations=sum(item["iterations"] for item in histories),
+                      cumulative_solver_seconds=sum(item["runtime_seconds"] for item in histories),
+                      runtime_seconds=perf_counter() - started, complete_outer_state_repeated=repeated, **details)
+        retries.append(record)
+        if progress:
+            progress(dict(event="corrector_outer_retry", method=method, **record))
+        return repeated
     while config.max_contact_iterations is None or outer < config.max_contact_iterations:
         if cancel is not None and cancel():
-            return None, dict(status="interrupted", outer_iterations=outer, solves=histories)
+            return finish(None, dict(status="interrupted", outer_iterations=outer, solves=histories))
         try:
-            contacts = step_contacts(initial, positions, trial_positions, integration_broken, config)
+            if reuse_state and last_trial is not None and np.array_equal(last_trial, trial_positions):
+                contacts = last_contacts
+                counts["contact_cache_hits"] += 1
+            else:
+                contacts = tuple(step_contacts(initial, positions, trial_positions, integration_broken, config))
+                counts["contact_builds"] += 1
+                if reuse_state:
+                    last_trial, last_contacts = trial_positions.copy(), contacts
         except ValueError as error:
-            return None, dict(status="invalid_contact_geometry", reason=str(error), outer_iterations=outer)
-        problem = _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed,
-                           tuple(contacts), model, config, previous_broken=previous_broken, previous_fixed=previous_fixed,
-                           stabilization_offset=stabilization_offset, velocity_envelope=velocity_envelope)
+            return finish(None, dict(status="invalid_contact_geometry", reason=str(error), outer_iterations=outer))
+        contact_key = _contact_signature(contacts)
+        if contact_key != last_contact_key:
+            if last_contact_key is not None:
+                counts["contact_geometry_invalidations"] += 1
+                counts["solver_workspace_resets"] += int(any(isinstance(workspace, dict) and workspace
+                                                              for workspace in (energy_workspace, linear_workspace)))
+                for workspace in (energy_workspace, linear_workspace):
+                    if isinstance(workspace, dict):
+                        workspace.clear()
+            last_balance, last_frozen, pending_problem = None, None, None
+            last_contact_key = contact_key
+        if pending_problem is not None:
+            problem = pending_problem
+            pending_problem = None
+            counts["pending_problem_reuses"] += 1
+        else:
+            problem = problem_for(contacts, stabilization_offset)
         if config.mechanics_mode != "disabled" and stabilization_offset is None:
             stabilization_offset, stabilization = solve_stabilization(problem.elastic_balance, contacts, proposed_velocities,
                                                                        config.geometry_tolerance, problem.position_scale, tolerance, cancel)
             if stabilization_offset is None:
-                return None, dict(status=stabilization["status"], stabilization=stabilization, outer_iterations=outer)
-            problem = _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed,
-                               tuple(contacts), model, config, previous_broken=previous_broken, previous_fixed=previous_fixed,
-                               stabilization_offset=stabilization_offset, velocity_envelope=velocity_envelope)
-        energy, budget = step_energy(initial, positions, velocities, integration_broken, integration_fixed, config,
-                                     balance=problem.elastic_balance, stabilization=stabilization_offset, nonlinear=energy_model)
+                return finish(None, dict(status=stabilization["status"], stabilization=stabilization, outer_iterations=outer))
+            problem = problem_for(contacts, stabilization_offset)
+        energy, budget = energy_for(problem, stabilization_offset)
         if progress:
             progress(dict(event="corrector_started", method=method, contact_outer_iteration=outer + 1,
                           contact_constraints=len(contacts), material_corners=problem.corner_count))
         if config.energy_balance:
             projection = EnergyProjection(problem, energy, budget, config.absolute_tolerance, config.relative_tolerance)
-            result = solve_energy(problem, projection, method, tolerance, config.rho, config.max_iterations, cancel, progress=progress)
+            result = solve_energy(problem, projection, method, tolerance, config.rho, config.max_iterations, cancel, progress=progress, workspace=energy_workspace)
         else:
             result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel) if method == "central" else solve_consensus(
-                problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations, cancel=cancel, progress=progress)
+                problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations, cancel=cancel, progress=progress, _workspace=linear_workspace)
         outer += 1
         histories.append(dict(outer_iteration=outer, status=result.status, iterations=result.iterations,
-                              objective=result.objective, diagnostics=result.diagnostics,
-                              history=[asdict(item) for item in result.history]))
+                              objective=result.objective, diagnostics=result.diagnostics, runtime_seconds=result.runtime_seconds,
+                              history=[asdict(item) for item in result.history] if record_history else []))
         if progress:
             progress(dict(event="corrector_solved", method=method, contact_outer_iteration=outer,
                           status=result.status, iterations=result.iterations, runtime_seconds=result.runtime_seconds))
@@ -415,33 +562,52 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
                            maximum_residual_reduction=float(before - after) if before is not None and after is not None else None)
         result.diagnostics["mechanics"] = mechanics
         if not result.converged:
-            return None, dict(status=result.status, outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics)
+            return finish(None, dict(status=result.status, outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics))
         if config.mechanics_mode != "disabled":
             final_velocity = result.velocities.reshape(-1, 3)
-            if np.any(np.abs(final_velocity) > velocity_envelope):
+            exceeded = np.abs(final_velocity) > velocity_envelope
+            if np.any(exceeded):
                 velocity_envelope = velocity_publication_domain(np.maximum(velocity_envelope, np.abs(final_velocity)))
+                if retry("velocity_envelope", result, contact_key, exceeded_components=int(np.count_nonzero(exceeded)),
+                         maximum_velocity=float(np.max(np.abs(final_velocity))), maximum_envelope=float(np.max(velocity_envelope))):
+                    return finish(None, dict(status="outer_fixed_point_cycle_unknown", outer_iterations=outer,
+                                             solves=histories, geometry=geometry, mechanics=mechanics))
                 continue
             updated_offset, stabilization = solve_stabilization(problem.elastic_balance, contacts, final_velocity,
                                                                  config.geometry_tolerance, problem.position_scale, tolerance, cancel)
             if updated_offset is None:
-                return None, dict(status=stabilization["status"], stabilization=stabilization, outer_iterations=outer, solves=histories)
+                return finish(None, dict(status=stabilization["status"], stabilization=stabilization, outer_iterations=outer, solves=histories))
             mismatch = float(np.max(np.abs(updated_offset - stabilization_offset))) / problem.position_scale
             stabilization["frozen_offset_consistency_residual"] = mismatch
             stabilization["previous_offset_change_normalized"] = mismatch
             result.diagnostics["stabilization"] = stabilization
             if mismatch > tolerance.absolute + tolerance.relative:
-                verified_problem = _problem(initial, positions, velocities, proposed_positions, proposed_velocities, broken, fixed,
-                                             contacts, model, config, previous_broken=previous_broken, previous_fixed=previous_fixed,
-                                             stabilization_offset=updated_offset, velocity_envelope=velocity_envelope)
+                verified_problem = problem_for(contacts, updated_offset)
                 verified_state = verified_problem.encode_state(result.positions, result.velocities)
                 verified = _diagnostics(verified_problem, verified_state, tolerance)
-                verified_energy, verified_budget = step_energy(initial, positions, velocities, integration_broken, integration_fixed, config,
-                                                                balance=verified_problem.elastic_balance, stabilization=updated_offset, nonlinear=energy_model)
+                verified_energy, verified_budget = energy_for(verified_problem, updated_offset)
                 energy_check = verified_energy.balance(positions, velocities, result.positions, result.velocities,
                                                        model.config["velocity_scale"], budget=verified_budget,
                                                        absolute_tolerance=config.absolute_tolerance, relative_tolerance=config.relative_tolerance)
+                stabilization_delta = updated_offset - stabilization_offset
                 stabilization_offset = updated_offset
                 if not verified["constraints_satisfied"] or (config.energy_balance and not energy_check["energy_satisfied"]):
+                    translation = dict(translated_states=0, status="not_available")
+                    if reuse_state:
+                        pending_problem = verified_problem
+                        active_workspace = energy_workspace if config.energy_balance else linear_workspace
+                        if method == "consensus" and active_workspace:
+                            continuation = {"linear": energy_workspace.get("linear", {})} if config.energy_balance else {"linear": linear_workspace}
+                            translation = translate_consensus(continuation, problem, verified_problem, stabilization_delta)
+                    stabilization["continuation_translation"] = translation
+                    if retry("stabilization_recheck", result, contact_key, stabilization_change_normalized=mismatch,
+                             constraint_violation=verified["constraint_violation"], constraint_tolerance=verified["constraint_tolerance"],
+                             constraints_satisfied=verified["constraints_satisfied"],
+                             energy_violation=energy_check["normalized_violation"], energy_tolerance=energy_check["normalized_tolerance"],
+                             energy_satisfied=energy_check["energy_satisfied"],
+                             continuation_states_translated=translation["translated_states"]):
+                        return finish(None, dict(status="outer_fixed_point_cycle_unknown", outer_iterations=outer,
+                                                 solves=histories, geometry=geometry, mechanics=mechanics, stabilization=stabilization))
                     continue
                 problem, energy, budget = verified_problem, verified_energy, verified_budget
                 for key in ("constraints_satisfied", "constraint_violation", "constraint_tolerance", "factor_violations"):
@@ -455,27 +621,31 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
             result.diagnostics["energy"]["stabilization"] = energy.stabilization_diagnostics(result.positions, result.velocities)
         initiation = mechanics.get("fracture_initiation", {})
         if config.fracture_initiation and initiation.get("status") != "pass":
-            return None, dict(status="fracture_initiation_rejected" if initiation.get("status") == "fail" else "fracture_initiation_unknown",
-                              outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics)
+            return finish(None, dict(status="fracture_initiation_rejected" if initiation.get("status") == "fail" else "fracture_initiation_unknown",
+                              outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics))
         if geometry["valid"]:
             swept = phase_swept_geometry_diagnostics(mesh, positions, result.positions, broken, config.geometry_tolerance,
                                                      initial.metadata.get("floor_height_m"), stabilization_offset)
             if not swept["valid"]:
-                return None, dict(status="continuous_geometry_unresolved", outer_iterations=outer, solves=histories,
-                                  geometry=geometry, swept_geometry=swept, mechanics=mechanics)
-            return result, dict(status="converged", outer_iterations=outer, solves=histories, geometry=geometry,
+                return finish(None, dict(status="continuous_geometry_unresolved", outer_iterations=outer, solves=histories,
+                                  geometry=geometry, swept_geometry=swept, mechanics=mechanics))
+            return finish(result, dict(status="converged", outer_iterations=outer, solves=histories, geometry=geometry,
                                 swept_geometry=swept, mechanics=mechanics,
-                                contact_initialization="physical free motion with prescribed supports")
+                                contact_initialization="physical free motion with prescribed supports"))
         if geometry.get("inverted_tetrahedra", 0):
-            return None, dict(status="inverted_tetrahedra", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics)
+            return finish(None, dict(status="inverted_tetrahedra", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics))
         if np.allclose(trial_positions, result.positions.reshape(-1, 3), rtol=0, atol=config.geometry_tolerance):
-            return None, dict(status="contact_linearization_stagnation", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics)
+            return finish(None, dict(status="contact_linearization_stagnation", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics))
         if any(np.allclose(previous, result.positions.reshape(-1, 3), rtol=0, atol=config.geometry_tolerance)
                for previous in previous_trials):
-            return None, dict(status="contact_linearization_cycle", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics)
+            return finish(None, dict(status="contact_linearization_cycle", outer_iterations=outer, solves=histories, geometry=geometry, mechanics=mechanics))
         previous_trials = (previous_trials + [trial_positions.copy()])[-2:]
         trial_positions = result.positions.reshape(-1, 3)
-    return None, dict(status="contact_iteration_budget", outer_iterations=outer, solves=histories)
+        if retry("contact_geometry", result, contact_key,
+                 overlapping_tetrahedron_pairs=geometry.get("overlapping_tetrahedron_pairs", 0)):
+            return finish(None, dict(status="outer_fixed_point_cycle_unknown", outer_iterations=outer,
+                                     solves=histories, geometry=geometry, mechanics=mechanics))
+    return finish(None, dict(status="contact_iteration_budget", outer_iterations=outer, solves=histories))
 
 
 def release_supports(mesh, broken, fixed, release_probability):
@@ -492,8 +662,12 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
                            geometries=[render_geometry(mesh, state, cuts, supports)], metrics=values))
     first = frames[0]["geometries"][0]
     physics_only = metadata.get("method") == "physics"
-    return dict(title="Constant-acceleration physics baseline" if physics_only else "Engine-free neural fracture rollout",
+    motion_ablated = metadata.get("motion_source") == "physical_prior"
+    return dict(title="Constant-acceleration physics baseline" if physics_only else
+                      "Learned fracture with physical motion prior and numerical correction" if motion_ablated else
+                      "Engine-free neural fracture rollout",
                 source="constant-acceleration physical prediction; no learned dynamics or fracture generation" if physics_only
+                       else "learned fracture and support release; learned motion discarded; numerical state correction" if motion_ablated
                        else "trained neural dynamics with optional proximal consensus",
                 bodies=[dict(id=0, **first, color="#d3ab75")], frames=frames,
                 metadata={**metadata, **{key: initial.metadata[key] for key in ("floor_height_m", "up_axis") if key in initial.metadata},
@@ -504,8 +678,12 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
 @torch.no_grad()
 def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="consensus", config=None, device="auto", progress=None,
                      *, cancel=None):
-    if method not in ("physics", "raw", "neural", "central", "consensus") or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-        raise ValueError("select physics/raw/neural/central/consensus and a positive number of steps")
+    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
+    if method not in allowed or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("select physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus and a positive number of steps")
+    motion_ablated = method in {"no_motion_central", "no_motion_consensus"}
+    solver_method = method.removeprefix("no_motion_") if method in {"central", "consensus"} or motion_ablated else None
+    constrained = solver_method is not None
     config = config or RolloutConfig()
     initial = load_initial(initial_path)
     teacher_physics = initial.metadata.get("teacher_physics", {})
@@ -517,7 +695,7 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
     if config.kinematic_rule == "auto":
         config = replace(config, kinematic_rule="backward_euler" if config.mechanics_mode != "disabled"
                          else model.config.get("motion_prior", "backward_euler"))
-    if method in {"central", "consensus"}:
+    if constrained:
         unsupported = {key: teacher_physics[key] for key in teacher_parameters if teacher_physics.get(key, 0) != 0}
         if unsupported:
             raise ValueError(f"the constrained rollout requires undamped frictionless teacher data; regenerate with zero damping and friction: {unsupported}")
@@ -562,6 +740,8 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                 else:
                     proposal, flow_context = model(batch), None
                 predictor_calls += 1
+                if motion_ablated:
+                    proposal = {**proposal, **physics_motion_prediction(batch, model.config.get("motion_prior", "backward_euler"))}
                 _validate_proposal(proposal, positions, velocities)
                 candidates = fracture_candidates(model, batch, proposal, config, step, context=flow_context)
                 flow_calls += config.fracture_samples
@@ -583,9 +763,11 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                                               _array(corrected["support_release_probability"])) if learned_supports else fixed.copy()
                 candidate_proposal = _candidate_proposal(corrected, positions, velocities,
                                                           fixed if config.mechanics_mode != "disabled" else next_fixed) if learned_supports else corrected
-                if method in ("central", "consensus"):
-                    result, diagnostic = _correct(initial, positions, velocities, candidate_proposal, mask, next_fixed, model, config, method, cancel,
-                                                  energy_model=energy_model, progress=progress, previous_broken=old, previous_fixed=fixed)
+                if constrained:
+                    solver_progress = (lambda event: progress({**event, "comparison_method": method,
+                                                              "motion_source": "physical_prior" if motion_ablated else "learned"})) if progress is not None else None
+                    result, diagnostic = _correct(initial, positions, velocities, candidate_proposal, mask, next_fixed, model, config, solver_method, cancel,
+                                                  energy_model=energy_model, progress=solver_progress, previous_broken=old, previous_fixed=fixed)
                     optimization_solves += len(diagnostic.get("solves", []))
                     iterations += sum(item["iterations"] for item in diagnostic.get("solves", []))
                     if result is None:
@@ -662,6 +844,10 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
     split = next((name for name, conditions in condition_splits.items() if initial.condition_digest in conditions), "unseen_condition")
     committed = [event for event in events if event.get("status") == "committed"]
     report = dict(format="fracture-world.neural-rollout.v1", status=status, method=method,
+                  solver_method=solver_method, motion_source="physical_prior" if motion_ablated else "constant_acceleration" if method == "physics" else "learned",
+                  motion_ablation=motion_ablated, fully_neural_free_baseline=method == "physics",
+                  autonomous=True, state_feedback="previous committed prediction; no teacher state reset",
+                  predictor_forward_includes_discarded_motion_head=motion_ablated,
                   requested_steps=steps, completed_steps=len(times) - 1, engine_calls=0,
                   checkpoint_sha256=file_hash(checkpoint_path), initial_sha256=file_hash(initial_path),
                   case_id=initial.case_id, condition_digest=initial.condition_digest, condition_split=split,
@@ -672,9 +858,10 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                   floor_height_m=initial.metadata.get("floor_height_m"),
                   overfit_debug=checkpoint["training"]["overfit"], configuration=asdict(config),
                   predictor_calls=predictor_calls, neural_corrector_calls=neural_calls,
-                  learned_motion_corrector_calls=predictor_calls,
+                  learned_motion_corrector_calls=0 if motion_ablated else predictor_calls,
                   physical_predictor="constant_acceleration" if method == "physics" else model.config.get("motion_prior", "backward_euler"),
-                  learned_motion_role="none" if method == "physics" else "state-dependent correction of the physical motion prior",
+                  learned_motion_role="discarded; physical motion prior only" if motion_ablated else
+                                      "none" if method == "physics" else "state-dependent correction of the physical motion prior",
                   predictor_parameters=sum(parameter.numel() for parameter in model.parameters()),
                   neural_corrector_parameters=sum(parameter.numel() for parameter in neural_corrector.parameters()) if method == "neural" else 0,
                   fracture_flow_calls=flow_calls, optimization_solves=optimization_solves,
@@ -694,17 +881,20 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                   checked_constraint_steps=len(committed),
                   mechanics_mode=config.mechanics_mode,
                   mechanics_weight=config.mechanics_weight,
-                  fracture_initiation_enforced=config.fracture_initiation and method in {"central", "consensus"},
+                  fracture_initiation_enforced=config.fracture_initiation and constrained,
                   all_committed_elastic_equalities_valid=all(event.get("mechanics", {}).get("elastic_dynamics", {}).get("status") == "pass"
                                                            for event in committed) if committed and config.mechanics_mode != "disabled" else None,
                   elastic_equality_check_scope="residual against the pinned numerical equation; proximal mode minimizes rather than enforces zero residual",
                   mechanics_scope="frozen-rotation implicit teacher model; contact/support reactions remain partially unknown",
                   mechanical_energy_law="corotational elastic + kinetic + gravitational; static boundaries, no supplied fracture-energy credit",
-                  energy_balance_enforced=bool(config.energy_balance and method in {"central", "consensus"}),
+                  energy_balance_enforced=bool(config.energy_balance and constrained),
                   energy_velocity_scale=float(model.config["velocity_scale"]),
                   contact_law=("frictionless normal nonpenetration correction; restitution and contact impulse law not independently enforced"
-                               if method in {"central", "consensus"} else "not enforced; endpoint and swept geometry are diagnostics only"),
+                               if constrained else "not enforced; endpoint and swept geometry are diagnostics only"),
                   constitutive_response=("none; constant acceleration with prescribed current supports" if method == "physics"
+                                         else "physical motion prior plus frozen-rotation elastic residual correction" if motion_ablated and config.mechanics_mode != "disabled"
+                                         else "physical motion prior; no explicit elastic constitutive solve" if motion_ablated
+                                         else "learned predictor plus frozen-rotation elastic residual correction" if constrained and config.mechanics_mode != "disabled"
                                          else "learned predictor; no explicit elastic constitutive solve"),
                   fracture_choice=("initial fracture topology held fixed; no new fracture generation" if method == "physics"
                                    else "one shared flow sample; fixed fracture mask during each state correction" if config.fracture_policy == "shared_sample"

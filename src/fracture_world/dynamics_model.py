@@ -180,6 +180,27 @@ def constant_acceleration_prediction(batch):
     return _constant_acceleration_prediction(batch, dt)
 
 
+def physics_motion_prediction(batch, motion_prior):
+    if motion_prior not in {"backward_euler", "constant_acceleration"}:
+        raise ValueError("physical motion prior must select backward_euler or constant_acceleration")
+    dt = _validated_batch(batch)
+    velocity_increment = batch["forces"] * dt / batch["masses"][:, None]
+    velocities = batch["velocities"] + velocity_increment
+    if motion_prior == "backward_euler":
+        position_increment = dt * velocities
+    else:
+        position_increment = (dt * batch["velocities"]
+                              + 0.5 * dt.square() * batch["forces"] / batch["masses"][:, None])
+    positions = batch["positions"] + position_increment
+    held = batch["fixed"][:, None]
+    return dict(positions=torch.where(held, batch["positions"], positions),
+                velocities=torch.where(held, torch.zeros_like(velocities), velocities),
+                position_increment=torch.where(held, torch.zeros_like(position_increment), position_increment),
+                velocity_increment=torch.where(held, -batch["velocities"], velocity_increment),
+                unconstrained_position_increment=position_increment,
+                unconstrained_velocity_increment=velocity_increment)
+
+
 def _constant_acceleration_prediction(batch, dt):
     acceleration = batch["forces"] / batch["masses"][:, None]
     positions = batch["positions"] + dt * batch["velocities"] + 0.5 * dt.square() * acceleration
