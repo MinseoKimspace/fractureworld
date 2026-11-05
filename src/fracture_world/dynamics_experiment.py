@@ -83,15 +83,20 @@ def _rollout_agreement(central, consensus, completed):
                     if available else "no shared future prediction; initial-state equality provides no implementation validation")
 
 
+def _comparison_methods(methods, learned_corrector):
+    selected = list(methods or (["raw", "neural", "central", "consensus"] if learned_corrector is not None
+                                else ["raw", "central", "consensus"]))
+    if len(set(selected)) != len(selected) or not set(selected).issubset({"physics", "raw", "neural", "central", "consensus"}):
+        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus values")
+    if "neural" in selected and learned_corrector is None:
+        raise ValueError("neural baseline requested but checkpoint has no trained corrector")
+    return selected
+
+
 def compare_dynamics(checkpoint, initial, output, steps, config=None, device="auto", methods=None,
                      reference_case=None, reference_trajectory=None, progress=None):
     _, learned_corrector, _, _ = load_dynamics_model(checkpoint, device)
-    methods = methods or (["raw", "neural", "central", "consensus"] if learned_corrector is not None
-                          else ["raw", "central", "consensus"])
-    if len(set(methods)) != len(methods) or not set(methods).issubset({"physics", "raw", "neural", "central", "consensus"}):
-        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus values")
-    if "neural" in methods and learned_corrector is None:
-        raise ValueError("neural baseline requested but checkpoint has no trained corrector")
+    methods = _comparison_methods(methods, learned_corrector)
     if reference_trajectory and not reference_case:
         raise ValueError("reference_trajectory requires reference_case")
     config = config or RolloutConfig()
@@ -100,20 +105,26 @@ def compare_dynamics(checkpoint, initial, output, steps, config=None, device="au
     for method in methods:
         report = rollout_dynamics(checkpoint, initial, directory / method, steps, method, config, device, progress)
         conditions[method] = {key: value for key, value in report.items() if key != "events"}
+        if report["status"] == "interrupted":
+            break
+    interrupted = any(item["status"] == "interrupted" for item in conditions.values())
     if reference_case:
-        for method in methods:
+        for method in conditions:
             conditions[method]["evaluation"] = evaluate_dynamics(directory / method, reference_case, reference_trajectory,
                                                                  directory / method / "evaluation.json")
     agreement = None
     if {"central", "consensus"}.issubset(conditions):
         agreement = _rollout_agreement(directory / "central" / "trajectory.npz", directory / "consensus" / "trajectory.npz",
                                        all(conditions[method]["status"] == "completed" for method in ("central", "consensus")))
-    report = dict(format="fracture-world.neural-comparison.v1", status="comparison_finished", engine_calls=0,
+    report = dict(format="fracture-world.neural-comparison.v1", status="interrupted" if interrupted else "comparison_finished", engine_calls=0,
                   conditions=conditions, central_consensus_agreement=agreement,
+                  requested_methods=methods, attempted_methods=list(conditions),
+                  unattempted_methods=[method for method in methods if method not in conditions],
                   proposal_control="same predictor, seed and Gaussian samples; autonomous states may diverge after the first step",
                   numerical_reference_used_for_inference=False,
                   neural_baseline_available=learned_corrector is not None,
-                  all_rollouts_completed=all(item["status"] == "completed" for item in conditions.values()))
+                  all_rollouts_completed=not interrupted and len(conditions) == len(methods)
+                  and all(item["status"] == "completed" for item in conditions.values()))
     write_json(directory / "comparison.json", report)
     return report
 
@@ -123,7 +134,8 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
         raise ValueError("benchmark steps must be a positive integer number of native timesteps")
     if split not in {"validation", "test"}:
         raise ValueError("benchmark split must select validation or test")
-    _, _, saved, _ = load_dynamics_model(checkpoint, device)
+    _, learned_corrector, saved, _ = load_dynamics_model(checkpoint, device)
+    methods = _comparison_methods(methods, learned_corrector)
     if saved["training"]["overfit"]:
         raise ValueError("held-out benchmarking cannot use an overfit-debug checkpoint")
     conditions = set(saved["condition_splits"][split])
@@ -133,7 +145,8 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
     if len(cases) != len(names) or not cases:
         raise ValueError("benchmark data must contain every recorded held-out case and matching loading condition")
     directory = new_directory(output)
-    records, rows = [], {}
+    records, rows = [], {method: [] for method in methods}
+    interrupted = False
     for index, item in enumerate(cases, start=1):
         clock = _native_clock(item.metadata["conditioning_context"])
         if steps >= len(clock):
@@ -154,12 +167,18 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                                       case_path, trajectory_path, progress)
         target_has_new_fracture = bool(np.any(item.broken[(recorded_steps > 0) & (recorded_steps <= steps)] & ~item.broken[0]))
         records.append(dict(case=item.case_id, shape_family=item.shape_family, directory=case_directory.name,
-                            support_policy=policy, all_rollouts_completed=comparison["all_rollouts_completed"]))
+                            support_policy=policy, status=comparison.get("status", "comparison_finished"),
+                            attempted_methods=list(comparison["conditions"]),
+                            unattempted_methods=[method for method in methods if method not in comparison["conditions"]],
+                            all_rollouts_completed=comparison["all_rollouts_completed"]))
         for method, result in comparison["conditions"].items():
             result["benchmark_case_id"] = item.case_id
             result["requested_horizon_target_has_new_fracture"] = target_has_new_fracture
             result["full_horizon_evaluated"] = result["status"] == "completed" and result["evaluation"]["last_compared_native_step"] == steps
             rows.setdefault(method, []).append(result)
+        if comparison.get("status") == "interrupted" or any(result["status"] == "interrupted" for result in comparison["conditions"].values()):
+            interrupted = True
+            break
     summaries = {}
     for method, results in rows.items():
         evaluations = [result["evaluation"] for result in results if result["full_horizon_evaluated"]]
@@ -169,7 +188,11 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                     for item in results if not item["requested_horizon_target_has_new_fracture"] and item["full_horizon_evaluated"]]
         mean = lambda values: float(np.mean(values)) if values else None
         metrics = _ACCURACY_METRICS
-        summaries[method] = dict(cases=len(results), completed_rate=mean([item["status"] == "completed" for item in results]),
+        summaries[method] = dict(cases=len(results), requested_cases=len(cases), attempted_cases=len(results),
+                                  unattempted_cases=len(cases) - len(results),
+                                  interrupted_cases=sum(item["status"] == "interrupted" for item in results),
+                                  failed_cases=sum(item["status"] not in {"completed", "interrupted"} for item in results),
+                                  completed_rate=mean([item["status"] == "completed" for item in results]),
                                   completed_and_geometry_valid_rate=mean([item["status"] == "completed" and item.get("all_committed_geometry_valid") is True for item in results]),
                                   **_checked_constraint_summary(results),
                                   fracture_positive_cases=len(positive), fracture_positive_case_f1_failure_penalized=mean(positive),
@@ -183,7 +206,14 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                   pairwise=[_paired_accuracy(rows, pair, _ACCURACY_METRICS) for pair in combinations(rows, 2)],
                   interpretation="accuracy conditional on shared completed horizons; every metric uses the same cases across its methods; completion rates and failed cases must also be reported",
                   difference_semantics="second method minus first method on each shared case; negative differences are lower values, not an automatic claim of better physics")
-    report = dict(schema="fracture-world.dynamics-benchmark.v1", cases=records, conditions=summaries,
+    attempted_runs = sum(len(results) for results in rows.values())
+    report = dict(schema="fracture-world.dynamics-benchmark.v1", status="interrupted" if interrupted else "benchmark_finished",
+                  cases=records, conditions=summaries,
+                  requested_cases=len(cases), attempted_cases=len(records), unattempted_cases=len(cases) - len(records),
+                  requested_case_ids=[item.case_id for item in cases],
+                  unattempted_case_ids=[item.case_id for item in cases[len(records):]],
+                  requested_methods=methods, requested_method_runs=len(cases) * len(methods),
+                  attempted_method_runs=attempted_runs, unattempted_method_runs=len(cases) * len(methods) - attempted_runs,
                   paired_accuracy=paired,
                   split=split, generalization_protocol=saved.get("generalization_protocol", "loading_condition"),
                   inference_engine_calls=0, reference_used_only_for_evaluation=True,
@@ -193,7 +223,9 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                   support_policy_selection="checkpoint support-release capability and current fixed corners only; teacher support future not inspected",
                   checked_constraint_success_semantics="completion plus verified endpoint geometry, swept geometry and mechanical energy; missing diagnostics remain unknown and do not count as verified success",
                   incomplete_rollout_policy="positive-case F1 is zero; error means and negative-case false positives use complete horizons; completion rates include every case",
+                  interruption_policy="stop remaining methods and cases; summaries use attempted runs only; unattempted runs are neither successes nor failures",
                   checkpoint_sha256=file_hash(checkpoint),
-                  all_rollouts_completed=all(item["all_rollouts_completed"] for item in records))
+                  all_rollouts_completed=not interrupted and len(records) == len(cases)
+                  and all(item["all_rollouts_completed"] for item in records))
     write_json(directory / "benchmark.json", report)
     return report

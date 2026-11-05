@@ -11,6 +11,10 @@ from .io import file_hash
 from .mesh import VolumeMesh, rigid_pose
 
 
+ELASTIC_STATE_SCHEMA = "fracture-world.femfx-elastic-state.v1"
+ELASTIC_STATE_KEYS = ("rotations", "centers_of_mass", "corner_vertex_ids", "tetrahedron_local_ids", "piece_ids", "nodal_masses")
+
+
 def _frozen(values, dtype=None):
     result = np.array(values, dtype=dtype, copy=True)
     result.setflags(write=False)
@@ -20,6 +24,69 @@ def _frozen(values, dtype=None):
 def _digest(value):
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def elastic_state_signature(positions, broken, fixed):
+    digest = hashlib.sha256()
+    for value, dtype in ((positions, np.float64), (broken, bool), (fixed, bool)):
+        digest.update(np.ascontiguousarray(value, dtype=dtype).tobytes())
+    return digest.hexdigest()
+
+
+def _checked_elastic_state_arrays(state, tetrahedra, *, frames=None):
+    if not isinstance(state, dict) or set(state) != set(ELASTIC_STATE_KEYS):
+        raise ValueError("native elastic state requires its complete current-state fields")
+    prefix = () if frames is None else (frames,)
+    shapes = {"rotations": (*prefix, tetrahedra, 3, 3), "centers_of_mass": (*prefix, tetrahedra, 3),
+              "corner_vertex_ids": (*prefix, tetrahedra, 4), "tetrahedron_local_ids": (*prefix, tetrahedra),
+              "piece_ids": (*prefix, tetrahedra), "nodal_masses": (*prefix, tetrahedra, 4)}
+    integer = {"corner_vertex_ids", "tetrahedron_local_ids", "piece_ids"}
+    arrays = {}
+    for name in ELASTIC_STATE_KEYS:
+        values = np.asarray(state[name])
+        valid_type = np.issubdtype(values.dtype, np.integer) if name in integer else np.issubdtype(values.dtype, np.floating)
+        if values.shape != shapes[name] or not valid_type or not np.isfinite(values).all():
+            raise ValueError(f"native elastic state {name} has invalid dimensions, values or type")
+        if name in integer and (values < 0).any():
+            raise ValueError("native elastic state indices must be nonnegative")
+        if name not in integer and not np.array_equal(values, values.astype(np.float32).astype(values.dtype)):
+            raise ValueError("native elastic state must preserve captured float32 values")
+        arrays[name] = values
+    if (arrays["nodal_masses"] <= 0).any() or (np.linalg.det(arrays["rotations"]) <= 0).any():
+        raise ValueError("native elastic state requires positive masses and nonsingular proper rotations")
+    histories = arrays if frames is not None else {name: values[None] for name, values in arrays.items()}
+    for frame in range(frames if frames is not None else 1):
+        corner_ids = histories["corner_vertex_ids"][frame].ravel()
+        pieces = histories["piece_ids"][frame]
+        vertices = np.unique(corner_ids)
+        if not np.array_equal(vertices, np.arange(len(vertices))):
+            raise ValueError("native elastic state corner IDs must reference every current native vertex")
+        memberships = np.unique(np.column_stack((corner_ids, np.repeat(pieces, 4))), axis=0)
+        if len(memberships) != len(vertices):
+            raise ValueError("native elastic state pieces cannot share native vertices")
+        order = np.argsort(corner_ids)
+        masses = histories["nodal_masses"][frame].ravel()[order]
+        if np.any((np.diff(corner_ids[order]) == 0) & (np.diff(masses) != 0)):
+            raise ValueError("native elastic state copies must have identical nodal masses")
+        for piece in np.unique(pieces):
+            local = histories["tetrahedron_local_ids"][frame][pieces == piece]
+            if not np.array_equal(np.sort(local), np.arange(len(local))):
+                raise ValueError("native elastic state local tetrahedron IDs must enumerate each mesh piece")
+    return {name: _frozen(values) for name, values in arrays.items()}
+
+
+def _teacher_physics(settings):
+    if not isinstance(settings, dict):
+        raise ValueError("recorded native physics settings must be a JSON object")
+    physics = {}
+    for name in ("rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient"):
+        if name not in settings:
+            continue
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+            raise ValueError(f"recorded {name} must be finite and nonnegative")
+        physics[name] = value
+    return physics
 
 
 @dataclass(frozen=True)
@@ -69,6 +136,8 @@ class DynamicsTransition:
     dt: float
     time: float
     frame: int
+    observations: dict | None = None
+    elastic_state: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +154,8 @@ class DynamicsTrajectory:
     case_id: str
     condition_digest: str
     metadata: dict
+    observations: dict | None = None
+    elastic_state: dict | None = None
 
     @property
     def shape_family(self):
@@ -97,10 +168,14 @@ class DynamicsTrajectory:
     def transition(self, frame):
         if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)) or not 0 <= frame < len(self):
             raise ValueError("transition frame must select an available consecutive recorded pair")
+        observations = None if self.observations is None else {
+            name: bool(values[frame + 1]) if name == "single_step_coverage" else values[frame + 1]
+            for name, values in self.observations.items()}
+        elastic_state = None if self.elastic_state is None else {name: values[frame] for name, values in self.elastic_state.items()}
         return DynamicsTransition(
             self.positions[frame], self.velocities[frame], self.broken[frame], self.fixed[frame],
             self.positions[frame + 1], self.velocities[frame + 1], self.broken[frame + 1], self.fixed[frame + 1],
-            float(self.times[frame + 1] - self.times[frame]), float(self.times[frame]), int(frame),
+            float(self.times[frame + 1] - self.times[frame]), float(self.times[frame]), int(frame), observations, elastic_state,
         )
 
 
@@ -109,6 +184,7 @@ def _context(case):
     if metadata.get("source") != "FEMFX" or metadata.get("schema_version") != "fracture-world.femfx.v1" or metadata.get("units") != "SI" or metadata.get("supervision_kind") != "native_facet_fracture":
         raise ValueError("dynamics training requires native facet fracture trajectories in SI units")
     settings = metadata.get("native_settings", {})
+    _teacher_physics(settings)
     if settings.get("plasticity") is not False or settings.get("enable_fracture") is not True:
         raise ValueError("the first dynamics model requires elastic fracture trajectories with plasticity disabled")
     context = metadata.get("conditioning_context")
@@ -173,6 +249,9 @@ def _loading(case, topology, fixed):
     velocity = momentum / nodal_mass[:, None] + rigid_velocity
     initial_impulses = topology.masses[:, None] * velocity[case.mesh.tets].reshape(-1, 3)
     canonical = {**case.metadata["conditioning_context"]}
+    if isinstance(canonical.get("scene_options"), dict):
+        canonical["scene_options"] = {key: value for key, value in canonical["scene_options"].items()
+                                      if key != "record_observations"}
     for key in ("dt", "steps", "threads", "native_revision", "binding_sha256", "shape_id", "shape_family", "geometry_source"):
         canonical.pop(key, None)
     active = np.flatnonzero(np.linalg.norm(momentum, axis=1) > 0)
@@ -294,6 +373,82 @@ def _support_history(arrays, case, topology, positions, velocities, broken, fixe
     return result
 
 
+def _observation_history(arrays, case, provenance, context, times):
+    from .femfx import (OBSERVATION_CORNER_FIELDS, OBSERVATION_FIELDS, OBSERVATION_SCHEMA, OBSERVATION_VECTOR_FIELDS,
+                        SOLVER_OBSERVATION_FIELDS, SOLVER_OBSERVATION_SCHEMA, _solver_observation_arrays)
+
+    schema = case.metadata.get("native_observation_schema")
+    solver_schema = case.metadata.get("native_solver_observation_schema")
+    solver_fields = {name: arrays[f"native_{name}"] for name in SOLVER_OBSERVATION_FIELDS if f"native_{name}" in arrays}
+    if provenance.get("native_solver_observation_schema") != solver_schema:
+        raise ValueError("native solver observation schema differs between case and trajectory provenance")
+    if (solver_schema is not None or solver_fields) and (solver_schema != SOLVER_OBSERVATION_SCHEMA or schema != OBSERVATION_SCHEMA):
+        raise ValueError("native solver observations require their supported provenance schema and update observations")
+    if provenance.get("native_observation_schema") != schema:
+        raise ValueError("native observation schema differs between case and trajectory provenance")
+    names = {f"native_{name}" for name in OBSERVATION_FIELDS}
+    present = names.intersection(arrays)
+    if schema is None and not present:
+        return None
+    if schema != OBSERVATION_SCHEMA:
+        raise ValueError("native observations require their supported provenance schema")
+    if present != names:
+        raise ValueError("native observations require the complete capture fields")
+    frames, tetrahedra = len(times), len(case.mesh.tets)
+    observations = {}
+    for name in OBSERVATION_FIELDS:
+        values = arrays[f"native_{name}"]
+        shape = (frames, tetrahedra, 4, 3) if name in OBSERVATION_VECTOR_FIELDS else (
+            (frames, tetrahedra, 4) if name in OBSERVATION_CORNER_FIELDS else (frames, tetrahedra))
+        boolean = name in OBSERVATION_CORNER_FIELDS or name == "fracture_stress_observed"
+        valid_type = values.dtype == np.dtype(bool) if boolean else np.issubdtype(values.dtype, np.floating)
+        if values.shape != shape or not valid_type or not np.isfinite(values).all():
+            raise ValueError(f"native observation {name} has invalid dimensions, values or mask type")
+        observations[name] = _frozen(values)
+    stress = observations["fracture_stress_observed"]
+    if ((observations["fracture_stress_eigenvalues"][stress] < 0).any() or
+            (observations["fracture_stress_thresholds"][stress] <= 0).any()):
+        raise ValueError("observed native fracture stresses require nonnegative eigenvalues and positive thresholds")
+    if (observations["constraint_solve_active"] & ~observations["contact_observed"]).any():
+        raise ValueError("active native constraint solves require observed applied corrections")
+    if observations["contact_observed"][0].any() or stress[0].any():
+        raise ValueError("initial native state cannot claim a preceding observed update")
+    if solver_schema is not None:
+        try:
+            solver = _solver_observation_arrays(solver_fields, tetrahedra, required=True, frames=frames)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from error
+        if solver["mpcg_observed"][0].any() or solver["mpcg_stopping_observed"][0].any():
+            raise ValueError("initial native state cannot claim a preceding observed solver update")
+        observations.update({name: _frozen(values) for name, values in solver.items()})
+    clock = np.r_[0., np.cumsum(np.full(context["steps"], np.float32(context["dt"])), dtype=np.float32).astype(float)]
+    native_steps = np.searchsorted(clock, times)
+    observations["single_step_coverage"] = _frozen(np.r_[False, np.diff(native_steps) == 1])
+    return observations
+
+
+def _elastic_state_history(arrays, case, provenance, times):
+    fields = {"rotations": "native_cached_tet_rotations", "centers_of_mass": "native_cached_tet_centers_of_mass",
+              "tetrahedron_local_ids": "native_mesh_tet_ids"}
+    schema = case.metadata.get("native_elastic_state_schema")
+    if provenance.get("native_elastic_state_schema") != schema:
+        raise ValueError("native elastic state schema differs between case and trajectory provenance")
+    present = set(fields.values()).intersection(arrays)
+    if schema is None and not present:
+        return None
+    if schema != ELASTIC_STATE_SCHEMA:
+        raise ValueError("native elastic state requires its supported provenance schema")
+    required = {*fields.values(), "native_piece_ids", "native_corner_vertex_ids", "native_node_offsets", "native_nodal_masses"}
+    if not required.issubset(arrays):
+        raise ValueError("native elastic state requires its complete captured fields")
+    offsets, corners = arrays["native_node_offsets"], arrays["native_corner_vertex_ids"]
+    masses = np.asarray([arrays["native_nodal_masses"][offsets[frame]:offsets[frame + 1]][corners[frame]]
+                         for frame in range(len(times))])
+    state = {name: arrays[source] for name, source in fields.items()}
+    state.update(corner_vertex_ids=corners, piece_ids=arrays["native_piece_ids"], nodal_masses=masses)
+    return _checked_elastic_state_arrays(state, len(case.mesh.tets), frames=len(times))
+
+
 def load_dynamics_trajectory(case_path, trajectory_path=None):
     case_path = Path(case_path).resolve(strict=True)
     trajectory_path = Path(trajectory_path or case_path.parent.parent / "trajectories" / case_path.name).resolve(strict=True)
@@ -319,6 +474,8 @@ def load_dynamics_trajectory(case_path, trajectory_path=None):
         raise ValueError("dynamics trajectory provenance differs from its loading case")
     times, positions, velocities, broken = _validate_history(arrays, case, topology, context, fixed, initial_velocity)
     support = _support_history(arrays, case, topology, positions, velocities, broken, fixed)
+    observations = _observation_history(arrays, case, provenance, context, times)
+    elastic_state = _elastic_state_history(arrays, case, provenance, times)
     for path, checksum in before.items():
         if file_hash(path) != checksum:
             raise RuntimeError("dynamics source changed during archive validation")
@@ -327,9 +484,17 @@ def load_dynamics_trajectory(case_path, trajectory_path=None):
                 "conditioning_context": context, "stable_indexing": "original_tetrahedron_then_local_corner",
                 "fracture_semantics": "irreversible_original_internal_facet_cuts", "observed_support_releases": released,
                 "support_release_requires_explicit_runtime_policy": bool(released), "native_runtime_required": False,
-                "split_unit": "complete_loading_condition", "parameter_status": case.metadata.get("parameter_status")}
+                "split_unit": "complete_loading_condition", "parameter_status": case.metadata.get("parameter_status"),
+                "native_settings": dict(case.metadata["native_settings"])}
+    if observations is not None:
+        metadata["native_observation_schema"] = case.metadata["native_observation_schema"]
+        if case.metadata.get("native_solver_observation_schema") is not None:
+            metadata["native_solver_observation_schema"] = case.metadata["native_solver_observation_schema"]
+    if elastic_state is not None:
+        metadata["native_elastic_state_schema"] = ELASTIC_STATE_SCHEMA
     return DynamicsTrajectory(topology, _frozen(positions), _frozen(velocities), _frozen(broken), _frozen(support),
-                              _frozen(times), _frozen(gravity), dict(material), _frozen(impulses), case_path.stem, condition, metadata)
+                              _frozen(times), _frozen(gravity), dict(material), _frozen(impulses), case_path.stem, condition, metadata,
+                              observations, elastic_state)
 
 
 @lru_cache(maxsize=1)
@@ -377,7 +542,7 @@ class StreamedDynamicsTrajectory:
             return self.metadata["conditioning_context"]["material"]
         if name == "gravity":
             return np.asarray(self.metadata["conditioning_context"]["gravity"], dtype=float)
-        if name in {"positions", "velocities", "broken", "fixed", "initial_impulses"}:
+        if name in {"positions", "velocities", "broken", "fixed", "initial_impulses", "observations", "elastic_state"}:
             return getattr(self._load(), name)
         raise AttributeError(name)
 

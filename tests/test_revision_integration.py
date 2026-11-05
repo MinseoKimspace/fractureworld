@@ -46,7 +46,7 @@ def test_fm_search_contains_only_generated_samples_without_classifier_or_extra_c
     fields = [torch.tensor([0.2, -0.2, -0.4]), torch.tensor([-0.2, 0.2, -0.4])]
 
     class SampleModel:
-        def sample_fracture(self, batch, steps, noise):
+        def sample_fracture(self, batch, steps, noise, *, context=None):
             return fields.pop(0)
 
     batch = {"positions": torch.zeros(4, 3), "broken": torch.zeros(3, dtype=torch.bool)}

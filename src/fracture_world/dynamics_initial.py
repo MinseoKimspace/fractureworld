@@ -4,7 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .dynamics_data import MaterialTopology, _frozen, load_dynamics_trajectory, material_topology
+from .dynamics_data import (ELASTIC_STATE_KEYS, ELASTIC_STATE_SCHEMA, MaterialTopology, _checked_elastic_state_arrays,
+                            _frozen, _teacher_physics, elastic_state_signature, load_dynamics_trajectory, material_topology)
 from .mesh import VolumeMesh
 
 
@@ -53,6 +54,20 @@ def _checked_state(mesh, positions, velocities, broken, fixed, time, dt, gravity
     if not isinstance(metadata, dict):
         raise ValueError("initial metadata must be a JSON object")
     json.dumps(metadata, allow_nan=False)
+    _teacher_physics(metadata.get("teacher_physics", {}))
+    elastic_state = metadata.get("elastic_state")
+    if elastic_state is not None or metadata.get("native_elastic_state_schema") is not None:
+        if (not isinstance(elastic_state, dict) or metadata.get("native_elastic_state_schema") != ELASTIC_STATE_SCHEMA
+                or elastic_state.get("schema") != ELASTIC_STATE_SCHEMA
+                or set(elastic_state) != {*ELASTIC_STATE_KEYS, "schema", "positions_hash"}):
+            raise ValueError("initial elastic state requires its complete supported current-state schema")
+        if elastic_state["positions_hash"] != elastic_state_signature(positions, broken, fixed):
+            raise ValueError("initial elastic state signature does not match the current material state")
+        cached = _checked_elastic_state_arrays({name: elastic_state[name] for name in ELASTIC_STATE_KEYS}, len(mesh.tets))
+        groups = mesh.corner_groups(broken)
+        memberships = np.unique(np.column_stack((groups, cached["corner_vertex_ids"].ravel())), axis=0)
+        if len(memberships) != len(np.unique(groups)) or len(memberships) != len(np.unique(cached["corner_vertex_ids"])):
+            raise ValueError("initial elastic state connectivity differs from current material topology")
     if "floor_height_m" in metadata:
         floor = metadata["floor_height_m"]
         if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not np.isfinite(floor) or metadata.get("up_axis") != "y":
@@ -112,9 +127,13 @@ def export_initial(case_path, trajectory_path, frame, output_file, *, support_po
                 "shape_family": trajectory.shape_family,
                 "parameter_status": trajectory.metadata.get("parameter_status")}
     context = trajectory.metadata["conditioning_context"]
-    settings = trajectory.metadata.get("native_settings", {})
-    metadata["teacher_physics"] = {key: settings[key] for key in (
-        "rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient") if key in settings}
+    metadata["teacher_physics"] = _teacher_physics(trajectory.metadata.get("native_settings", {}))
+    metadata["native_settings"] = dict(trajectory.metadata.get("native_settings", {}))
+    if trajectory.elastic_state is not None:
+        metadata["native_elastic_state_schema"] = ELASTIC_STATE_SCHEMA
+        metadata["elastic_state"] = {name: values[frame].tolist() for name, values in trajectory.elastic_state.items()}
+        metadata["elastic_state"].update(schema=ELASTIC_STATE_SCHEMA, positions_hash=elastic_state_signature(
+            trajectory.positions[frame], trajectory.broken[frame], trajectory.fixed[frame]))
     if "floor_height_m" in context:
         metadata["floor_height_m"] = context["floor_height_m"]
         metadata["up_axis"] = "y"

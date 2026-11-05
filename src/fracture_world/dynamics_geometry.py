@@ -92,49 +92,30 @@ def _contact_states(mesh, current, proposed, broken, tolerance):
     return current, proposed, broken
 
 
-def _candidate_pairs(mesh, current, proposed, broken, tolerance):
+def _candidate_pairs(current, proposed, tolerance):
     lower = np.minimum(current.min(axis=1), proposed.min(axis=1)) - tolerance
     upper = np.maximum(current.max(axis=1), proposed.max(axis=1)) + tolerance
-    groups = corner_groups(mesh, broken).reshape(-1, 4)
     for first in range(len(current)):
         candidates = np.flatnonzero(np.all(upper[first] >= lower, axis=1) & np.all(upper >= lower[first], axis=1))
         for second in candidates[candidates > first]:
-            if not np.intersect1d(groups[first], groups[second]).size:
-                yield first, int(second)
+            yield first, int(second)
 
 
 def linearized_contacts(mesh, current, proposed, broken, tolerance):
     current, proposed, broken = _contact_states(mesh, current, proposed, broken, tolerance)
     contacts = []
-    pairs = face_corner_pairs(mesh)
-    flat_current, flat_proposed = current.reshape(-1, 3), proposed.reshape(-1, 3)
-    groups = corner_groups(mesh, broken).reshape(-1, 4)
-    for face in np.flatnonzero(broken):
-        first_cell, second_cell = mesh.dual_edges[face]
-        if not np.intersect1d(groups[first_cell], groups[second_cell]).size:
+    exposed = np.zeros(4 * len(mesh.tets), dtype=bool)
+    exposed[boundary_triangles(mesh, broken).ravel()] = True
+    intact_neighbors = {tuple(map(int, pair)) for pair in mesh.dual_edges[~broken]}
+    for first, second in _candidate_pairs(current, proposed, tolerance):
+        if (first, second) in intact_neighbors:
             continue
-        proposed_separation, _ = tetrahedron_separation(proposed[first_cell], proposed[second_cell])
-        if proposed_separation >= -tolerance:
-            continue
-        ids = pairs[face, :, 0]
-        triangle = flat_proposed[ids]
-        normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
-        length = np.linalg.norm(normal)
-        if length <= np.finfo(float).tiny:
-            continue
-        normal /= length
-        if np.dot(normal, proposed[first_cell].mean(axis=0) - triangle.mean(axis=0)) > 0:
-            normal = -normal
-        for first, second in pairs[face]:
-            gap = float(np.dot(flat_current[second] - flat_current[first], normal))
-            next_gap = float(np.dot(flat_proposed[second] - flat_proposed[first], normal))
-            if next_gap < tolerance:
-                contacts.append(LinearizedContact(np.array([first, second]), np.array([-1.0, 1.0]), normal, gap))
-    for first, second in _candidate_pairs(mesh, current, proposed, broken, tolerance):
         next_gap, normal = tetrahedron_separation(proposed[first], proposed[second])
         if next_gap >= -tolerance:
             continue
         for first_corner, second_corner in ((a, b) for a in range(4) for b in range(4)):
+            if not exposed[4 * first + first_corner] or not exposed[4 * second + second_corner]:
+                continue
             trial_gap = float(np.dot(proposed[second, second_corner] - proposed[first, first_corner], normal))
             if trial_gap > tolerance:
                 continue
@@ -144,13 +125,21 @@ def linearized_contacts(mesh, current, proposed, broken, tolerance):
     return tuple(contacts)
 
 
-def floor_contacts(current, proposed, height, tolerance):
+def floor_contacts(current, proposed, height, tolerance, *, eligible_corners=None, activation_distance=None, bias=0.):
     current, proposed = (np.asarray(value, dtype=float).reshape(-1, 3) for value in (current, proposed))
     if not np.isfinite(height) or current.shape != proposed.shape:
         raise ValueError("floor contacts require a finite height and matching states")
-    selected = np.flatnonzero(np.minimum(current[:, 1], proposed[:, 1]) <= height + tolerance)
-    return tuple(LinearizedContact.pair(int(index), -1, np.array([0.0, 1.0, 0.0]), float(current[index, 1] - height))
-                 for index in selected)
+    activation_distance = tolerance if activation_distance is None else activation_distance
+    if not np.isfinite([tolerance, activation_distance, bias]).all() or min(tolerance, activation_distance) < 0:
+        raise ValueError("floor contact tolerances must be finite and nonnegative")
+    selected = np.minimum(current[:, 1], proposed[:, 1]) <= height + activation_distance
+    if eligible_corners is not None:
+        eligible = np.asarray(eligible_corners)
+        if eligible.shape != selected.shape or eligible.dtype != np.dtype(bool):
+            raise ValueError("floor contact eligibility must be Boolean over material corners")
+        selected &= eligible
+    return tuple(LinearizedContact.pair(int(index), -1, np.array([0.0, 1.0, 0.0]), float(current[index, 1] - height - bias))
+                 for index in np.flatnonzero(selected))
 
 
 def _fixed_plane_sweep_is_separated(first, second, next_first, next_second, tolerance):
@@ -181,6 +170,26 @@ def _minimum_swept_determinant(current, proposed):
     return float(np.min(np.polynomial.polynomial.polyval(np.r_[0.0, interior, 1.0], coefficients)))
 
 
+def _moving_face_sweep_is_separated(first, second, next_first, next_second):
+    for current, other, proposed, next_other in ((first, second, next_first, next_second),
+                                               (second, first, next_second, next_first)):
+        for ids in LOCAL_FACES:
+            face, next_face = current[ids], proposed[ids]
+            normal = np.cross(face[1] - face[0], face[2] - face[0])
+            next_normal = np.cross(next_face[1] - next_face[0], next_face[2] - next_face[0])
+            for corner, next_corner in zip(other, next_other, strict=True):
+                if any(np.array_equal(corner, point) and np.array_equal(next_corner, next_point)
+                       for point, next_point in zip(face, next_face, strict=True)):
+                    continue
+                if (corner - face[0]) @ normal < 0 or (next_corner - next_face[0]) @ next_normal < 0:
+                    break
+                if _minimum_swept_determinant(np.vstack((face, corner)), np.vstack((next_face, next_corner))) < 0:
+                    break
+            else:
+                return True
+    return False
+
+
 def swept_geometry_diagnostics(mesh, current, proposed, broken, tolerance, floor_height=None):
     current, proposed, broken = _contact_states(mesh, current, proposed, broken, tolerance)
     if floor_height is not None and not np.isfinite(floor_height):
@@ -188,29 +197,72 @@ def swept_geometry_diagnostics(mesh, current, proposed, broken, tolerance, floor
     minimum_determinants = np.array([_minimum_swept_determinant(first, second)
                                      for first, second in zip(current, proposed)])
     degenerate = np.flatnonzero(minimum_determinants <= 64 * np.finfo(float).eps)
-    candidates = set(_candidate_pairs(mesh, current, proposed, broken, tolerance))
+    candidates = set(_candidate_pairs(current, proposed, tolerance))
     candidates.update(tuple(map(int, mesh.dual_edges[index])) for index in np.flatnonzero(broken))
+    intact_faces = {tuple(map(int, cells)): pairs for cells, pairs in
+                    zip(mesh.dual_edges[~broken], mesh.corner_face_pairs[~broken], strict=True)}
+    flat_current, flat_proposed = current.reshape(-1, 3), proposed.reshape(-1, 3)
+    groups = corner_groups(mesh, broken).reshape(-1, 4)
     unresolved = []
+    shared_face_certificates = 0
+    moving_face_certificates = 0
     invalid_cells = set(degenerate.tolist())
     for first, second in sorted(candidates):
         if first in invalid_cells or second in invalid_cells:
             unresolved.append([first, second])
             continue
-        if not _fixed_plane_sweep_is_separated(current[first], current[second],
-                                              proposed[first], proposed[second], tolerance):
-            unresolved.append([first, second])
+        pairs = intact_faces.get((first, second))
+        if (pairs is not None and np.array_equal(flat_current[pairs[:, 0]], flat_current[pairs[:, 1]])
+                and np.array_equal(flat_proposed[pairs[:, 0]], flat_proposed[pairs[:, 1]])):
+            shared_face_certificates += 1
+            continue
+        if _fixed_plane_sweep_is_separated(current[first], current[second], proposed[first], proposed[second], tolerance):
+            continue
+        if (np.intersect1d(groups[first], groups[second]).size and
+                _moving_face_sweep_is_separated(current[first], current[second], proposed[first], proposed[second])):
+            moving_face_certificates += 1
+            continue
+        unresolved.append([first, second])
     floor_depth = 0.0 if floor_height is None else max(
         0.0, float(floor_height - min(current[:, :, 1].min(), proposed[:, :, 1].min())))
     return {"valid": not len(degenerate) and not unresolved and floor_depth <= tolerance,
             "continuous_collision_detection": "conservative_linear_vertex_sweep_certificate",
             "motion_assumption": "linear interpolation of each material corner between recorded states",
             "certified_nonpenetrating_pairs": len(candidates) - len(unresolved),
+            "shared_face_sweep_certificates": shared_face_certificates,
+            "moving_face_sweep_certificates": moving_face_certificates,
             "continuous_collision_unresolved_pairs": unresolved,
             "continuous_collision_unresolved_pair_count": len(unresolved),
             "degenerate_or_inverted_swept_tetrahedra": degenerate.tolist(),
             "minimum_normalized_swept_determinant": float(minimum_determinants.min()),
             "maximum_swept_floor_penetration_metres": floor_depth,
-            "incident_tetrahedron_collision_exclusion": "pairs sharing an intact material corner except opened material faces"}
+            "incident_tetrahedron_collision_exclusion": "none; shared or moving faces require positive swept-volume and separation certificates"}
+
+
+def phase_swept_geometry_diagnostics(mesh, current, proposed, broken, tolerance, floor_height=None, stabilization=None):
+    if stabilization is None or (not np.any(stabilization) and
+                                 (floor_height is None or np.min(np.asarray(current).reshape(-1, 3)[:, 1]) >= floor_height - tolerance)):
+        return swept_geometry_diagnostics(mesh, current, proposed, broken, tolerance, floor_height)
+    current = np.asarray(current, dtype=float).reshape(-1, 3)
+    proposed = np.asarray(proposed, dtype=float).reshape(current.shape)
+    stabilization = np.asarray(stabilization, dtype=float).reshape(current.shape)
+    stabilized = current + stabilization
+    repair = swept_geometry_diagnostics(mesh, current, stabilized, broken, tolerance)
+    transport = swept_geometry_diagnostics(mesh, stabilized, proposed, broken, tolerance)
+    floor_valid = True
+    if floor_height is not None:
+        endpoint_valid = bool(np.all(proposed[:, 1] >= floor_height - tolerance))
+        initial_floor = np.minimum(current[:, 1], floor_height - tolerance)
+        floor_valid = bool(endpoint_valid and np.all(stabilized[:, 1] >= initial_floor))
+    report = dict(transport)
+    report.update(valid=bool(repair["valid"] and transport["valid"] and floor_valid),
+                  continuous_collision_detection="separate contact position repair and physical transport sweeps",
+                  stabilization_sweep=repair, floor_repair_verified=floor_valid,
+                  initial_floor_penetration_metres=max(0., float(floor_height - current[:, 1].min())) if floor_height is not None else 0.,
+                  initial_floor_violation_repaired=bool(floor_height is not None and np.any(current[:, 1] < floor_height - tolerance)),
+                  maximum_swept_floor_penetration_metres=max(0., float(floor_height - proposed[:, 1].min())) if floor_height is not None else 0.,
+                  scope="existing floor penetration may be repaired; this does not certify a nonpenetrating initial state")
+    return report
 
 
 def geometry_diagnostics(mesh, positions, broken, tolerance, floor_height=None):
@@ -223,13 +275,17 @@ def geometry_diagnostics(mesh, positions, broken, tolerance, floor_height=None):
     if not np.isfinite(positions).all():
         return {"valid": False, "nonfinite": True}
     determinant = np.linalg.det(positions[:, 1:] - positions[:, :1])
-    overlap_count, maximum_depth = 0, 0.0
-    for first, second in _candidate_pairs(mesh, positions, positions, broken, tolerance):
+    overlap_count, incident_overlap_count, maximum_depth = 0, 0, 0.0
+    groups = corner_groups(mesh, broken).reshape(-1, 4)
+    for first, second in _candidate_pairs(positions, positions, tolerance):
         if determinant[first] <= 0 or determinant[second] <= 0:
             continue
         gap, _ = tetrahedron_separation(positions[first], positions[second])
         if gap < -tolerance:
-            overlap_count += 1
+            if np.intersect1d(groups[first], groups[second]).size:
+                incident_overlap_count += 1
+            else:
+                overlap_count += 1
             maximum_depth = max(maximum_depth, -gap)
     pairs = face_corner_pairs(mesh)[~np.asarray(broken, dtype=bool)].reshape(-1, 2)
     flat = positions.reshape(-1, 3)
@@ -259,9 +315,11 @@ def geometry_diagnostics(mesh, positions, broken, tolerance, floor_height=None):
     if floor_height is not None and not np.isfinite(floor_height):
         raise ValueError("floor height must be finite")
     floor_depth = 0.0 if floor_height is None else max(0.0, float(floor_height - flat[:, 1].min()))
-    return {"valid": inverted == 0 and overlap_count == 0 and opened_count == 0 and continuity <= tolerance and floor_depth <= tolerance,
+    return {"valid": inverted == 0 and overlap_count == 0 and incident_overlap_count == 0 and opened_count == 0 and continuity <= tolerance and floor_depth <= tolerance,
             "maximum_floor_penetration_metres": floor_depth,
             "inverted_tetrahedra": inverted, "overlapping_nonincident_tetrahedron_pairs": overlap_count,
+            "overlapping_incident_tetrahedron_pairs": incident_overlap_count,
+            "overlapping_tetrahedron_pairs": overlap_count + incident_overlap_count,
             "maximum_separating_axis_penetration_metres": maximum_depth,
             "intact_face_position_mismatch_metres": continuity,
             "penetrating_opened_material_faces": opened_count,
@@ -269,4 +327,4 @@ def geometry_diagnostics(mesh, positions, broken, tolerance, floor_height=None):
             "minimum_opened_face_normal_gap_metres": minimum_opened_gap if np.isfinite(minimum_opened_gap) else 0.0,
             "contact_detection": "discrete tetrahedron SAT and opened material-face normal gaps",
             "continuous_collision_detection": False,
-            "incident_tetrahedron_collision_exclusion": "pairs sharing an intact material corner"}
+            "incident_tetrahedron_collision_exclusion": "none; shared vertices and edges do not exempt volume overlap"}

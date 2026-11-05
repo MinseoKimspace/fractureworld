@@ -4,6 +4,7 @@
 
 #include "AMD_FEMFX.h"
 #include "SampleTaskSystem.h"
+#include "fracture_world_observer.h"
 
 #include <algorithm>
 #include <array>
@@ -72,6 +73,7 @@ class Scene
     std::vector<InternalFace> internal_faces_;
     std::vector<double> fracture_times_;
     std::vector<double> vertex_masses_;
+    FractureWorldTelemetry::Observation observation_;
     py::dict settings_;
     uint tet_count_ = 0;
     uint vertex_count_ = 0;
@@ -80,6 +82,7 @@ class Scene
     bool owns_task_system_ = false;
     bool added_to_scene_ = false;
     bool valid_ = true;
+    bool record_observations_ = true;
 
     void close()
     {
@@ -134,7 +137,7 @@ public:
             "max_volume_contacts", "max_volume_contact_vertices", "max_broad_phase_pairs",
             "max_constraint_solver_bytes", "epsilon_cg", "rayleigh_mass_damping",
             "rayleigh_stiffness_damping", "dist_contact_bias", "dist_contact_threshold",
-            "collision_bounds", "enable_fracture", "enable_self_collision"
+            "collision_bounds", "enable_fracture", "enable_self_collision", "record_observations"
         };
         for (const auto& item : options)
             if (!option_keys.count(py::cast<std::string>(item.first)))
@@ -143,6 +146,7 @@ public:
             throw std::invalid_argument("nodes and tets must have shapes [N,3] and [M,4]");
         vertex_count_ = checked_count(nodes.shape(0), "vertex count");
         tet_count_ = checked_count(tets.shape(0), "tet count");
+        observation_.reset(tet_count_);
         if (velocities.ndim() != 2 || velocities.shape(0) != vertex_count_ || velocities.shape(1) != 3 ||
             kinematic.ndim() != 1 || kinematic.shape(0) != vertex_count_)
             throw std::invalid_argument("velocities and kinematic must have shapes [N,3] and [N]");
@@ -175,6 +179,7 @@ public:
             throw std::invalid_argument("friction_coefficient must be nonnegative");
         const bool enable_fracture = option<bool>(options, "enable_fracture", true);
         const bool self_collision = option<bool>(options, "enable_self_collision", false);
+        record_observations_ = option<bool>(options, "record_observations", true);
 
         const auto node_data = nodes.unchecked<2>();
         const auto tet_data = tets.unchecked<2>();
@@ -363,6 +368,11 @@ public:
             settings_["plasticity"] = false;
             settings_["enable_fracture"] = enable_fracture;
             settings_["enable_self_collision"] = self_collision;
+            settings_["record_observations"] = record_observations_;
+            settings_["observation_schema"] = "fracture-world.femfx-observation.v1";
+            settings_["observation_semantics"] = "actual pre-constraint velocity and applied solver deltas before integration; stable original tetrahedron corners";
+            settings_["solver_observation_schema"] = "fracture-world.femfx-mpcg-observation.v1";
+            settings_["solver_observation_semantics"] = "actual pre-contact MPCG solution, b-Ax, free-row block-preconditioned recursive and recomputed norms; per-native-piece norms repeated by original tetrahedron; zero RHS returns before iterative stopping test";
             settings_["friction_coefficient"] = friction;
             settings_["collision_bounds"] = collision_bounds;
             settings_["epsilon_cg"] = control.epsilonCg;
@@ -407,6 +417,8 @@ public:
         py::array_t<int64_t> piece_ids(tet_count_);
         py::array_t<int64_t> original_ids(tet_count_);
         py::array_t<int64_t> mesh_tet_ids(tet_count_);
+        py::array_t<double> cached_tet_rotations({py::ssize_t(tet_count_), py::ssize_t(3), py::ssize_t(3)});
+        py::array_t<double> cached_tet_centers({py::ssize_t(tet_count_), py::ssize_t(3)});
         py::array_t<int64_t> adjacency({py::ssize_t(tet_count_), py::ssize_t(4)});
         auto position_output = positions.mutable_unchecked<3>();
         auto velocity_output = velocities.mutable_unchecked<3>();
@@ -418,6 +430,8 @@ public:
         auto piece_output = piece_ids.mutable_unchecked<1>();
         auto original_output = original_ids.mutable_unchecked<1>();
         auto local_output = mesh_tet_ids.mutable_unchecked<1>();
+        auto cached_rotation_output = cached_tet_rotations.mutable_unchecked<3>();
+        auto cached_center_output = cached_tet_centers.mutable_unchecked<2>();
         auto adjacency_output = adjacency.mutable_unchecked<2>();
         const uint piece_count = AMD::FmGetNumTetMeshes(*buffer_);
         std::vector<py::ssize_t> vertex_offsets(piece_count + 1, 0);
@@ -484,6 +498,22 @@ public:
             piece_output(original) = piece;
             local_output(original) = local;
             original_output(original) = original;
+            const auto cached_rotation = AMD::FmGetTetRotation(*mesh, local);
+            const auto cached_center = AMD::FmGetCenterOfMass(*mesh);
+            const float center_values[3] = {cached_center.x, cached_center.y, cached_center.z};
+            for (uint row = 0; row < 3; ++row)
+            {
+                if (!std::isfinite(center_values[row]))
+                    throw std::runtime_error("FEMFX returned a nonfinite cached center of mass");
+                cached_center_output(original, row) = center_values[row];
+                for (uint column = 0; column < 3; ++column)
+                {
+                    const float value = cached_rotation.getElem(column, row);
+                    if (!std::isfinite(value))
+                        throw std::runtime_error("FEMFX returned a nonfinite cached tetrahedron rotation");
+                    cached_rotation_output(original, row, column) = value;
+                }
+            }
             const auto ids = AMD::FmGetTetVertIds(*mesh, local);
             for (uint corner = 0; corner < 4; ++corner)
             {
@@ -571,6 +601,8 @@ public:
         result["tet_piece_ids"] = piece_ids;
         result["original_tet_ids"] = original_ids;
         result["mesh_tet_ids"] = mesh_tet_ids;
+        result["cached_tet_rotations"] = cached_tet_rotations;
+        result["cached_tet_centers_of_mass"] = cached_tet_centers;
         result["tet_adjacency"] = adjacency;
         result["internal_faces"] = face_cells;
         result["internal_face_local_ids"] = face_local_ids;
@@ -583,16 +615,81 @@ public:
         result["time"] = AMD::FmGetSceneControlParams(*scene_).simTime;
         result["step"] = step_;
         result["piece_count"] = piece_count;
+        if (observation_.invalid.load())
+            throw std::runtime_error("Native observation referenced an unknown original tetrahedron");
+        auto vectors = [&](const std::vector<double>& values)
+        {
+            py::array_t<double> array({py::ssize_t(tet_count_), py::ssize_t(4), py::ssize_t(3)});
+            std::copy(values.begin(), values.end(), array.mutable_data());
+            return array;
+        };
+        auto corner_flags = [&](const std::vector<uint8_t>& values)
+        {
+            py::array_t<bool> array({py::ssize_t(tet_count_), py::ssize_t(4)});
+            std::transform(values.begin(), values.end(), array.mutable_data(), [](uint8_t value) { return value != 0; });
+            return array;
+        };
+        auto corner_scalars = [&](const std::vector<double>& values)
+        {
+            py::array_t<double> array({py::ssize_t(tet_count_), py::ssize_t(4)});
+            std::copy(values.begin(), values.end(), array.mutable_data());
+            return array;
+        };
+        auto tet_scalars = [&](const std::vector<double>& values)
+        {
+            py::array_t<double> array(tet_count_);
+            std::copy(values.begin(), values.end(), array.mutable_data());
+            return array;
+        };
+        auto tet_flags = [&](const std::vector<uint8_t>& values)
+        {
+            py::array_t<bool> array(tet_count_);
+            std::transform(values.begin(), values.end(), array.mutable_data(), [](uint8_t value) { return value != 0; });
+            return array;
+        };
+        py::array_t<double> stress(tet_count_);
+        py::array_t<double> thresholds(tet_count_);
+        py::array_t<bool> stress_observed(tet_count_);
+        std::copy(observation_.fractureStressEigenvalues.begin(), observation_.fractureStressEigenvalues.end(), stress.mutable_data());
+        std::copy(observation_.fractureStressThresholds.begin(), observation_.fractureStressThresholds.end(), thresholds.mutable_data());
+        std::transform(observation_.fractureStressObserved.begin(), observation_.fractureStressObserved.end(), stress_observed.mutable_data(), [](uint8_t value) { return value != 0; });
+        result["pre_contact_velocities"] = vectors(observation_.preContactVelocities);
+        result["applied_delta_velocities"] = vectors(observation_.appliedDeltaVelocities);
+        result["stabilization_delta_positions"] = vectors(observation_.stabilizationDeltaPositions);
+        result["contact_observed"] = corner_flags(observation_.cornerObserved);
+        result["constraint_solve_active"] = corner_flags(observation_.constraintSolveActive);
+        result["fracture_stress_eigenvalues"] = stress;
+        result["fracture_stress_thresholds"] = thresholds;
+        result["fracture_stress_observed"] = stress_observed;
+        result["mpcg_solution"] = vectors(observation_.mpcgSolution);
+        result["mpcg_rhs"] = vectors(observation_.mpcgRhs);
+        result["mpcg_residual"] = vectors(observation_.mpcgResidual);
+        result["mpcg_masses"] = corner_scalars(observation_.mpcgMasses);
+        result["mpcg_observed"] = corner_flags(observation_.mpcgObserved);
+        result["mpcg_kinematic"] = corner_flags(observation_.mpcgKinematic);
+        result["mpcg_recursive_norm_squared"] = tet_scalars(observation_.mpcgRecursiveNormSquared);
+        result["mpcg_true_norm_squared"] = tet_scalars(observation_.mpcgTrueNormSquared);
+        result["mpcg_rhs_norm_squared"] = tet_scalars(observation_.mpcgRhsNormSquared);
+        result["mpcg_tolerance_squared"] = tet_scalars(observation_.mpcgToleranceSquared);
+        result["mpcg_epsilon"] = tet_scalars(observation_.mpcgEpsilon);
+        result["mpcg_iterations"] = tet_scalars(observation_.mpcgIterations);
+        result["mpcg_max_iterations"] = tet_scalars(observation_.mpcgMaxIterations);
+        result["mpcg_stopping_observed"] = tet_flags(observation_.mpcgStoppingObserved);
+        result["mpcg_rhs_positive"] = tet_flags(observation_.mpcgRhsPositive);
         return result;
     }
 
     py::dict step()
     {
         require_open();
-        AMD::FmUpdateScene(scene_, dt_);
-        ++step_;
         try
         {
+            observation_.reset(tet_count_);
+            {
+                FractureWorldTelemetry::Scope observer(record_observations_ ? &observation_ : nullptr);
+                AMD::FmUpdateScene(scene_, dt_);
+            }
+            ++step_;
             return state();
         }
         catch (...)
@@ -622,6 +719,13 @@ PYBIND11_MODULE(_femfx, module)
     capabilities["original_tet_mapping"] = true;
     capabilities["face_fracture_history"] = true;
     capabilities["stress_tensor"] = false;
+    capabilities["constraint_delta_observation"] = true;
+    capabilities["fracture_stress_eigenvalue_observation"] = true;
+    capabilities["elastic_solver_observation"] = true;
+    capabilities["observation_schema"] = "fracture-world.femfx-observation.v1";
+    capabilities["solver_observation_schema"] = "fracture-world.femfx-mpcg-observation.v1";
+    capabilities["solver_observation_stopping_semantics"] = "free rows; recursive r^T PInvDiag r <= epsilon^2 adjusted_rhs^T PInvDiag adjusted_rhs; zero RHS exits before test; recomputed residual recorded separately";
+    capabilities["observation_source"] = "read-only hooks at native delta application and pre-fracture stress test; compiled source copies are instrumented";
     capabilities["elastic_strain_energy"] = false;
     capabilities["kinetic_energy_from_unique_nodal_masses"] = true;
     capabilities["checkpoint"] = false;
@@ -629,6 +733,8 @@ PYBIND11_MODULE(_femfx, module)
     capabilities["distinct_rest_and_current_geometry"] = true;
     capabilities["initial_time"] = true;
     capabilities["current_nodal_masses_and_kinematic_flags"] = true;
+    capabilities["current_elastic_state"] = true;
+    capabilities["current_elastic_state_semantics"] = "current cached tetrahedron rotations and mesh centers of mass in original tetrahedron order; snapshot reads without advancing or restoring the solver";
     capabilities["input_vertex_welding"] = false;
     capabilities["restart_contact_cache"] = "cold";
     capabilities["plastic_history_restore"] = false;

@@ -7,8 +7,79 @@ from numpy.testing import assert_array_equal
 import pytest
 
 from fracture_world.dynamics_initial import ARRAYS, export_initial, load_initial
+from fracture_world.dynamics_data import load_dynamics_trajectory
+from fracture_world.io import file_hash
 from test_dynamics_data import recorded_trajectory
 from recorded_cases import update_archive
+
+
+def recorded_teacher(directory, settings):
+    case, trajectory = recorded_trajectory(directory)
+
+    def change_case(arrays):
+        metadata = json.loads(str(arrays["metadata_json"].item()))
+        metadata["native_settings"].update(settings)
+        arrays["metadata_json"] = np.asarray(json.dumps(metadata))
+
+    update_archive(case, change_case)
+
+    def change_provenance(arrays):
+        provenance = json.loads(str(arrays["metadata_json"].item()))
+        provenance["source_case_sha256"] = file_hash(case)
+        arrays["metadata_json"] = np.asarray(json.dumps(provenance))
+
+    update_archive(trajectory, change_provenance)
+    return case, trajectory
+
+
+@pytest.mark.parametrize("settings", [
+    {},
+    {"rayleigh_mass_damping": 0.0},
+    {"rayleigh_mass_damping": 0.0, "rayleigh_stiffness_damping": 0.0, "friction_coefficient": 0.0},
+    {"rayleigh_mass_damping": 0.15, "rayleigh_stiffness_damping": 0.02, "friction_coefficient": 0.4},
+])
+def test_recorded_teacher_settings_survive_trajectory_initial_export_and_portable_reload(tmp_path, settings):
+    case, trajectory = recorded_teacher(tmp_path / "source", settings)
+    loaded = load_dynamics_trajectory(case, trajectory)
+    with np.load(case, allow_pickle=False) as archive:
+        original = json.loads(str(archive["metadata_json"].item()))["native_settings"]
+    assert loaded.metadata["native_settings"] == original
+    output = tmp_path / "initial.npz"
+    initial = export_initial(case, trajectory, 0, output, support_policy="free")
+    assert initial.metadata["teacher_physics"] == settings
+    for path in (case, trajectory, case.parent.parent / "mesh.npz"):
+        path.rename(path.with_suffix(".backup"))
+    assert load_initial(output).metadata["teacher_physics"] == settings
+
+
+@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("parameter", ["rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient"])
+def test_exported_recorded_incompatible_teacher_settings_are_rejected_before_rollout(tmp_path, method, parameter):
+    import torch
+
+    from fracture_world.dynamics_runtime import rollout_dynamics
+    from test_dynamics_runtime import portable_rollout_inputs
+
+    case, trajectory = recorded_teacher(tmp_path / "source", {parameter: 0.15})
+    initial_path = tmp_path / "teacher-initial.npz"
+    initial = export_initial(case, trajectory, 0, initial_path, support_policy="free")
+    checkpoint, _, _, _ = portable_rollout_inputs(tmp_path)
+    saved = torch.load(checkpoint, weights_only=True)
+    saved["training_mesh_fingerprints"] = [initial.topology.fingerprint]
+    torch.save(saved, checkpoint)
+    output = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="zero damping and friction"):
+        rollout_dynamics(checkpoint, initial_path, output, 1, method, device="cpu")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("value", [True, "0", None, -0.1, float("nan")])
+def test_malformed_recorded_teacher_physics_cannot_be_exported_as_compatible(tmp_path, value):
+    case, trajectory = recorded_teacher(tmp_path / "source", {"friction_coefficient": value})
+    output = tmp_path / "invalid.npz"
+    with pytest.raises(ValueError, match="recorded friction_coefficient must be finite and nonnegative"):
+        export_initial(case, trajectory, 0, output, support_policy="free")
+    assert not output.exists()
 
 
 def constant_supports(path):

@@ -72,23 +72,44 @@ class _Factor:
     matrix: sparse.csr_matrix
     bound: np.ndarray
     inequality: bool = False
+    penalty: float | None = None
     inverse_gram: np.ndarray = field(init=False, repr=False)
+    _soft_inverse: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
+        if self.penalty is not None and (not np.isfinite(self.penalty) or self.penalty <= 0 or self.inequality):
+            raise ValueError("soft residual factors require a positive finite penalty and equality residuals")
         if len(self.bound) == 1:
             squared_norm = float(self.matrix.data @ self.matrix.data)
             self.inverse_gram = np.array([[1.0 / squared_norm if squared_norm else 0.0]])
         else:
             self.inverse_gram = pinvh((self.matrix @ self.matrix.T).toarray())
 
-    def project(self, value):
+    def projection_inverse(self, rho):
+        if self.penalty is None:
+            return self.inverse_gram
+        if self._soft_inverse is None or self._soft_inverse[0] != rho:
+            gram = (self.matrix @ self.matrix.T).toarray()
+            inverse = np.linalg.solve(gram + (rho / self.penalty) * np.eye(len(self.bound)), np.eye(len(self.bound)))
+            self._soft_inverse = (rho, inverse)
+        return self._soft_inverse[1]
+
+    def cost(self, value):
+        if self.penalty is None:
+            return 0.0
+        residual = np.asarray(self.matrix @ value).ravel() - self.bound
+        return float(0.5 * self.penalty * (residual @ residual))
+
+    def project(self, value, rho=1.0):
         residual = self.bound - self.matrix @ value
         if self.inequality:
             residual = np.maximum(residual, 0)
-        return value + np.asarray(self.matrix.T @ (self.inverse_gram @ residual)).ravel()
+        return value + np.asarray(self.matrix.T @ (self.projection_inverse(rho) @ residual)).ravel()
 
     def violation(self, value):
         residual = np.asarray(self.matrix @ value).ravel() - self.bound
+        if self.penalty is not None:
+            return np.zeros_like(residual)
         return np.maximum(-residual, 0) if self.inequality else np.abs(residual)
 
 
@@ -112,6 +133,14 @@ class DynamicsProblem:
     kinematic_rule: str = "backward_euler"
     previous_broken_faces: np.ndarray | None = None
     previous_fixed: np.ndarray | None = None
+    elastic_balance: object | None = None
+    mechanics_mode: str = "disabled"
+    mechanics_weight: float = 1.0
+    stabilization_offset: np.ndarray | None = None
+    position_roundoff: np.ndarray | None = None
+    kinematic_velocity_envelope: np.ndarray | None = None
+    contact_tolerance: float = 0.0
+    native_contact_phase: bool = False
     corner_masses: np.ndarray = field(init=False)
     prior: np.ndarray = field(init=False, repr=False)
     prior_weights: np.ndarray = field(init=False, repr=False)
@@ -128,9 +157,26 @@ class DynamicsProblem:
             raise ValueError("time step, density, and prior weights must be positive")
         if self.kinematic_rule not in ("backward_euler", "trapezoidal", "constant_acceleration"):
             raise ValueError("unsupported kinematic integration rule")
+        if self.mechanics_mode not in {"disabled", "proximal", "exact"}:
+            raise ValueError("mechanics_mode must select disabled, proximal or exact")
+        if self.mechanics_mode != "disabled" and (self.elastic_balance is None or self.kinematic_rule != "backward_euler"):
+            raise ValueError("FEMFX mechanical balance requires its frozen elastic model and backward_euler kinematics")
+        if not np.isfinite(self.mechanics_weight) or self.mechanics_weight <= 0:
+            raise ValueError("mechanics_weight must be finite and positive")
         shape = (len(self.mesh.tets), 4, 3)
         for name in ("positions", "velocities", "predicted_positions", "predicted_velocities"):
             setattr(self, name, _finite_array(getattr(self, name), shape, name))
+        for name in ("stabilization_offset", "position_roundoff", "kinematic_velocity_envelope"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _finite_array(value, shape, name)
+                if name != "stabilization_offset" and (value < 0).any():
+                    raise ValueError(f"{name} must be nonnegative")
+                setattr(self, name, value)
+        if not np.isfinite(self.contact_tolerance) or self.contact_tolerance < 0:
+            raise ValueError("contact tolerance must be finite and nonnegative")
+        if not isinstance(self.native_contact_phase, bool):
+            raise ValueError("native contact phase must be Boolean")
         for name, length in (("broken_faces", len(self.mesh.faces.vertices)), ("fixed", 4 * len(self.mesh.tets))):
             raw = getattr(self, name)
             target_shape = (length,) if name == "broken_faces" else shape[:2]
@@ -167,6 +213,8 @@ class DynamicsProblem:
         if not np.isfinite([self.position_scale, self.velocity_scale]).all() or min(self.position_scale, self.velocity_scale) <= 0:
             raise ValueError("position and velocity scales must be finite and positive")
         self.corner_masses = np.broadcast_to(self.mesh.volumes[:, None] * self.density / 4, shape[:2]).copy()
+        if self.mechanics_mode != "disabled":
+            self.corner_masses = _finite_array(self.elastic_balance.corner_masses.reshape(shape[:2]), shape[:2], "native corner masses")
         fractions = np.repeat((self.corner_masses / self.corner_masses.sum()).ravel(), 3)
         self.prior_weights = np.r_[self.position_weight * fractions, self.velocity_weight * fractions]
         self.prior = np.r_[((self.predicted_positions - self.positions) / self.position_scale).ravel(), (self.predicted_velocities / self.velocity_scale).ravel()]
@@ -181,14 +229,22 @@ class DynamicsProblem:
             "kinematic_rule": self.kinematic_rule,
             "contact_geometry": "supplied frozen linearized normal constraints",
             "contact_law": "nonpenetration only; no verified impulse or restitution law",
-            "momentum_constraint": "linear and angular momentum per closed interaction island; external reaction inferred on supported or environment-contact islands",
+            "momentum_constraint": "linear and angular momentum per closed interaction island; external reaction inferred on supported or environment-contact islands"
+            if self.mechanics_mode == "disabled" else "frozen discrete island balance: residual penalty in proximal mode, equality in exact reference; physical linear and angular momentum recorded independently",
             "momentum_partition": "start-of-step intact material connectivity plus current contact hyperedges",
             "momentum_island_count": len(self.momentum_islands),
             "newly_broken_faces": int(np.count_nonzero(self.broken_faces & ~self.previous_broken_faces)),
             "released_support_corners": int(np.count_nonzero(self.previous_fixed & ~self.fixed)),
             "support_reaction_interval": "supports present at either endpoint may contribute an unmeasured reaction during the step",
             "boundary_momentum_verified": closed,
-            "angular_momentum_constraint": closed,
+            "closed_boundary": closed,
+            "physical_momentum_equality_enforced": closed and self.mechanics_mode == "disabled",
+            "discrete_balance_equality_enforced": self.mechanics_mode == "exact",
+            "angular_momentum_constraint": closed and self.mechanics_mode == "disabled",
+            "mechanics_mode": self.mechanics_mode,
+            "mechanics_weight": self.mechanics_weight,
+            "fracture_update_order": "endpoint candidate topology" if self.mechanics_mode == "disabled" else "integrate old topology, then copy state into the generated endpoint topology",
+            "angular_momentum_scope": "explicit invariant" if self.mechanics_mode == "disabled" else "diagnostic only; pinned frozen-rotation implicit teacher step",
             "frictionless_boundary_projection": not supported and any(contact.environment for contact in self.contacts),
             "external_torque_quadrature": "supplied point impulses act at current material-corner positions",
             "feasibility_check": "shared HiGHS linear feasibility presolve; solver failure is unknown",
@@ -198,6 +254,9 @@ class DynamicsProblem:
             "intact_faces": int(np.count_nonzero(~self.broken_faces[self.mesh.internal_faces])),
             "broken_faces": int(self.broken_faces.sum()),
             "factor_names": [factor.name for factor in self.factors],
+            "contact_tolerance_metres": float(self.contact_tolerance),
+            "position_arithmetic": "IEEE float32 publication error envelope" if self.position_roundoff is not None else "exact analytical integration",
+            "position_stabilization": "frozen minimum-A-response contact correction" if self.stabilization_offset is not None else "none",
         }
         if self.kinematic_rule == "constant_acceleration":
             self.metadata["external_torque_quadrature"] = "internal impulse at the initial state followed by continuous constant external acceleration"
@@ -241,7 +300,17 @@ class DynamicsProblem:
             if self.kinematic_rule == "constant_acceleration":
                 impulse = self.external_impulse.reshape(-1, 3)[corner]
                 bound = -0.5 * self.dt * impulse / (self.corner_masses.ravel()[corner] * self.position_scale)
-            factors.append(self._factor(f"kinematic:{corner}", np.tile(np.arange(3), 2), columns, np.r_[np.ones(3), -beta * np.ones(3)], bound))
+            if self.stabilization_offset is not None:
+                bound = bound + self.stabilization_offset.reshape(-1, 3)[corner] / self.position_scale
+            if self.position_roundoff is None:
+                factors.append(self._factor(f"kinematic:{corner}", np.tile(np.arange(3), 2), columns, np.r_[np.ones(3), -beta * np.ones(3)], bound))
+            else:
+                radius = self.position_roundoff.reshape(-1, 3)[corner] / self.position_scale
+                for axis in range(3):
+                    indices = columns[[axis, 3 + axis]]
+                    for sign, side in ((1., "lower"), (-1., "upper")):
+                        factors.append(self._factor(f"kinematic:{corner}:{axis}:{side}", [0, 0], indices,
+                                                    [sign, -sign * beta], [sign * bound[axis] - radius[axis]], True))
         flat_positions = self.positions.reshape(-1, 3)
         for face in self.mesh.internal_faces:
             if self.broken_faces[face]:
@@ -265,15 +334,28 @@ class DynamicsProblem:
         for index, contact in enumerate(self.contacts):
             columns = (3 * contact.corner_ids[:, None] + np.arange(3)).ravel()
             values = (contact.weights[:, None] * contact.normal).ravel()
-            bound = [(-contact.gap + self.dt * contact.environment_velocity) / self.position_scale]
+            bound = [(-contact.gap - self.contact_tolerance + self.dt * contact.environment_velocity) / self.position_scale]
             factors.append(self._factor(f"contact:{index}", np.zeros(len(columns), dtype=int), columns, values, bound, True))
+            if self.native_contact_phase:
+                velocity_columns = columns + 3 * count
+                target = contact.environment_velocity - max(contact.gap + self.contact_tolerance, 0.) / self.dt
+                factors.append(self._factor(f"contact_velocity:{index}", np.zeros(len(columns), dtype=int), velocity_columns,
+                                            values, [target / self.velocity_scale], True))
         for island, corners in enumerate(self.momentum_islands):
             factors.extend(self._momentum_factors(corners, "" if len(self.momentum_islands) == 1 else f":{island}"))
+        if self.mechanics_mode != "disabled":
+            for factor in self.elastic_balance.factors(self):
+                if self.mechanics_mode == "proximal":
+                    group = int(factor.name.rsplit(":", 1)[-1])
+                    factor.penalty = self.mechanics_weight * self.elastic_balance.node_masses[group] / self.elastic_balance.node_masses.sum()
+                factors.append(factor)
         return tuple(factors)
 
     def _momentum_factors(self, corners, suffix):
         if (self.fixed | self.previous_fixed).ravel()[corners].any():
             return []
+        if self.mechanics_mode != "disabled":
+            return self._discrete_momentum_factors(corners, suffix)
         factors = []
         mass = self.corner_masses.ravel()[corners]
         positions = self.positions.reshape(-1, 3)[corners]
@@ -293,6 +375,8 @@ class DynamicsProblem:
         if not environment:
             factors.append(self._factor(f"linear_momentum{suffix}", np.tile(np.arange(3), len(corners)), columns,
                                         np.repeat(mass / mass.sum(), 3), target_momentum / (mass.sum() * self.velocity_scale)))
+            if self.mechanics_mode != "disabled":
+                return factors
             cross = np.zeros((len(corners), 3, 3))
             cross[:, 0, 1], cross[:, 0, 2] = -moment_arm[:, 2], moment_arm[:, 1]
             cross[:, 1, 0], cross[:, 1, 2] = moment_arm[:, 2], -moment_arm[:, 0]
@@ -315,9 +399,39 @@ class DynamicsProblem:
                 factors.append(self._factor(f"nonnegative_boundary_normal_impulse{suffix}", np.zeros(3 * len(corners), dtype=int),
                                              columns, coefficients.ravel(),
                                              [float(normal @ target_momentum / (mass.sum() * self.velocity_scale))], True))
+                if self.mechanics_mode != "disabled":
+                    return factors
                 coefficients = mass[:, None] * np.cross(normal, moment_arm) / (mass.sum() * length)
                 factors.append(self._factor(f"boundary_normal_axis_angular_momentum{suffix}", np.zeros(3 * len(corners), dtype=int), columns,
                                              coefficients.ravel(), [float(normal @ (old_angular + torque) / (mass.sum() * length * self.velocity_scale))]))
+        return factors
+
+    def _discrete_momentum_factors(self, corners, suffix):
+        balance = self.elastic_balance
+        nodes = np.unique(balance.groups[corners])
+        rows = (3 * nodes[:, None] + np.arange(3)).ravel()
+        aggregate = sparse.csr_matrix((np.ones(len(rows)), (np.tile(np.arange(3), len(nodes)), rows)),
+                                      shape=(3, len(balance.rhs)))
+        mass = float(self.corner_masses.ravel()[corners].sum())
+        matrix = (aggregate @ balance.matrix) / mass
+        bound = np.asarray(aggregate @ balance.rhs).ravel() / (mass * self.velocity_scale)
+        environment = self._island_environment(corners)
+        projections = [(f"discrete_linear_balance{suffix}", np.eye(3), False)]
+        if environment:
+            normals = np.stack([contact.normal for contact in environment])
+            projections = [(f"discrete_boundary_tangential_balance{suffix}", null_space(normals.T @ normals).T, False)]
+            if np.allclose(normals, normals[0], rtol=1e-10, atol=1e-12):
+                projections.append((f"discrete_nonnegative_boundary_impulse{suffix}", normals[:1], True))
+        factors = []
+        for name, projection, inequality in projections:
+            if not len(projection):
+                continue
+            coo = (sparse.csr_matrix(projection) @ matrix).tocoo()
+            columns = 3 * self.corner_count + 3 * balance.representatives[coo.col // 3] + coo.col % 3
+            factor = self._factor(name, coo.row, columns, coo.data, projection @ bound, inequality)
+            if self.mechanics_mode == "proximal" and not inequality:
+                factor.penalty = self.mechanics_weight * mass / self.corner_masses.sum()
+            factors.append(factor)
         return factors
 
     def unpack(self, state):
@@ -327,7 +441,144 @@ class DynamicsProblem:
 
     def objective(self, state):
         difference = np.asarray(state) - self.prior
-        return float(0.5 * np.dot(self.prior_weights, difference**2))
+        return float(0.5 * np.dot(self.prior_weights, difference**2) +
+                     sum(factor.cost(np.asarray(state)[factor.indices]) for factor in self.factors))
+
+    def encode_state(self, positions, velocities):
+        return np.r_[((np.asarray(positions) - self.positions) / self.position_scale).ravel(),
+                     (np.asarray(velocities) / self.velocity_scale).ravel()]
+
+    def direction_to_corners(self, direction):
+        direction = _finite_array(direction, self.prior.shape, "state direction")
+        cut = 3 * self.corner_count
+        return (self.position_scale * direction[:cut].reshape(self.positions.shape),
+                self.velocity_scale * direction[cut:].reshape(self.velocities.shape))
+
+    def gradient_from_corners(self, position_gradient, velocity_gradient):
+        return np.r_[self.position_scale * np.asarray(position_gradient).ravel(),
+                     self.velocity_scale * np.asarray(velocity_gradient).ravel()]
+
+    def zero_energy_state(self, positions):
+        rest = self.mesh.nodes[self.mesh.tets]
+        projected = _rigid_projection(rest, np.asarray(positions).reshape(rest.shape))
+        return self.encode_state(projected, np.zeros_like(projected))
+
+
+def _rigid_projection(rest, positions):
+    source = rest - rest.mean(axis=-2, keepdims=True)
+    center = positions.mean(axis=-2, keepdims=True)
+    left, _, right = np.linalg.svd(np.swapaxes(source, -2, -1) @ (positions - center))
+    signs = np.ones(left.shape[:-1])
+    signs[..., -1] = np.where(np.linalg.det(left @ right) < 0, -1.0, 1.0)
+    return source @ ((left * signs[..., None, :]) @ right) + center
+
+
+class _SharedDynamicsProblem:
+    def __init__(self, source):
+        self.source_problem = source
+        self.groups = source.mesh.corner_groups(source.broken_faces[source.mesh.internal_faces])
+        self.group_count = int(self.groups.max()) + 1
+        _, self.representatives = np.unique(self.groups, return_index=True)
+        self.reference_positions = source.positions.reshape(-1, 3)[self.representatives]
+        position_indices = (3 * self.groups[:, None] + np.arange(3)).ravel()
+        self.state_indices = np.r_[position_indices, 3 * self.group_count + position_indices]
+        self.offset = np.r_[((self.reference_positions[self.groups] - source.positions.reshape(-1, 3))
+                             / source.position_scale).ravel(), np.zeros(3 * source.corner_count)]
+        self.prior_weights = np.bincount(self.state_indices, weights=source.prior_weights,
+                                        minlength=6 * self.group_count)
+        self.prior = np.bincount(self.state_indices, weights=source.prior_weights * (source.prior - self.offset),
+                                minlength=6 * self.group_count) / self.prior_weights
+        difference = self.prior[self.state_indices] + self.offset - source.prior
+        self.objective_offset = float(0.5 * np.dot(source.prior_weights, difference**2))
+        self.factors, aliases = self._reduced_factors(source.factors)
+        self.metadata = {**source.metadata, "factor_names": [factor.name for factor in self.factors],
+                         "state_parameterization": "exact shared next positions and velocities on intact material corners",
+                         "full_state_variables": len(source.prior), "solver_state_variables": len(self.prior),
+                         "shared_corner_groups": self.group_count, "original_factor_count": len(source.factors),
+                         "solver_factor_count": len(self.factors), "factor_aliases": aliases,
+                         "irreducible_prediction_cost": self.objective_offset}
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "source_problem"), name)
+
+    def _reduced_factors(self, factors):
+        reduced, signatures, aliases = [], {}, {}
+        for factor in factors:
+            coo = factor.matrix.tocoo()
+            columns = self.state_indices[factor.indices[coo.col]]
+            indices, local = np.unique(columns, return_inverse=True)
+            matrix = sparse.csr_matrix((coo.data, (coo.row, local)), shape=(len(factor.bound), len(indices)))
+            matrix.sum_duplicates()
+            matrix.eliminate_zeros()
+            bound = factor.bound - factor.matrix @ self.offset[factor.indices]
+            active = np.diff(matrix.indptr) > 0
+            active |= bound > 0 if factor.inequality else bound != 0
+            if not active.any():
+                aliases[factor.name] = "exactly eliminated"
+                continue
+            matrix, bound = matrix[active], np.asarray(bound)[active]
+            coo = matrix.tocoo()
+            used, local = np.unique(coo.col, return_inverse=True)
+            indices = indices[used]
+            matrix = sparse.csr_matrix((coo.data, (coo.row, local)), shape=(len(bound), len(indices)))
+            signature = (factor.inequality, indices.tobytes(), matrix.indptr.tobytes(),
+                         matrix.indices.tobytes(), matrix.data.tobytes(), bound.tobytes())
+            if factor.penalty is None and signature in signatures:
+                aliases[factor.name] = signatures[signature]
+                continue
+            if factor.penalty is None:
+                signatures[signature] = factor.name
+            reduced.append(_Factor(factor.name, indices, matrix, bound, factor.inequality, factor.penalty))
+        return tuple(reduced), aliases
+
+    def unpack(self, state):
+        state = _finite_array(state, self.prior.shape, "shared corrector state")
+        cut = 3 * self.group_count
+        positions = self.reference_positions + self.position_scale * state[:cut].reshape(-1, 3)
+        velocities = self.velocity_scale * state[cut:].reshape(-1, 3)
+        return positions[self.groups].reshape(self.positions.shape), velocities[self.groups].reshape(self.velocities.shape)
+
+    def encode_state(self, positions, velocities):
+        positions = np.asarray(positions).reshape(-1, 3)[self.representatives]
+        velocities = np.asarray(velocities).reshape(-1, 3)[self.representatives]
+        return np.r_[((positions - self.reference_positions) / self.position_scale).ravel(),
+                     (velocities / self.velocity_scale).ravel()]
+
+    def direction_to_corners(self, direction):
+        direction = _finite_array(direction, self.prior.shape, "shared state direction")
+        cut = 3 * self.group_count
+        positions = self.position_scale * direction[:cut].reshape(-1, 3)
+        velocities = self.velocity_scale * direction[cut:].reshape(-1, 3)
+        return positions[self.groups].reshape(self.positions.shape), velocities[self.groups].reshape(self.velocities.shape)
+
+    def gradient_from_corners(self, position_gradient, velocity_gradient):
+        full = self.source_problem.gradient_from_corners(position_gradient, velocity_gradient)
+        return np.bincount(self.state_indices, weights=full, minlength=len(self.prior))
+
+    def objective(self, state):
+        difference = np.asarray(state) - self.prior
+        return float(self.objective_offset + 0.5 * np.dot(self.prior_weights, difference**2) +
+                     sum(factor.cost(np.asarray(state)[factor.indices]) for factor in self.factors))
+
+    def zero_energy_state(self, positions):
+        rest = self.mesh.nodes[self.mesh.tets].reshape(-1, 3)[self.representatives]
+        target = np.asarray(positions).reshape(-1, 3)[self.representatives]
+        projected = np.empty_like(target)
+        labels = component_labels(len(self.mesh.tets), self.mesh.dual_edges,
+                                  self.broken_faces[self.mesh.internal_faces])
+        for label in np.unique(labels):
+            corners = np.flatnonzero(np.repeat(labels, 4) == label)
+            groups = np.unique(self.groups[corners])
+            projected[groups] = _rigid_projection(rest[groups], target[groups])
+        shape = self.positions.shape
+        return self.encode_state(projected[self.groups].reshape(shape), np.zeros(shape))
+
+
+def _shared_problem(problem):
+    if isinstance(problem, _SharedDynamicsProblem):
+        return problem
+    groups = problem.mesh.corner_groups(problem.broken_faces[problem.mesh.internal_faces])
+    return _SharedDynamicsProblem(problem) if len(np.unique(groups)) < problem.corner_count else problem
 
 
 @dataclass(frozen=True)
@@ -389,11 +640,25 @@ def _island_momentum_diagnostics(problem, positions, velocities, bound):
                             linear_residual_or_inferred_reaction=residual.tolist(),
                             angular_residual_or_inferred_reaction=angular_residual.tolist(),
                             linear_momentum_verified=bool(closed and np.max(np.abs(residual)) / scale <= bound),
-                            angular_momentum_verified=bool(closed and np.max(np.abs(angular_residual)) / (scale * length) <= bound)))
+                            angular_momentum_verified=bool(closed and np.max(np.abs(angular_residual)) / (scale * length) <= bound)
+                            if problem.mechanics_mode == "disabled" else None))
     return reports
 
 
 def _diagnostics(problem, state, tolerance):
+    if isinstance(problem, _SharedDynamicsProblem):
+        positions, velocities = problem.unpack(state)
+        original = problem.source_problem
+        report = _diagnostics(original, original.encode_state(positions, velocities), tolerance)
+        for factor in problem.factors:
+            violation = float(np.max(factor.violation(np.asarray(state)[factor.indices]), initial=0))
+            report["factor_violations"][factor.name] = max(report["factor_violations"].get(factor.name, 0.0), violation)
+        report["constraint_violation"] = max(report["factor_violations"].values(), default=0.0)
+        report["constraints_satisfied"] = bool(report["constraint_violation"] <= report["constraint_tolerance"])
+        report["shared_coordinates"] = {key: problem.metadata[key] for key in (
+            "state_parameterization", "full_state_variables", "solver_state_variables", "shared_corner_groups",
+            "original_factor_count", "solver_factor_count", "irreducible_prediction_cost")}
+        return report
     positions, velocities = problem.unpack(state)
     violations = {factor.name: float(np.max(factor.violation(state[factor.indices]), initial=0)) for factor in problem.factors}
     actual_impulse = np.sum(problem.corner_masses[..., None] * (velocities - problem.velocities), axis=(0, 1))
@@ -419,6 +684,10 @@ def _diagnostics(problem, state, tolerance):
         "constraint_tolerance": float(bound),
         "constraints_satisfied": bool(violation <= bound),
         "factor_violations": violations,
+        "objective_components": {
+            "prediction_fidelity": float(0.5 * np.dot(problem.prior_weights, (np.asarray(state) - problem.prior)**2)),
+            "elastic_residual_penalty": sum(factor.cost(np.asarray(state)[factor.indices]) for factor in problem.factors),
+        },
         "linearized_contact_gaps": contacts,
         "linear_momentum_change": actual_impulse.tolist(),
         "supplied_external_impulse": supplied_impulse.tolist(),
@@ -428,15 +697,18 @@ def _diagnostics(problem, state, tolerance):
         "angular_residual_or_inferred_boundary_angular_impulse": angular_residual.tolist(),
         "angular_momentum_origin": origin.tolist(),
         "external_torque_quadrature": problem.metadata["external_torque_quadrature"],
-        "closed_system_momentum_constraint": problem.metadata["boundary_momentum_verified"],
+        "closed_system_momentum_constraint": problem.metadata["physical_momentum_equality_enforced"],
+        "discrete_balance_equality_enforced": problem.metadata["discrete_balance_equality_enforced"],
         "boundary_momentum_verified": bool(problem.metadata["boundary_momentum_verified"] and np.max(np.abs(residual)) / (problem.corner_masses.sum() * problem.velocity_scale) <= bound),
-        "angular_momentum_verified": bool(problem.metadata["angular_momentum_constraint"] and np.max(np.abs(angular_residual)) / (problem.corner_masses.sum() * angular_length * problem.velocity_scale) <= bound),
+        "angular_momentum_verified": bool(problem.metadata["angular_momentum_constraint"] and np.max(np.abs(angular_residual)) / (problem.corner_masses.sum() * angular_length * problem.velocity_scale) <= bound)
+        if problem.mechanics_mode == "disabled" else None,
         "contact_impulse_law_verified": False,
         "momentum_partition": problem.metadata["momentum_partition"],
         "momentum_islands": island_reports,
         "free_momentum_island_count": len(free_islands),
         "free_momentum_islands_verified": all(item["linear_momentum_verified"] and item["angular_momentum_verified"]
-                                               for item in free_islands) if free_islands else None,
+                                               for item in free_islands) if free_islands and problem.mechanics_mode == "disabled" else None,
+        "free_linear_momentum_islands_verified": all(item["linear_momentum_verified"] for item in free_islands) if free_islands else None,
         "engine_calls": 0,
     }
 
@@ -448,7 +720,7 @@ def _constraint_system(problem):
         offset = 0
         sign = -1.0 if inequality else 1.0
         for factor in problem.factors:
-            if factor.inequality != inequality:
+            if factor.inequality != inequality or factor.penalty is not None:
                 continue
             coo = factor.matrix.tocoo()
             rows.append(coo.row + offset)
@@ -460,6 +732,27 @@ def _constraint_system(problem):
                                    shape=(offset, len(problem.prior))).tocsc() if values else sparse.csc_matrix((0, len(problem.prior)))
         systems.append((matrix, np.concatenate(bounds) if bounds else np.empty(0)))
     return tuple(systems)
+
+
+def _quadratic_objective(problem):
+    matrix = sparse.diags(problem.prior_weights, format="csc")
+    linear = -problem.prior_weights * problem.prior
+    for factor in problem.factors:
+        if factor.penalty is None:
+            continue
+        coo = factor.matrix.tocoo()
+        full = sparse.csc_matrix((coo.data, (coo.row, factor.indices[coo.col])), shape=(len(factor.bound), len(problem.prior)))
+        matrix = matrix + factor.penalty * (full.T @ full)
+        linear = linear - factor.penalty * np.asarray(full.T @ factor.bound).ravel()
+    return sparse.triu(matrix, format="csc"), linear
+
+
+def _prior_is_minimum(problem):
+    return all(factor.cost(problem.prior[factor.indices]) == 0.0 for factor in problem.factors)
+
+
+def _factor_inverse_gram(problem, rho):
+    return sparse.block_diag([factor.projection_inverse(rho) for factor in problem.factors], format="csr")
 
 
 def _feasibility(problem, tolerances):
@@ -491,6 +784,8 @@ def _feasibility(problem, tolerances):
 def _result(problem, method, state, tolerance, converged, status, iterations, history, start, feasibility=None):
     positions, velocities = problem.unpack(state)
     diagnostics = _diagnostics(problem, state, tolerance)
+    if converged and not diagnostics["constraints_satisfied"]:
+        converged, status = False, "original_constraint_validation_failed"
     diagnostics["feasibility"] = feasibility or {"method": "not run", "status": "unknown", "iterations": 0, "runtime_seconds": 0.0, "engine_calls": 0}
     return CorrectorResult(method, positions, velocities, problem.objective(state), converged, status, iterations, diagnostics, history, perf_counter() - start)
 
@@ -499,6 +794,7 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
     import clarabel
 
     start = perf_counter()
+    problem = _shared_problem(problem)
     tolerances = tolerances or CorrectorTolerances()
     _limit(max_iterations)
     if cancel is not None and cancel():
@@ -509,7 +805,7 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
     if feasibility["status"] != "feasible":
         status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
         return _result(problem, "central", problem.prior, tolerances, False, status, 0, [], start, feasibility)
-    if feasibility["method"] == "direct feasible prior certificate":
+    if feasibility["method"] == "direct feasible prior certificate" and _prior_is_minimum(problem):
         return _result(problem, "central", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
     (equalities, equality_bounds), (inequalities, inequality_bounds) = _constraint_system(problem)
     matrix = sparse.vstack((equalities, inequalities), format="csc")
@@ -523,8 +819,9 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
     if max_iterations is not None:
         settings.max_iter = int(max_iterations)
     iterations = 0
+    objective_matrix, objective_linear = _quadratic_objective(problem)
     while True:
-        solver = clarabel.DefaultSolver(sparse.diags(problem.prior_weights, format="csc"), -problem.prior_weights * problem.prior, matrix, bounds, cones, settings)
+        solver = clarabel.DefaultSolver(objective_matrix, objective_linear, matrix, bounds, cones, settings)
         if cancel is not None:
             solver.set_termination_callback(lambda info: bool(cancel()))
         solution = solver.solve()
@@ -545,6 +842,7 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
 def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, cancel: Callable[[], bool] | None = None, adaptive_rho=True,
                     *, progress=None, _workspace=None):
     start = perf_counter()
+    problem = _shared_problem(problem)
     tolerances = tolerances or CorrectorTolerances()
     _limit(max_iterations)
     rho = float(np.median(problem.prior_weights)) if rho is None else float(rho)
@@ -562,15 +860,16 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
     if feasibility["status"] != "feasible":
         status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
         return _result(problem, "consensus", problem.prior, tolerances, False, status, 0, [], start, feasibility)
-    if feasibility["method"] == "direct feasible prior certificate":
+    if feasibility["method"] == "direct feasible prior certificate" and _prior_is_minimum(problem):
         return _result(problem, "consensus", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
     state = problem.prior.copy()
     indices = np.concatenate([factor.indices for factor in problem.factors])
     matrix = sparse.block_diag([factor.matrix for factor in problem.factors], format="csr")
     transpose = matrix.T.tocsr()
-    inverse_gram = sparse.block_diag([factor.inverse_gram for factor in problem.factors], format="csr")
+    inverse_gram = _factor_inverse_gram(problem, rho)
     bound = np.concatenate([factor.bound for factor in problem.factors])
     inequality = np.concatenate([np.full(len(factor.bound), factor.inequality, dtype=bool) for factor in problem.factors])
+    soft_rows = np.concatenate([np.full(len(factor.bound), factor.penalty is not None, dtype=bool) for factor in problem.factors])
     local = state[indices].copy()
     dual = np.zeros_like(local)
     counts = np.bincount(indices, minlength=len(state))
@@ -610,6 +909,7 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
             dual_tolerance = float(np.sqrt(local_dimension) * tolerances.absolute + tolerances.relative * rho * np.sqrt(dual_squared))
             constraint_residual = matrix @ selected - bound
             constraint_residual[inequality] = np.minimum(constraint_residual[inequality], 0)
+            constraint_residual[soft_rows] = 0
             violation = float(np.max(np.abs(constraint_residual), initial=0))
             constraint_tolerance = tolerances.absolute + tolerances.relative * max(float(np.max(np.abs(state), initial=0)), 1.0)
             history.append(CorrectorIteration(iteration, problem.objective(state), primal, dual_residual, primal_tolerance, dual_tolerance, violation, rho))
@@ -626,6 +926,8 @@ def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, can
                 multiplier = 2.0 if primal > 10 * dual_residual else 0.5 if dual_residual > 10 * primal else 1.0
                 rho *= multiplier
                 dual /= multiplier
+                if multiplier != 1.0:
+                    inverse_gram = _factor_inverse_gram(problem, rho)
             snapshot = (state.copy(), dual.copy(), rho)
             if any(snapshot[2] == prior[2] and np.array_equal(snapshot[0], prior[0]) and np.array_equal(snapshot[1], prior[1]) for prior in previous):
                 status = "numerical_cycle"

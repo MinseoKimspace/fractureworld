@@ -18,6 +18,21 @@ from .partition import component_labels
 REVISION = "95cf656731a2465ae1d400138170af2d6575b5bb"
 REPOSITORY = "https://github.com/GPUOpen-Effects/FEMFX.git"
 SCHEMA = "fracture-world.femfx.v1"
+OBSERVATION_SCHEMA = "fracture-world.femfx-observation.v1"
+OBSERVATION_VECTOR_FIELDS = ("pre_contact_velocities", "applied_delta_velocities", "stabilization_delta_positions")
+OBSERVATION_CORNER_FIELDS = ("contact_observed", "constraint_solve_active")
+OBSERVATION_TET_FIELDS = ("fracture_stress_eigenvalues", "fracture_stress_thresholds", "fracture_stress_observed")
+OBSERVATION_FIELDS = (*OBSERVATION_VECTOR_FIELDS, *OBSERVATION_CORNER_FIELDS, *OBSERVATION_TET_FIELDS)
+SOLVER_OBSERVATION_SCHEMA = "fracture-world.femfx-mpcg-observation.v1"
+SOLVER_VECTOR_FIELDS = ("mpcg_solution", "mpcg_rhs", "mpcg_residual")
+SOLVER_CORNER_FIELDS = ("mpcg_observed", "mpcg_kinematic", "mpcg_masses")
+SOLVER_TET_FIELDS = ("mpcg_recursive_norm_squared", "mpcg_true_norm_squared", "mpcg_rhs_norm_squared",
+                     "mpcg_tolerance_squared", "mpcg_epsilon", "mpcg_iterations", "mpcg_max_iterations",
+                     "mpcg_rhs_positive", "mpcg_stopping_observed")
+SOLVER_BOOLEAN_FIELDS = ("mpcg_observed", "mpcg_kinematic", "mpcg_rhs_positive", "mpcg_stopping_observed")
+SOLVER_OBSERVATION_FIELDS = (*SOLVER_VECTOR_FIELDS, *SOLVER_CORNER_FIELDS, *SOLVER_TET_FIELDS)
+ELASTIC_STATE_SCHEMA = "fracture-world.femfx-elastic-state.v1"
+ELASTIC_STATE_FIELDS = ("cached_tet_rotations", "cached_tet_centers_of_mass", "mesh_tet_ids")
 
 
 def native_directory():
@@ -75,6 +90,10 @@ def build_native(source_dir=None, build_dir=None, jobs=None):
     if len(modules) != 1:
         raise RuntimeError("native build did not produce exactly one FEMFX Python module")
     module = modules[0]
+    observation = json.loads((build_dir / "observed-source" / "manifest.json").read_text(encoding="utf-8"))
+    if (observation.get("schema") != OBSERVATION_SCHEMA or
+            observation.get("solver_observation_schema") != SOLVER_OBSERVATION_SCHEMA):
+        raise RuntimeError("native build is missing its observation instrumentation manifest")
     manifest = {
         "schema": SCHEMA,
         "repository": REPOSITORY,
@@ -84,11 +103,85 @@ def build_native(source_dir=None, build_dir=None, jobs=None):
         "module": module.relative_to(build_dir).as_posix(),
         "python": sys.version,
         "platform": sys.platform,
-        "reference_source_modified": False,
+        "reference_source_modified": True,
+        "upstream_checkout_modified": False,
+        "compiled_source_instrumented": True,
+        "physics_arithmetic_modified": False,
+        "observation": observation,
     }
     write_json(build_dir / "manifest.json", manifest)
     shutil.copyfile(source_dir / "LICENSE.txt", build_dir / "FEMFX-LICENSE.txt")
     return manifest
+
+
+def _observation_arrays(state, tetrahedra, required=False):
+    present = set(state).intersection(OBSERVATION_FIELDS)
+    if not present and not required:
+        return {}
+    if present != set(OBSERVATION_FIELDS):
+        raise RuntimeError("native observations require the complete capture fields")
+    arrays = {}
+    for name in OBSERVATION_FIELDS:
+        values = np.asarray(state[name])
+        expected = (tetrahedra, 4, 3) if name in OBSERVATION_VECTOR_FIELDS else (tetrahedra, 4) if name in OBSERVATION_CORNER_FIELDS else (tetrahedra,)
+        boolean = name in OBSERVATION_CORNER_FIELDS or name == "fracture_stress_observed"
+        valid_type = values.dtype == np.dtype(bool) if boolean else np.issubdtype(values.dtype, np.floating)
+        if values.shape != expected or not valid_type or not np.isfinite(values).all():
+            raise RuntimeError(f"native observation {name} has invalid dimensions, values or mask type")
+        arrays[name] = np.array(values, copy=True)
+    observed = arrays["fracture_stress_observed"]
+    if (arrays["fracture_stress_eigenvalues"][observed] < 0).any() or (arrays["fracture_stress_thresholds"][observed] <= 0).any():
+        raise RuntimeError("observed native fracture stresses require nonnegative eigenvalues and positive thresholds")
+    if (arrays["constraint_solve_active"] & ~arrays["contact_observed"]).any():
+        raise RuntimeError("active native constraint solves require observed applied corrections")
+    if state.get("step") == 0 and (arrays["contact_observed"].any() or observed.any()):
+        raise RuntimeError("initial native state cannot claim a preceding observed update")
+    return arrays
+
+
+def _solver_observation_arrays(state, tetrahedra, required=False, *, frames=None):
+    present = set(state).intersection(SOLVER_OBSERVATION_FIELDS)
+    if not present and not required:
+        return {}
+    if present != set(SOLVER_OBSERVATION_FIELDS):
+        raise RuntimeError("native solver observations require the complete capture fields")
+    prefix = () if frames is None else (frames,)
+    arrays = {}
+    for name in SOLVER_OBSERVATION_FIELDS:
+        shape = (*prefix, tetrahedra, 4, 3) if name in SOLVER_VECTOR_FIELDS else (
+            (*prefix, tetrahedra, 4) if name in SOLVER_CORNER_FIELDS else (*prefix, tetrahedra))
+        values = np.asarray(state[name])
+        valid_type = values.dtype == np.dtype(bool) if name in SOLVER_BOOLEAN_FIELDS else np.issubdtype(values.dtype, np.floating)
+        if values.shape != shape or not valid_type or not np.isfinite(values).all():
+            raise RuntimeError(f"native solver observation {name} has invalid dimensions, values or mask type")
+        arrays[name] = np.array(values, copy=True)
+    observed = arrays["mpcg_observed"]
+    stopping = arrays["mpcg_stopping_observed"]
+    if (arrays["mpcg_masses"][observed] <= 0).any() or (arrays["mpcg_kinematic"] & ~observed).any():
+        raise RuntimeError("native solver observations require positive observed masses and available kinematic flags")
+    if np.any(stopping & ~observed.all(axis=-1)) or np.any(arrays["mpcg_rhs_positive"] & ~stopping):
+        raise RuntimeError("native solver stopping observations require complete observed tetrahedron corners")
+    for name in ("mpcg_recursive_norm_squared", "mpcg_true_norm_squared", "mpcg_rhs_norm_squared", "mpcg_tolerance_squared"):
+        if (arrays[name][stopping] < 0).any():
+            raise RuntimeError("native solver squared norms must be nonnegative where observed")
+    epsilon, iterations, maximum = (arrays[name][stopping] for name in ("mpcg_epsilon", "mpcg_iterations", "mpcg_max_iterations"))
+    if ((epsilon <= 0).any() or (maximum < 1).any() or (iterations < 0).any() or (iterations > maximum).any()
+            or np.any(iterations != np.floor(iterations)) or np.any(maximum != np.floor(maximum))):
+        raise RuntimeError("native solver observations contain invalid stopping settings or iteration counts")
+    if np.any(arrays["mpcg_rhs_positive"][stopping] != (arrays["mpcg_rhs_norm_squared"][stopping] > 0)):
+        raise RuntimeError("native solver RHS availability disagrees with its observed squared norm")
+    if np.any(stopping & ~arrays["mpcg_rhs_positive"] & (arrays["mpcg_iterations"] != 0)):
+        raise RuntimeError("native solver zero-RHS early return cannot perform iterations")
+    for name, values in arrays.items():
+        if name in SOLVER_BOOLEAN_FIELDS or name in {"mpcg_iterations", "mpcg_max_iterations"}:
+            continue
+        mask = observed if name in (*SOLVER_VECTOR_FIELDS, "mpcg_masses") else stopping
+        selected = values[mask]
+        if not np.array_equal(selected, selected.astype(np.float32).astype(values.dtype)):
+            raise RuntimeError("native solver observations must retain captured float32 arithmetic exactly")
+    if state.get("step") == 0 and (observed.any() or stopping.any()):
+        raise RuntimeError("initial native state cannot claim a preceding observed solver update")
+    return arrays
 
 
 def load_native(build_dir=None):
@@ -281,6 +374,14 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("numerical dataset output must be empty; use a new directory")
     native, build = load_native(build_dir)
+    capabilities = native.capabilities()
+    capture_observations = capabilities.get("constraint_delta_observation", False)
+    if capture_observations and capabilities.get("observation_schema") != OBSERVATION_SCHEMA:
+        raise RuntimeError("native observation capability has an unsupported schema")
+    capture_solver = capabilities.get("elastic_solver_observation", False)
+    if capture_solver and (not capture_observations or capabilities.get("solver_observation_schema") != SOLVER_OBSERVATION_SCHEMA):
+        raise RuntimeError("native solver observation capability has an unsupported schema or missing update observations")
+    capture_elastic_state = capabilities.get("current_elastic_state", False)
     context = {
         "mesh_si_fingerprint": _mesh_digest(mesh),
         "material": material,
@@ -304,13 +405,15 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
         "schema": SCHEMA, "specification": specification, "build": build,
         "source_mesh_sha256": file_hash(mesh_path), "metres_per_source_unit": length_scale,
         "conditioning_context": context, "conditioning_context_sha256": context_hash,
-        "capabilities": native.capabilities(),
+        "capabilities": capabilities,
     })
     results, rejected = [], []
     nodal_fields = ["nodal_rest_positions", "nodal_positions", "nodal_velocities", "nodal_masses",
                     "nodal_kinematic", "nodal_flags", "nodal_original_ids", "nodal_piece_ids"]
     recorded_fields = ["time", "corner_positions", "corner_velocities", "corner_kinematic", "tet_piece_ids", "warnings",
                        "corner_vertex_ids", *nodal_fields]
+    if capture_elastic_state:
+        recorded_fields.extend(ELASTIC_STATE_FIELDS)
     for case in specification["cases"]:
         velocities, kinematic, impacts = initial_conditions(mesh, material, fixed, case)
         scene_arguments = (mesh.nodes, mesh.tets, material, velocities, kinematic,
@@ -323,15 +426,25 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
             else:
                 scene = native.Scene(*scene_arguments)
             initial = scene.state()
+            observations = _observation_arrays(initial, len(mesh.tets), capture_observations)
+            solver_observations = _solver_observation_arrays(initial, len(mesh.tets), capture_solver)
+            observation_fields = (*observations, *solver_observations)
+            if observation_fields and not capture_observations:
+                raise RuntimeError("native observations require an advertised instrumented capture capability")
+            initial.update(observations)
+            initial.update(solver_observations)
+            case_recorded_fields = [*recorded_fields, *observation_fields]
             order = native_face_order(mesh, initial)
             previous = np.zeros(len(mesh.internal_faces), dtype=np.int8)
-            states = [{key: initial[key] for key in recorded_fields}]
+            states = [{key: initial[key] for key in case_recorded_fields}]
             recorded_steps = [0]
             previous_support = np.asarray(initial["corner_kinematic"], dtype=bool)
             cuts = validate_state(mesh, initial, previous, order)
             cut_history = [cuts]
             for step in range(specification["steps"]):
                 state = scene.step()
+                state.update(_observation_arrays(state, len(mesh.tets), capture_observations))
+                state.update(_solver_observation_arrays(state, len(mesh.tets), capture_solver))
                 previous_cuts = cuts
                 cuts = validate_state(mesh, state, previous_cuts, order)
                 current_support = np.asarray(state["corner_kinematic"], dtype=bool)
@@ -339,7 +452,7 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
                     raise RuntimeError("native support flags have invalid dimensions or activate a new prescribed support")
                 support_changed = not np.array_equal(current_support, previous_support)
                 if (step + 1) % specification.get("record_stride", 1) == 0 or step + 1 == specification["steps"] or not np.array_equal(cuts, previous_cuts) or support_changed:
-                    states.append({key: state[key] for key in recorded_fields})
+                    states.append({key: state[key] for key in case_recorded_fields})
                     cut_history.append(cuts)
                     recorded_steps.append(step + 1)
                 previous_support = current_support.copy()
@@ -354,8 +467,12 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
                 "density_kg_per_m3": material["rest_density"],
                 "parameter_status": specification["parameter_status"],
                 "calibration_source": specification.get("calibration_source"),
-                "case": case, "reference_build": build, "native_capabilities": native.capabilities(),
+                "case": case, "reference_build": build, "native_capabilities": capabilities,
                 "native_settings": scene.settings(),
+                "native_observation_schema": OBSERVATION_SCHEMA if observation_fields else None,
+                "native_solver_observation_schema": SOLVER_OBSERVATION_SCHEMA if solver_observations else None,
+                "native_elastic_state_schema": ELASTIC_STATE_SCHEMA if capture_elastic_state else None,
+                "native_observation_semantics": "preceding single native update only; unobserved masks remain unknown; values are read at native application sites, not inferred from endpoints" if observation_fields else "not recorded",
                 "cumulative_cut_semantics": "native_new_exterior_faces",
                 "fracture_time_semantics": "first observed after native update; event is localized only to the preceding timestep interval",
                 "physics_reference": "FEMFX numerical model; not an experimental physical ground truth",
@@ -373,6 +490,9 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
             native_topology = {f"native_{name}": np.concatenate([record[name] for record in states]) for name in nodal_fields}
             native_topology["native_node_offsets"] = np.r_[0, np.cumsum([len(record["nodal_masses"]) for record in states])]
             native_topology["native_corner_vertex_ids"] = np.stack([record["corner_vertex_ids"] for record in states])
+            if capture_elastic_state:
+                native_topology.update({f"native_{name}": np.stack([record[name] for record in states]) for name in ELASTIC_STATE_FIELDS})
+            native_observations = {f"native_{name}": np.stack([record[name] for record in states]) for name in observation_fields}
             support_history = np.stack([record["corner_kinematic"] for record in states]).astype(bool)
             releases = support_history[:-1] & ~support_history[1:]
             np.savez_compressed(trajectories / f"{case['id']}.npz",
@@ -394,7 +514,10 @@ def generate_dataset(mesh_path, specification_path, output_dir, length_scale, bu
                                     "conditioning_context_sha256": context_hash,
                                     "native_revision": REVISION,
                                     "native_topology_schema": "fracture-world.femfx-nodal-topology.v1",
-                                }, allow_nan=False), **native_topology)
+                                    "native_observation_schema": OBSERVATION_SCHEMA if observation_fields else None,
+                                    "native_solver_observation_schema": SOLVER_OBSERVATION_SCHEMA if solver_observations else None,
+                                    "native_elastic_state_schema": ELASTIC_STATE_SCHEMA if capture_elastic_state else None,
+                                }, allow_nan=False), **native_topology, **native_observations)
             if export_replay:
                 export_reference_replay(mesh, states, cut_history, metadata, output_dir / "replays" / f"{case['id']}.json")
             result = {"case": case["id"], "steps": specification["steps"], "cut_facets": int(cuts.sum()),

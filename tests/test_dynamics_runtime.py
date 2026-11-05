@@ -129,10 +129,10 @@ def test_fm_candidate_supports_reapply_unclamped_motion_after_topology_selection
             self.support_head.weight[0, 0] = 1
             self.support_head.bias.zero_()
             self.fracture_head.bias.fill_(-4 if candidate_broken else 4)
-        return self._prediction(batch, corner_context, torch.zeros(1, 12))
+        return self._prediction(batch, corner_context, torch.zeros(1, 12)), self.prepare_fracture_flow(batch)
 
-    monkeypatch.setattr(TemporalDynamicsModel, "forward", predict)
-    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise:
+    monkeypatch.setattr(TemporalDynamicsModel, "forward_with_flow_context", predict)
+    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise, *, context=None:
                         torch.full((1,), 1. if candidate_broken else -1.))
     output = tmp_path / "candidate"
     report = rollout_dynamics(checkpoint, initial, output, 1, "raw",
@@ -295,15 +295,17 @@ def test_physics_only_replay_identifies_the_unlearned_baseline(tmp_path):
 def test_nonfinite_predictions_save_failure_report_before_geometry_or_optimization(tmp_path, monkeypatch, stage, field):
     checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
     network = TemporalDynamicsModel if stage == "predictor" else NeuralDynamicsCorrector
-    original = network.forward
+    entry_point = "forward_with_flow_context" if stage == "predictor" else "forward"
+    original = getattr(network, entry_point)
 
     def corrupted(self, *args, **kwargs):
-        output = original(self, *args, **kwargs)
+        prediction = original(self, *args, **kwargs)
+        output = prediction[0] if stage == "predictor" else prediction
         source = output.get(field, output["positions"])
         output[field] = torch.full_like(source, float("nan"))
-        return output
+        return (output, prediction[1]) if stage == "predictor" else output
 
-    monkeypatch.setattr(network, "forward", corrupted)
+    monkeypatch.setattr(network, entry_point, corrupted)
     method = "consensus" if stage == "predictor" else "neural"
     directory = tmp_path / "failed"
     report = rollout_dynamics(checkpoint, initial, directory, 3, method, device="cpu")
@@ -325,20 +327,20 @@ def test_nonfinite_predictions_save_failure_report_before_geometry_or_optimizati
 @pytest.mark.parametrize("field", ["unconstrained_position_increment", "unconstrained_velocity_increment"])
 def test_nonfinite_hidden_support_motion_is_rejected_before_fm_can_restore_it(tmp_path, monkeypatch, field):
     checkpoint, initial, _, fixed = portable_rollout_inputs(tmp_path, learned_supports=True, has_corrector=False)
-    original = TemporalDynamicsModel.forward
+    original = TemporalDynamicsModel.forward_with_flow_context
 
     def corrupted(self, batch):
         with torch.no_grad():
             self.support_head.bias.fill_(-4)
-        output = original(self, batch)
+        output, context = original(self, batch)
         assert output["next_fixed"][batch["fixed"]].all()
         assert torch.isfinite(output["positions"]).all()
         assert torch.isfinite(output["velocities"]).all()
         output[field] = output[field].clone()
         output[field][torch.as_tensor(fixed), 0] = float("nan")
-        return output
+        return output, context
 
-    monkeypatch.setattr(TemporalDynamicsModel, "forward", corrupted)
+    monkeypatch.setattr(TemporalDynamicsModel, "forward_with_flow_context", corrupted)
     report = rollout_dynamics(checkpoint, initial, tmp_path / "hidden-nonfinite", 1, "raw", device="cpu")
     assert report["status"] == "nonfinite_prediction"
     assert report["completed_steps"] == 0
@@ -348,7 +350,7 @@ def test_nonfinite_hidden_support_motion_is_rejected_before_fm_can_restore_it(tm
 
 def test_nonfinite_flow_sample_is_not_silently_thresholded_into_an_unbroken_mask(tmp_path, monkeypatch):
     checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
-    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise: torch.full_like(noise, float("nan")))
+    monkeypatch.setattr(TemporalDynamicsModel, "sample_fracture", lambda self, batch, steps, noise, *, context=None: torch.full_like(noise, float("nan")))
     report = rollout_dynamics(checkpoint, initial, tmp_path / "failed-flow", 1, "raw", device="cpu")
     assert report["status"] == "nonfinite_prediction"
     assert report["completed_steps"] == 0

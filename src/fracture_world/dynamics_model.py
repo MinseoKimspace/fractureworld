@@ -474,7 +474,7 @@ class TemporalDynamicsModel(nn.Module):
         return self.flow_head(torch.cat((features, flow_values), dim=-1)).squeeze(-1).masked_fill(batch["broken"], 0)
 
     @torch.no_grad()
-    def sample_fracture(self, batch, steps=8, noise=None):
+    def sample_fracture(self, batch, steps=8, noise=None, *, context=None):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("fracture flow steps must be a positive integer")
         if noise is None:
@@ -487,7 +487,7 @@ class TemporalDynamicsModel(nn.Module):
         initial = torch.where(batch["broken"], torch.ones_like(noise), noise)
         if not len(initial):
             return initial
-        context = self.prepare_fracture_flow(batch)
+        context = self.prepare_fracture_flow(batch) if context is None else context
 
         def vector_field(time, field):
             velocity = self.fracture_velocity(batch, field, time, context=context)

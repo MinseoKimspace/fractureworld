@@ -3,7 +3,7 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy.spatial.transform import Rotation
 
-from fracture_world.dynamics_corrector import DynamicsProblem, LinearizedContact, solve_consensus
+from fracture_world.dynamics_corrector import DynamicsProblem, LinearizedContact, _shared_problem, solve_consensus
 from fracture_world.dynamics_energy import CorotationalEnergy, EnergyProjection
 from fracture_world.dynamics_energy_solvers import solve_energy
 from fracture_world.mesh import VolumeMesh
@@ -276,12 +276,23 @@ def test_energy_solver_reports_progress_without_changing_results(method):
     assert reports
     assert_allclose(monitored.positions, plain.positions, atol=0)
     assert_allclose(monitored.velocities, plain.velocities, atol=0)
-    assert all(item["event"] == "energy_corrector_progress" and item["method"] == method for item in reports)
+    assert all(item["event"] in {"energy_corrector_progress", "energy_solver_phase"} and item["method"] == method for item in reports)
     assert all(item["runtime_seconds"] >= 0 for item in reports)
-    assert all({"objective", "constraint_violation", "energy_violation", "primal_residual", "dual_residual", "rho"}.issubset(item) for item in reports)
+    assert (np.diff([item["runtime_seconds"] for item in reports]) >= 0).all()
+    iterations = [item for item in reports if item["event"] == "energy_corrector_progress"]
+    assert iterations
+    assert all({"objective", "constraint_violation", "energy_violation", "primal_residual", "dual_residual", "rho"}.issubset(item) for item in iterations)
+    phases = [item for item in reports if item["event"] == "energy_solver_phase"]
+    assert phases and phases[0]["phase"] == "coordinate_setup" and phases[0]["status"] == "completed"
+    assert phases[0]["solver_state_variables"] <= phases[0]["full_state_variables"]
+    assert phases[1]["status"] == "started"
+    assert any(item.get("phase_runtime_seconds", -1) >= 0 for item in phases)
     if method == "consensus":
-        assert reports[0]["iteration"] == 1
-        assert all(item["iteration"] % 25 == 0 for item in reports[1:])
+        assert iterations[0]["iteration"] == 1
+        assert all(item["iteration"] % 25 == 0 for item in iterations[1:])
+        projection_phases = [item for item in phases if item["phase"] == "energy_projection"]
+        assert projection_phases[0]["status"] == "started"
+        assert any(item["status"] != "started" for item in projection_phases)
 
 
 def test_energy_acceptance_is_invariant_to_large_gravitational_origin_shift():
@@ -391,3 +402,147 @@ def test_active_energy_has_no_extra_iteration_after_linear_budget_is_exhausted()
     assert result.iterations == relaxation.iterations
     assert result.diagnostics["energy"]["energy_proximal_calls"] == 0
     assert result.diagnostics["energy"]["phases"][1]["iterations"] == 0
+
+
+def shared_energy_fixture(gravity=(0., 0., 0.)):
+    mesh = VolumeMesh(np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0., 0., -1.]]),
+                      np.array([[0, 1, 2, 3], [0, 2, 1, 4]]))
+    positions = mesh.nodes[mesh.tets]
+    velocities = np.zeros_like(positions)
+    energy = CorotationalEnergy(mesh, 2., 100., .25, np.asarray(gravity))
+    source = DynamicsProblem(mesh, positions, velocities, positions.copy(), velocities.copy(), .01,
+                             density=energy.density, position_scale=.2, velocity_scale=1.7)
+    problem = _shared_problem(source)
+    return source, problem, EnergyProjection(problem, energy, energy.value(positions, velocities))
+
+
+def test_shared_coordinate_energy_gradient_and_hessian_match_finite_differences():
+    source, problem, projection = shared_energy_fixture((.2, -9.81, .4))
+    assert len(problem.prior) < len(source.prior)
+    rng = np.random.default_rng(43)
+    state = problem.prior + rng.normal(0., .02, len(problem.prior))
+    numerical = np.empty_like(state)
+    for index in range(len(state)):
+        above, below = state.copy(), state.copy()
+        above[index] += 1e-6
+        below[index] -= 1e-6
+        numerical[index] = (projection.state_value(above) - projection.state_value(below)) / 2e-6
+    assert_allclose(projection.state_gradient(state), numerical, atol=1e-7, rtol=3e-6)
+    direction = rng.normal(size=state.shape)
+    actual = projection.state_hessian_vector(state, direction)
+    expected = (projection.state_gradient(state + 1e-6 * direction)
+                - projection.state_gradient(state - 1e-6 * direction)) / 2e-6
+    assert_allclose(actual, expected, atol=2e-6, rtol=3e-6)
+
+
+def test_zero_energy_projection_preserves_shared_corners_and_piece_rigidity():
+    source, problem, projection = shared_energy_fixture()
+    state = problem.prior + np.random.default_rng(47).normal(0., .15, len(problem.prior))
+    result = projection.project(state)
+    assert result.converged, result.diagnostics
+    assert result.status == "exact_zero_energy_projection"
+    positions, velocities = problem.unpack(result.state)
+    assert_allclose(velocities, 0., atol=0.)
+    flat = positions.reshape(-1, 3)
+    for first, second in source.mesh.corner_face_pairs.reshape(-1, 2):
+        assert np.array_equal(flat[first], flat[second])
+    unique = flat[problem.representatives]
+    rest = source.mesh.nodes[source.mesh.tets].reshape(-1, 3)[problem.representatives]
+    assert_allclose(np.linalg.norm(unique[:, None] - unique[None], axis=-1),
+                    np.linalg.norm(rest[:, None] - rest[None], axis=-1), atol=1e-12)
+    assert result.diagnostics["energy_satisfied"]
+    assert result.diagnostics["global_projection_verified"]
+
+
+@pytest.mark.parametrize("method", ["central", "consensus"])
+def test_shared_prior_certificate_keeps_irreducible_prediction_cost(method):
+    source, _, projection = shared_energy_fixture()
+    predicted_positions = source.positions.copy().reshape(-1, 3)
+    predicted_velocities = source.velocities.copy().reshape(-1, 3)
+    predicted_positions[[0, 4], 0] += [.01, -.01]
+    predicted_velocities[[0, 4], 0] += [.1, -.1]
+    problem = DynamicsProblem(source.mesh, source.positions, source.velocities,
+                              predicted_positions.reshape(source.positions.shape),
+                              predicted_velocities.reshape(source.velocities.shape), source.dt,
+                              density=source.density, position_scale=source.position_scale,
+                              velocity_scale=source.velocity_scale)
+    constraint = EnergyProjection(problem, projection.energy, 0.)
+    result = solve_energy(problem, constraint, method)
+    assert result.converged, (result.status, result.diagnostics)
+    assert result.objective > 0.
+    assert_allclose(result.objective, problem.objective(problem.encode_state(result.positions, result.velocities)), atol=1e-15)
+    assert result.diagnostics["energy"]["coordinate_minimum_certificate"]
+    assert not result.diagnostics["energy"]["zero_objective_certificate"]
+    assert result.diagnostics["energy"]["coordinate_reduction_seconds"] >= 0.
+
+
+@pytest.mark.parametrize("method", ["central", "consensus"])
+def test_active_energy_solver_uses_shared_state_and_preserves_original_constraints(method):
+    source, _, projection = shared_energy_fixture()
+    center = source.positions.mean(axis=(0, 1), keepdims=True)
+    velocity = .2 * (source.positions - center) + [.1, 0., 0.]
+    problem = DynamicsProblem(source.mesh, source.positions, source.velocities,
+                              source.positions + source.dt * velocity, velocity, source.dt,
+                              density=source.density, position_scale=source.position_scale,
+                              velocity_scale=source.velocity_scale)
+    constraint = EnergyProjection(problem, projection.energy, 0.)
+    result = solve_energy(problem, constraint, method)
+    assert result.converged, (result.status, result.diagnostics)
+    assert result.diagnostics["constraints_satisfied"]
+    assert result.diagnostics["energy"]["energy_satisfied"]
+    flat = result.positions.reshape(-1, 3)
+    for first, second in problem.mesh.corner_face_pairs.reshape(-1, 2):
+        assert np.array_equal(flat[first], flat[second])
+    assert result.diagnostics["shared_coordinates"]["solver_state_variables"] < len(problem.prior)
+    if method == "consensus":
+        assert result.diagnostics["energy"]["energy_proximal_calls"] > 0
+        assert result.diagnostics["energy"]["energy_projection_seconds"] > 0.
+
+
+@pytest.mark.parametrize("coordinates", ["full", "shared"])
+def test_positive_budget_velocity_elimination_matches_full_lagrangian_minimization(coordinates, monkeypatch):
+    from scipy.optimize import minimize
+
+    source, shared, _ = shared_energy_fixture()
+    problem = source if coordinates == "full" else shared
+    energy = CorotationalEnergy(source.mesh, 4.3, 100., .25, np.array([0., -.2, 0.]))
+    projection = EnergyProjection(problem, energy, .03, energy_scale=.5)
+    state = problem.prior + np.random.default_rng(83).normal(0., .03, len(problem.prior))
+    cut = len(state) // 2
+    state[cut:] += .6
+    optimized_dimensions = []
+
+    def recorded_minimize(function, initial, *args, **kwargs):
+        optimized_dimensions.append(len(initial))
+        return minimize(function, initial, *args, **kwargs)
+
+    monkeypatch.setattr("fracture_world.dynamics_energy.minimize", recorded_minimize)
+    result = projection.project(state)
+    assert result.converged, result.diagnostics
+    assert optimized_dimensions and set(optimized_dimensions) == {cut}
+    assert result.diagnostics["nonlinear_optimization_variables"] == cut
+    assert result.diagnostics["analytically_eliminated_velocity_variables"] == cut
+    assert result.diagnostics["proximal_state_variables"] == len(state)
+    multiplier = result.diagnostics["multiplier"]
+    masses = (energy.masses.ravel() if coordinates == "full" else
+              np.bincount(problem.groups, weights=energy.masses.ravel()))
+    curvature = np.repeat(masses, 3) * problem.velocity_scale**2 / projection.energy_scale
+    assert_allclose(result.state[cut:], state[cut:] / (1 + multiplier * curvature), atol=1e-14)
+
+    def full_objective(value):
+        difference = value - state
+        return (.5 * float(difference @ difference) + multiplier * projection.state_value(value),
+                difference + multiplier * projection.state_gradient(value))
+
+    reference = minimize(full_objective, state, method="L-BFGS-B", jac=True,
+                         options={"gtol": 1e-12, "ftol": 0.})
+    reference = minimize(full_objective, reference.x, method="Newton-CG", jac=True,
+                         hessp=lambda value, direction: direction + multiplier * projection.state_hessian_vector(value, direction),
+                         options={"xtol": 1e-12})
+    assert_allclose(result.state, reference.x, atol=2e-9, rtol=2e-8)
+    assert_allclose(full_objective(result.state)[0], full_objective(reference.x)[0], atol=1e-12)
+    stationarity = np.max(np.abs(full_objective(result.state)[1]))
+    threshold = projection.stationarity_tolerance * max(float(np.max(np.abs(result.state))), 1.)
+    assert stationarity <= threshold
+    assert result.diagnostics["stationarity_residual"] <= threshold
+    assert result.diagnostics["energy_satisfied"]

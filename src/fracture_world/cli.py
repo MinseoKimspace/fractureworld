@@ -105,6 +105,22 @@ def parser():
     benchmark.add_argument("--device", default="auto")
     benchmark.add_argument("--split", choices=["validation", "test"], default="test")
     benchmark.add_argument("--methods", nargs="+", choices=["physics", "raw", "neural", "central", "consensus"])
+    teacher = commands.add_parser("dynamics-teacher-audit", help="Check recorded teacher states against correction constraints and pinned mechanics")
+    teacher.add_argument("--data", type=Path, required=True)
+    normalization = teacher.add_mutually_exclusive_group(required=True)
+    normalization.add_argument("--checkpoint", type=Path)
+    normalization.add_argument("--velocity-scale", type=float)
+    teacher.add_argument("--specification", type=Path)
+    teacher.add_argument("--device", default="cpu")
+    teacher.add_argument("--output", type=Path, required=True)
+    matched = commands.add_parser("dynamics-matched", help="Compare raw, central and consensus on frozen identical one-step inputs")
+    matched.add_argument("--checkpoint", type=Path, required=True)
+    matched.add_argument("--data", type=Path, required=True)
+    matched.add_argument("--output", type=Path, required=True)
+    matched.add_argument("--specification", type=Path)
+    matched.add_argument("--device", default="auto")
+    matched.add_argument("--split", choices=["validation", "test"], default="test")
+    matched.add_argument("--frames", nargs="+", type=int)
     return root
 
 
@@ -189,6 +205,8 @@ def run(args):
             output({"status": report["status"], "all_rollouts_completed": report["all_rollouts_completed"],
                     "engine_calls": 0, "report": str((args.output / "comparison.json").resolve()),
                     "central_consensus_agreement": report["central_consensus_agreement"]})
+        if report["status"] == "interrupted":
+            raise SystemExit(130)
     elif args.command == "dynamics-evaluate":
         from .dynamics_evaluation import evaluate_dynamics
 
@@ -200,8 +218,32 @@ def run(args):
         progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
         report = benchmark_dynamics(args.checkpoint, args.data, args.output, args.steps,
                                     load_rollout_config(args.specification), args.device, args.methods, args.split, progress)
-        output(dict(report=str((args.output / "benchmark.json").resolve()), cases=len(report["cases"]),
+        output(dict(status=report["status"], report=str((args.output / "benchmark.json").resolve()), cases=len(report["cases"]),
+                    requested_cases=report["requested_cases"], attempted_cases=report["attempted_cases"],
+                    unattempted_cases=report["unattempted_cases"],
                     all_rollouts_completed=report["all_rollouts_completed"], conditions=report["conditions"]))
+        if report["status"] == "interrupted":
+            raise SystemExit(130)
+    elif args.command == "dynamics-teacher-audit":
+        from .dynamics_runtime import load_rollout_config
+        from .dynamics_teacher_audit import inspect_teacher_constraints
+
+        progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
+        report = inspect_teacher_constraints(args.data, args.checkpoint, load_rollout_config(args.specification),
+                                             args.device, args.output, progress, velocity_scale=args.velocity_scale)
+        output(dict(status=report["status"], constraint_status=report["constraint_status"],
+                    report=str(args.output.resolve()), totals=report["totals"]))
+    elif args.command == "dynamics-matched":
+        from .dynamics_matched import compare_matched_dynamics
+        from .dynamics_runtime import load_rollout_config
+
+        progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
+        report = compare_matched_dynamics(args.checkpoint, args.data, args.output, load_rollout_config(args.specification),
+                                          args.device, split=args.split, frames=args.frames, progress=progress)
+        output(dict(status=report["status"], report=str((args.output / "matched.json").resolve()),
+                    conditions=report["conditions"]))
+        if report["status"] == "interrupted":
+            raise SystemExit(130)
 
 
 

@@ -2,8 +2,11 @@ import numpy as np
 import pytest
 from scipy.optimize import linprog
 from scipy.spatial import ConvexHull
+from scipy.spatial.transform import Rotation
 
 from fracture_world.dynamics_geometry import (
+    _minimum_swept_determinant,
+    _moving_face_sweep_is_separated,
     boundary_triangles,
     corner_groups,
     face_corner_pairs,
@@ -233,3 +236,119 @@ def test_sweep_rejects_interior_inversion_with_positive_endpoint_volumes():
     assert not result["valid"]
     assert result["degenerate_or_inverted_swept_tetrahedra"] == [0]
     assert result["minimum_normalized_swept_determinant"] < 0
+
+
+def incident_fan_nodes(amount):
+    angles = np.deg2rad(np.array([0., 90., 180., 270.]) + amount * np.array([0., 60., 120., 180.]))
+    return np.vstack(([0., 0., 0.], [0., 0., 1.],
+                      np.column_stack((np.cos(angles), np.sin(angles), np.zeros(4)))))
+
+
+def incident_fan():
+    return VolumeMesh(incident_fan_nodes(0.), [[0, 1, 2, 3], [0, 1, 3, 4], [0, 1, 4, 5]])
+
+
+def test_incident_shared_edge_is_allowed_without_volume_overlap():
+    mesh = incident_fan()
+    current = mesh.nodes[mesh.tets]
+    broken = np.zeros(len(mesh.internal_faces), dtype=bool)
+    proposed = current + [.2, -.1, .3]
+    endpoint = geometry_diagnostics(mesh, proposed, broken, 1e-8)
+    assert endpoint["valid"]
+    assert endpoint["overlapping_tetrahedron_pairs"] == 0
+    assert endpoint["overlapping_incident_tetrahedron_pairs"] == 0
+    assert swept_geometry_diagnostics(mesh, current, proposed, broken, 1e-8)["valid"]
+    assert not linearized_contacts(mesh, current, proposed, broken, 1e-8)
+
+
+def test_incident_fan_fold_is_rejected_without_inversion_or_corner_mismatch():
+    mesh = incident_fan()
+    broken = np.zeros(len(mesh.internal_faces), dtype=bool)
+    positions = incident_fan_nodes(1.)[mesh.tets]
+    assert tetrahedron_separation(positions[0], positions[2])[0] < -.6
+    endpoint = geometry_diagnostics(mesh, positions, broken, 1e-8)
+    assert endpoint["inverted_tetrahedra"] == 0
+    assert endpoint["intact_face_position_mismatch_metres"] == 0
+    assert endpoint["overlapping_nonincident_tetrahedron_pairs"] == 0
+    assert endpoint["overlapping_incident_tetrahedron_pairs"] == 1
+    assert endpoint["overlapping_tetrahedron_pairs"] == 1
+    assert not endpoint["valid"]
+    swept = swept_geometry_diagnostics(mesh, positions, positions, broken, 1e-8)
+    assert not swept["valid"]
+    assert [0, 2] in swept["continuous_collision_unresolved_pairs"]
+    contacts = linearized_contacts(mesh, mesh.nodes[mesh.tets], positions, broken, 1e-8)
+    assert contacts
+    assert all(set(contact.corner_ids // 4) == {0, 2} for contact in contacts)
+
+
+def test_small_incident_fan_steps_cannot_accumulate_undetected_volume_overlap():
+    mesh = incident_fan()
+    broken = np.zeros(len(mesh.internal_faces), dtype=bool)
+    previous = mesh.nodes[mesh.tets]
+    overlap_steps = 0
+    for amount in np.linspace(0., 1., 26)[1:]:
+        proposed = incident_fan_nodes(amount)[mesh.tets]
+        endpoint = geometry_diagnostics(mesh, proposed, broken, 1e-8)
+        swept = swept_geometry_diagnostics(mesh, previous, proposed, broken, 1e-8)
+        assert endpoint["inverted_tetrahedra"] == 0
+        assert endpoint["intact_face_position_mismatch_metres"] == 0
+        assert not swept["degenerate_or_inverted_swept_tetrahedra"]
+        if tetrahedron_separation(proposed[0], proposed[2])[0] < -1e-8:
+            overlap_steps += 1
+            assert not endpoint["valid"]
+            assert not swept["valid"]
+        previous = proposed
+    assert overlap_steps > 0
+
+
+def test_exact_shared_face_rotation_uses_a_moving_face_certificate():
+    mesh = paired_tetrahedra()
+    current = mesh.nodes[mesh.tets]
+    rotation = Rotation.from_rotvec([.2, -.3, .1]).as_matrix()
+    proposed = current @ rotation.T + [.1, .2, -.1]
+    result = swept_geometry_diagnostics(mesh, current, proposed, np.array([False]), 1e-8)
+    assert result["valid"]
+    assert result["shared_face_sweep_certificates"] == 1
+    assert result["certified_nonpenetrating_pairs"] == 1
+
+
+def test_incident_fan_rotation_certifies_separation_with_moving_faces():
+    mesh = incident_fan()
+    current = mesh.nodes[mesh.tets]
+    rotation = Rotation.from_rotvec([.2, -.3, .1]).as_matrix()
+    proposed = current @ rotation.T + [.1, .2, -.1]
+    broken = np.zeros(len(mesh.internal_faces), dtype=bool)
+    assert geometry_diagnostics(mesh, proposed, broken, 1e-8)["valid"]
+    result = swept_geometry_diagnostics(mesh, current, proposed, broken, 1e-8)
+    assert result["valid"]
+    assert result["shared_face_sweep_certificates"] == 2
+    assert result["moving_face_sweep_certificates"] == 1
+    assert result["certified_nonpenetrating_pairs"] == 3
+
+
+def test_shared_face_certificate_does_not_hide_mismatched_corner_overlap():
+    mesh = paired_tetrahedra()
+    current = mesh.nodes[mesh.tets]
+    proposed = current.copy()
+    proposed[1] -= .1 * mesh.faces.normals[mesh.internal_faces[0]]
+    result = swept_geometry_diagnostics(mesh, current, proposed, np.array([False]), 1e-8)
+    assert result["shared_face_sweep_certificates"] == 0
+    assert not result["valid"]
+
+
+def test_moving_face_certificate_rejects_interior_collision_with_valid_endpoints():
+    def tetrahedron(degrees):
+        angles = np.deg2rad(degrees)
+        return np.vstack(([0., 0., 0.], [0., 0., 1.],
+                          np.column_stack((np.cos(angles), np.sin(angles), np.zeros(2)))))
+
+    first, second = tetrahedron([0., 60.]), tetrahedron([180., 240.])
+    angle = np.deg2rad(170.)
+    next_first = first @ Rotation.from_rotvec([0., 0., angle]).as_matrix().T
+    next_second = second @ Rotation.from_rotvec([0., 0., -angle]).as_matrix().T
+    assert tetrahedron_separation(first, second)[0] >= 0
+    assert tetrahedron_separation(next_first, next_second)[0] >= 0
+    assert _minimum_swept_determinant(first, next_first) > 0
+    assert _minimum_swept_determinant(second, next_second) > 0
+    assert tetrahedron_separation((first + next_first) / 2, (second + next_second) / 2)[0] < -.06
+    assert not _moving_face_sweep_is_separated(first, second, next_first, next_second)

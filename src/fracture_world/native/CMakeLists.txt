@@ -14,13 +14,35 @@ endif()
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
+set(FEMFX_OBSERVATION_DIR "${CMAKE_CURRENT_BINARY_DIR}/observed-source")
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/observe_sources.py"
+        --source "${FEMFX_ROOT}" --output "${FEMFX_OBSERVATION_DIR}"
+    RESULT_VARIABLE FEMFX_OBSERVATION_RESULT
+)
+if(NOT FEMFX_OBSERVATION_RESULT EQUAL 0)
+    message(FATAL_ERROR "Pinned observation-only source overlay could not be generated")
+endif()
+
 file(GLOB_RECURSE FEMFX_SOURCES CONFIGURE_DEPENDS "${FEMFX_ROOT}/amd_femfx/src/*.cpp")
+list(REMOVE_ITEM FEMFX_SOURCES
+    "${FEMFX_ROOT}/amd_femfx/src/ConstraintSolver/FEMFXConstraintSolver.cpp"
+    "${FEMFX_ROOT}/amd_femfx/src/Simulation/FEMFXUpdateTetState.cpp"
+    "${FEMFX_ROOT}/amd_femfx/src/Simulation/FEMFXSimulate.cpp"
+)
+list(APPEND FEMFX_SOURCES
+    "${FEMFX_OBSERVATION_DIR}/ConstraintSolver/FEMFXConstraintSolver.cpp"
+    "${FEMFX_OBSERVATION_DIR}/Simulation/FEMFXUpdateTetState.cpp"
+    "${FEMFX_OBSERVATION_DIR}/Simulation/FEMFXSimulate.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fracture_world_observer.cpp"
+)
 add_library(femfx STATIC ${FEMFX_SOURCES})
 target_compile_features(femfx PUBLIC cxx_std_17)
 target_compile_definitions(femfx PUBLIC WIN32 NOMINMAX)
 target_compile_options(femfx PUBLIC /permissive /Zc:twoPhase-)
 target_compile_options(femfx PRIVATE /W3 /wd4324 /wd4244 /wd4267)
 target_include_directories(femfx PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${FEMFX_ROOT}/amd_femfx/inc"
     "${FEMFX_ROOT}/amd_femfx/inc/Vectormath"
     "${FEMFX_ROOT}/amd_femfx/src/Bvh"

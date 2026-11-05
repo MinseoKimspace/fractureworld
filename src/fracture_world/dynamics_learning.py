@@ -54,6 +54,19 @@ def _restore_random_state(state):
         torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
 
 
+def _same_training_sources(recorded, current):
+    if not isinstance(recorded, dict) or recorded.keys() != current.keys():
+        return False
+    for case_id, metadata in current.items():
+        previous = recorded[case_id]
+        expected = dict(metadata)
+        if isinstance(previous, dict) and "native_settings" not in previous:
+            expected.pop("native_settings", None)
+        if previous != expected:
+            return False
+    return True
+
+
 def _validation_generator(case_id, frame, seed, device):
     digest = hashlib.sha256(f"{seed}:{case_id}:{frame}".encode()).digest()
     return torch.Generator(device=device).manual_seed(int.from_bytes(digest[:8], "little") % (2**63 - 1))
@@ -325,9 +338,9 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
     provenance = {item.case_id: item.metadata for item in trajectories}
     if resumed is not None:
         matching = {"model_config": model_config, "splits": manifest, "condition_splits": conditions,
-                    "source": provenance,
                     "class_weights": dict(fracture_positive=fracture_positive_weight, support_release_positive=support_positive_weight)}
-        if any(resumed.get(key) != value for key, value in matching.items()):
+        if (any(resumed.get(key) != value for key, value in matching.items()) or
+                not _same_training_sources(resumed.get("source"), provenance)):
             raise ValueError("resume checkpoint does not match the dataset, model normalization or supervision")
     directory = Path(output_dir).resolve()
     if resumed is None or directory != Path(resume).resolve().parent:

@@ -8,6 +8,14 @@ from scipy.sparse.linalg import LinearOperator, cg
 from .mesh import VolumeMesh
 
 
+def native_corotational_energy(mesh, density, youngs_modulus, poissons_ratio, gravity):
+    reference = VolumeMesh(mesh.nodes.astype(np.float32).astype(float), mesh.tets)
+    if not np.array_equal(reference.tets, mesh.tets):
+        raise ValueError("native rest precision changes material tetrahedron orientation")
+    values = [float(np.float32(value)) for value in (density, youngs_modulus, poissons_ratio)]
+    return CorotationalEnergy(reference, *values, np.asarray(gravity, dtype=np.float32).astype(float))
+
+
 @dataclass
 class CorotationalEnergy:
     mesh: VolumeMesh
@@ -163,7 +171,8 @@ class EnergyProjection:
         values = [self.budget, self.absolute_tolerance, self.relative_tolerance, self.stationarity_tolerance]
         if not np.isfinite(values).all() or min(self.absolute_tolerance, self.stationarity_tolerance) <= 0 or self.relative_tolerance < 0:
             raise ValueError("energy budget and tolerances must be finite and tolerances positive")
-        self.reference_components = self.energy.components(self.problem.positions, self.problem.velocities)
+        initial_components = getattr(self.energy, "initial_components", self.energy.components)
+        self.reference_components = initial_components(self.problem.positions, self.problem.velocities)
         if self.energy_scale is None:
             self.energy_scale = max(self.reference_components["elastic"] + self.reference_components["kinetic"],
                                     float(self.energy.masses.sum() * self.problem.velocity_scale**2), np.finfo(float).tiny)
@@ -184,22 +193,20 @@ class EnergyProjection:
     def state_gradient(self, state):
         positions, velocities = self.problem.unpack(state)
         position_gradient, velocity_gradient = self.energy.gradient(positions, velocities)
-        return np.r_[self.problem.position_scale * position_gradient.ravel(), self.problem.velocity_scale * velocity_gradient.ravel()] / self.energy_scale
+        return self.problem.gradient_from_corners(position_gradient, velocity_gradient) / self.energy_scale
 
     def state_hessian_vector(self, state, direction):
         positions, velocities = self.problem.unpack(state)
-        cut = 3 * self.problem.corner_count
-        position_direction = self.problem.position_scale * np.asarray(direction[:cut]).reshape(positions.shape)
-        velocity_direction = self.problem.velocity_scale * np.asarray(direction[cut:]).reshape(velocities.shape)
+        position_direction, velocity_direction = self.problem.direction_to_corners(direction)
         position_product, velocity_product = self.energy.hessian_vector(positions, velocities, position_direction, velocity_direction)
-        return np.r_[self.problem.position_scale * position_product.ravel(), self.problem.velocity_scale * velocity_product.ravel()] / self.energy_scale
+        return self.problem.gradient_from_corners(position_product, velocity_product) / self.energy_scale
 
     def diagnostics(self, state):
         positions, velocities = self.problem.unpack(state)
         report = self.energy.balance(self.problem.positions, self.problem.velocities, positions, velocities, self.problem.velocity_scale,
                                      budget=self.budget, energy_scale=self.energy_scale, absolute_tolerance=self.absolute_tolerance,
                                      relative_tolerance=self.relative_tolerance, reference_components=self.reference_components)
-        report.update(law="corotational elastic + kinetic + gravitational potential",
+        report.update(law=report.get("law", "corotational elastic + kinetic + gravitational potential"),
                       fracture_energy="not calibrated; no artificial energy is credited for fracture", engine_calls=0)
         return report
 
@@ -208,6 +215,12 @@ class EnergyProjection:
         state = np.array(state, dtype=float, copy=True)
         if state.shape != self.problem.prior.shape or not np.isfinite(state).all():
             raise ValueError("energy projection state must match the finite normalized corrector state")
+        from .dynamics_quadratic_projection import project_quadratic_energy
+
+        quadratic = project_quadratic_energy(self, state, cancel)
+        if quadratic is not None:
+            return quadratic
+        position_dimension = len(state) // 2
         calls, iterations, evaluations = 0, 0, 0
         cache = {}
         terminations = []
@@ -217,37 +230,36 @@ class EnergyProjection:
             report.update(method="local nonconvex L-BFGS-B Lagrangian with scalar multiplier search",
                           global_projection_verified=False, optimizer_calls=calls, optimizer_iterations=iterations,
                           energy_evaluations=evaluations, optimizer_terminations=terminations,
+                          proximal_state_variables=len(state),
+                          nonlinear_optimization_variables=position_dimension if calls else 0,
+                          analytically_eliminated_velocity_variables=len(state) - position_dimension if calls else 0,
                           runtime_seconds=perf_counter() - start)
             report.update(extra)
             return EnergyProjectionResult(value.copy(), converged, status, report)
 
         if cancel is not None and cancel():
             return result(state, False, "interrupted")
-        if not self.energy.gravity.any() and self.budget < 0:
+        if getattr(self.energy, "supports_nonnegative_energy_shortcut", True) and not self.energy.gravity.any() and self.budget < 0:
             return result(state, False, "negative_energy_budget_infeasible", certificate="stable elastic and kinetic energies are nonnegative without gravity")
         if self.state_value(state) <= 0:
             return result(state, True, "already_feasible", multiplier=0.0, stationarity_residual=0.0)
-        if not self.energy.gravity.any() and self.budget == 0:
+        if getattr(self.energy, "supports_zero_energy_shortcut", True) and not self.energy.gravity.any() and self.budget == 0:
             positions, _ = self.problem.unpack(state)
-            rest = self.energy.mesh.nodes[self.energy.mesh.tets]
-            source = rest - rest.mean(axis=1, keepdims=True)
-            target_center = positions.mean(axis=1, keepdims=True)
-            covariance = source.transpose(0, 2, 1) @ (positions - target_center)
-            left, _, right = np.linalg.svd(covariance)
-            signs = np.ones((len(rest), 3))
-            signs[:, -1] = np.where(np.linalg.det(left @ right) < 0, -1.0, 1.0)
-            rotation = (left * signs[:, None, :]) @ right
-            projected_positions = source @ rotation + target_center
-            projected = np.r_[((projected_positions - self.problem.positions) / self.problem.position_scale).ravel(),
-                              np.zeros(3 * self.problem.corner_count)]
+            projected = self.problem.zero_energy_state(positions)
             verified = self.state_value(projected) <= self.tolerance
             return result(projected, verified, "exact_zero_energy_projection" if verified else "energy_feasibility_unknown",
-                          method="per-tetrahedron proper Kabsch rigid projection with zero velocity",
+                          method="coordinate-consistent proper Kabsch rigid projection with zero velocity",
                           global_projection_verified=verified, multiplier=None, stationarity_residual=0.0)
         target = 0.5 * self.tolerance
         if self.state_value(state) <= target:
             return result(state, True, "already_feasible", multiplier=0.0, stationarity_residual=0.0,
                           proximal_set_normalized_slack=target)
+
+        zero_position = np.zeros_like(self.problem.positions)
+        velocity_gradient = self.energy.masses[..., None] * np.full_like(self.problem.velocities, self.problem.velocity_scale)
+        velocity_curvature = self.problem.gradient_from_corners(zero_position, velocity_gradient)[position_dimension:] / self.energy_scale
+        if not np.isfinite(velocity_curvature).all() or (velocity_curvature <= 0).any():
+            return result(state, False, "energy_projection_unknown", solver_message="invalid kinetic-energy curvature")
 
         def solve(multiplier):
             nonlocal calls, iterations, evaluations
@@ -256,41 +268,65 @@ class EnergyProjection:
             if cancel is not None and cancel():
                 raise InterruptedError("energy projection interrupted")
             initial = min(cache.items(), key=lambda item: abs(item[0] - multiplier))[1][0] if cache else state
+            velocity = state[position_dimension:] / (1 + multiplier * velocity_curvature)
 
-            def objective(value):
+            def reconstruct(positions):
+                return np.r_[positions, velocity]
+
+            def full_objective(positions):
                 nonlocal evaluations
                 evaluations += 1
+                value = reconstruct(positions)
                 displacement = value - state
                 return 0.5 * float(displacement @ displacement) + multiplier * self.state_value(value), displacement + multiplier * self.state_gradient(value)
 
-            solution = minimize(objective, initial, method="L-BFGS-B", jac=True,
+            def objective(positions):
+                value, gradient = full_objective(positions)
+                return value, gradient[:position_dimension]
+
+            def hessian_product(positions, direction):
+                full_direction = np.r_[direction, np.zeros_like(velocity)]
+                return direction + multiplier * self.state_hessian_vector(reconstruct(positions), full_direction)[:position_dimension]
+
+            def stationarity_tolerance(positions):
+                return self.stationarity_tolerance * max(float(np.max(np.abs(reconstruct(positions)), initial=0)), 1.0)
+
+            solution = minimize(objective, initial[:position_dimension], method="L-BFGS-B", jac=True,
                                 options={"gtol": self.stationarity_tolerance * 0.01, "ftol": 0.0})
             calls += 1
             iterations += int(solution.nit)
             if not np.isfinite(solution.x).all() or not np.isfinite(solution.jac).all():
                 raise RuntimeError("nonfinite energy optimizer output")
-            stationarity = float(np.max(np.abs(solution.jac), initial=0))
-            threshold = self.stationarity_tolerance * max(float(np.max(np.abs(solution.x), initial=0)), 1.0)
+            solution.fun, gradient = full_objective(solution.x)
+            if not np.isfinite(solution.fun) or not np.isfinite(gradient).all():
+                raise RuntimeError("nonfinite reconstructed energy optimizer output")
+            solution.jac = gradient[:position_dimension]
+            stationarity = float(np.max(np.abs(gradient), initial=0))
+            threshold = stationarity_tolerance(solution.x)
             terminations.append(dict(library_success=bool(solution.success), message=str(solution.message),
                                      stationarity_residual=stationarity, stationarity_tolerance=threshold))
             if stationarity > threshold:
                 refined = minimize(objective, solution.x, method="Newton-CG", jac=True,
-                                   hessp=lambda value, direction: direction + multiplier * self.state_hessian_vector(value, direction),
+                                   hessp=hessian_product,
                                    options={"xtol": 1e-12})
                 calls += 1
                 iterations += int(refined.nit)
                 if not np.isfinite(refined.x).all() or not np.isfinite(refined.jac).all():
                     raise RuntimeError("nonfinite energy optimizer refinement output")
-                refined_stationarity = float(np.max(np.abs(refined.jac), initial=0))
-                refined_threshold = self.stationarity_tolerance * max(float(np.max(np.abs(refined.x), initial=0)), 1.0)
+                refined.fun, refined_gradient = full_objective(refined.x)
+                if not np.isfinite(refined.fun) or not np.isfinite(refined_gradient).all():
+                    raise RuntimeError("nonfinite reconstructed energy optimizer refinement output")
+                refined.jac = refined_gradient[:position_dimension]
+                refined_stationarity = float(np.max(np.abs(refined_gradient), initial=0))
+                refined_threshold = stationarity_tolerance(refined.x)
                 terminations.append(dict(library_success=bool(refined.success), message=str(refined.message),
                                          stationarity_residual=refined_stationarity, stationarity_tolerance=refined_threshold))
                 if np.isfinite(refined.x).all() and np.isfinite(refined.jac).all() and refined_stationarity < stationarity:
                     solution, stationarity = refined, refined_stationarity
                     threshold = refined_threshold
             while stationarity > threshold:
-                operator = LinearOperator((len(state), len(state)),
-                                          matvec=lambda direction: direction + multiplier * self.state_hessian_vector(solution.x, direction))
+                operator = LinearOperator((position_dimension, position_dimension),
+                                          matvec=lambda direction: hessian_product(solution.x, direction))
                 step, cg_status = cg(operator, -solution.jac, rtol=1e-10, atol=0.0)
                 calls += 1
                 candidate = solution.x + step
@@ -298,30 +334,32 @@ class EnergyProjection:
                     terminations.append(dict(method="linear-memory Newton refinement", library_success=False,
                                              reason="linear solve failure or unresolved floating point step", linear_status=int(cg_status)))
                     break
-                candidate_value, candidate_gradient = objective(candidate)
+                candidate_value, candidate_gradient = full_objective(candidate)
                 if not np.isfinite(candidate_value) or not np.isfinite(candidate_gradient).all():
                     raise RuntimeError("nonfinite energy Newton refinement output")
                 candidate_stationarity = float(np.max(np.abs(candidate_gradient), initial=0))
-                candidate_energy = self.diagnostics(candidate)
+                candidate_state = reconstruct(candidate)
+                candidate_energy = self.diagnostics(candidate_state)
                 component_scale = (abs(candidate_energy["components"]["elastic"]) + abs(candidate_energy["components"]["kinetic"]) +
                                    abs(self.reference_components["elastic"]) + abs(self.reference_components["kinetic"]) +
                                    abs(candidate_energy["energy_change"]["gravitational"]) + abs(candidate_energy["allowed_external_work"]))
-                objective_scale = 0.5 * float(np.sum((candidate - state)**2)) + abs(multiplier) * component_scale / self.energy_scale
+                objective_scale = 0.5 * float(np.sum((candidate_state - state)**2)) + abs(multiplier) * component_scale / self.energy_scale
                 roundoff = 128 * np.finfo(float).eps * max(abs(float(solution.fun)), objective_scale, 1.0)
                 if candidate_value > solution.fun + roundoff or stationarity - candidate_stationarity <= np.finfo(float).eps * max(stationarity, 1.0):
                     terminations.append(dict(method="linear-memory Newton refinement", library_success=False,
                                              reason="unresolved objective or stationarity improvement", objective_change=float(candidate_value - solution.fun),
                                              objective_roundoff=float(roundoff), stationarity_residual=candidate_stationarity))
                     break
-                solution.x, solution.fun, solution.jac = candidate, candidate_value, candidate_gradient
+                solution.x, solution.fun, solution.jac = candidate, candidate_value, candidate_gradient[:position_dimension]
                 stationarity = candidate_stationarity
-                threshold = self.stationarity_tolerance * max(float(np.max(np.abs(candidate), initial=0)), 1.0)
+                threshold = stationarity_tolerance(candidate)
                 terminations.append(dict(method="linear-memory Newton refinement", library_success=True,
                                          stationarity_residual=stationarity, stationarity_tolerance=threshold))
             if stationarity > threshold:
                 raise RuntimeError(f"energy local optimizer unknown: {solution.message}; stationarity={stationarity:g}")
-            value = self.state_value(solution.x) - target
-            cache[multiplier] = (solution.x.copy(), value, stationarity)
+            full_state = reconstruct(solution.x)
+            value = self.state_value(full_state) - target
+            cache[multiplier] = (full_state, value, stationarity)
             return cache[multiplier]
 
         try:

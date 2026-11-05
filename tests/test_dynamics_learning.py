@@ -18,6 +18,7 @@ from fracture_world.dynamics_learning import (
 )
 from fracture_world.dynamics_model import TemporalDynamicsModel
 from test_dynamics_data import recorded_trajectory
+from recorded_cases import update_archive
 
 
 def training_config(**updates):
@@ -316,6 +317,60 @@ def test_resume_rejects_inference_only_legacy_checkpoint_without_overwriting_it(
     with pytest.raises(ValueError, match="legacy model weights remain valid for inference"):
         train_dynamics(tmp_path / "missing", tmp_path / "output", training_config(), resume=checkpoint)
     assert torch.load(checkpoint, weights_only=True) == {"format": dynamics_learning.FORMAT, "model": {}}
+
+
+def legacy_source_checkpoint(path):
+    checkpoint = torch.load(path, weights_only=True)
+    for metadata in checkpoint["source"].values():
+        metadata.pop("native_settings")
+    torch.save(checkpoint, path)
+
+
+def test_resume_from_older_source_metadata_matches_uninterrupted_training(tmp_path):
+    recorded_trajectory(tmp_path / "data")
+    config = training_config(epochs=2, corrector_epochs=0, learn_support_release=False)
+    uninterrupted = train_dynamics(tmp_path / "data", tmp_path / "uninterrupted", config)
+    train_dynamics(tmp_path / "data", tmp_path / "resumed", replace(config, epochs=1))
+    last = tmp_path / "resumed" / "last.pt"
+    legacy_source_checkpoint(last)
+    resumed = train_dynamics(tmp_path / "data", tmp_path / "resumed", config, resume=last)
+    expected = torch.load(uninterrupted, weights_only=True)
+    actual = torch.load(resumed, weights_only=True)
+    for name in expected["model"]:
+        torch.testing.assert_close(actual["model"][name], expected["model"][name], atol=0, rtol=0)
+    assert actual["source"] == expected["source"]
+    assert all("native_settings" in metadata for metadata in actual["source"].values())
+
+
+@pytest.mark.parametrize("change", ["source_archive", "recorded_metadata"])
+def test_legacy_source_resume_still_rejects_changed_archive_or_other_metadata(tmp_path, change):
+    case, trajectory = recorded_trajectory(tmp_path / "data")
+    config = training_config(corrector_epochs=0, learn_support_release=False)
+    train_dynamics(tmp_path / "data", tmp_path / "trained", config)
+    last = tmp_path / "trained" / "last.pt"
+    legacy_source_checkpoint(last)
+    if change == "source_archive":
+        from fracture_world.io import file_hash
+
+        def change_case(arrays):
+            metadata = json.loads(str(arrays["metadata_json"].item()))
+            metadata["native_settings"]["diagnostic_tag"] = "changed"
+            arrays["metadata_json"] = np.asarray(json.dumps(metadata))
+
+        update_archive(case, change_case)
+
+        def change_provenance(arrays):
+            provenance = json.loads(str(arrays["metadata_json"].item()))
+            provenance["source_case_sha256"] = file_hash(case)
+            arrays["metadata_json"] = np.asarray(json.dumps(provenance))
+
+        update_archive(trajectory, change_provenance)
+    else:
+        checkpoint = torch.load(last, weights_only=True)
+        checkpoint["source"]["sample"]["parameter_status"] = "different"
+        torch.save(checkpoint, last)
+    with pytest.raises(ValueError, match="resume checkpoint does not match"):
+        train_dynamics(tmp_path / "data", tmp_path / "trained", replace(config, epochs=2), resume=last)
 
 
 def test_cli_exposes_epoch_checkpoint_resume_without_changing_training_configuration():

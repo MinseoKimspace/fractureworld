@@ -1,8 +1,8 @@
 SOURCES = {'FEMFX': {'code': 'https://github.com/GPUOpen-Effects/FEMFX',
            'revision': '95cf656731a2465ae1d400138170af2d6575b5bb',
            'license': 'MIT; Copyright (c) 2019 Advanced Micro Devices, Inc.',
-           'use': 'Unmodified native corotational FEM and stress-threshold facet fracture for numerical '
-                  'teacher data',
+           'use': 'Pinned native corotational FEM and stress-threshold facet fracture for numerical '
+                  'teacher data; compiled source copies have read-only observation hooks with recorded hashes',
            'scope': 'Windows CPU reference; numerical-model agreement is distinct from experimental physical '
                     'validation'},
  'ContinuousFlowMatching': {'paper': 'https://arxiv.org/abs/2210.02747',
@@ -29,6 +29,10 @@ SOURCES = {'FEMFX': {'code': 'https://github.com/GPUOpen-Effects/FEMFX',
  'CorotationalEnergy': {'code': 'https://github.com/GPUOpen-Effects/FEMFX/tree/95cf656731a2465ae1d400138170af2d6575b5bb/amd_femfx/src',
                        'use': 'Independent isotropic nonplastic corotational energy, gradient and polar Hessian-vector implementation matching the numerical teacher material law',
                        'scope': 'Mechanical energy passivity with static boundaries; no calibrated fracture-energy law or global nonconvex convergence guarantee'},
+ 'FrozenImplicitMechanics': {'code': 'https://github.com/GPUOpen-Effects/FEMFX/tree/95cf656731a2465ae1d400138170af2d6575b5bb/amd_femfx/src',
+                             'license': 'MIT; Copyright (c) 2019 Advanced Micro Devices, Inc.',
+                             'use': 'Independent SciPy implementation of pinned frozen-rotation linear implicit velocity residuals and necessary fracture-initiation checks',
+                             'scope': 'Old connectivity during motion, backward Euler, native absolute-eigenvalue and shear-component convention; unrecorded boundary reactions remain unknown'},
  'StanfordBunny': {'source': 'https://graphics.stanford.edu/data/3Dscanrep/',
                   'archive': 'https://graphics.stanford.edu/pub/3Dscanrep/bunny.tar.gz',
                   'use': 'Input surface repaired and tetrahedralized as an explicitly solid numerical specimen'},

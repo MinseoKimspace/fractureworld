@@ -9,7 +9,10 @@
   "geometry_tolerance": 1e-6,
   "max_iterations": null,
   "max_contact_iterations": null,
-  "kinematic_rule": "constant_acceleration",
+  "kinematic_rule": "backward_euler",
+  "mechanics_mode": "proximal",
+  "mechanics_weight": 1.0,
+  "fracture_initiation": true,
   "energy_balance": true,
   "seed": 17
 }

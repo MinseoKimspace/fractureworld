@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from .dynamics_data import load_dynamics_trajectory
-from .dynamics_energy import CorotationalEnergy
+from .dynamics_energy import CorotationalEnergy, native_corotational_energy
 from .io import file_hash, write_json
 from .partition import component_labels
 
@@ -156,8 +156,9 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
     mass = teacher.topology.masses
     normalized_mass = mass / mass.sum()
     initial_broken = teacher.broken[initial_frame]
-    energy = CorotationalEnergy(teacher.topology.mesh, teacher.material["rest_density"],
-                                teacher.material["youngs_modulus"], teacher.material["poissons_ratio"], teacher.gravity)
+    energy_factory = native_corotational_energy if report.get("configuration", {}).get("mechanics_mode", "disabled") != "disabled" else CorotationalEnergy
+    energy = energy_factory(teacher.topology.mesh, teacher.material["rest_density"],
+                            teacher.material["youngs_modulus"], teacher.material["poissons_ratio"], teacher.gravity)
     velocity_scale = report.get("energy_velocity_scale")
     if velocity_scale is not None and (isinstance(velocity_scale, bool) or not isinstance(velocity_scale, (int, float))
                                        or not np.isfinite(velocity_scale) or velocity_scale <= 0):
