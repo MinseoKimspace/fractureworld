@@ -24,6 +24,7 @@ frames.forEach((frame,index)=>{
 element('title').textContent=data.title||'Recorded fragment motion';
 const source=String(data.source||'unspecified');
 const sourceKind=source.toLowerCase();
+const methodLabel=({central_pcg:'centralized PCG',no_motion_central_pcg:'physical motion prior with centralized PCG'})[data.metadata?.method]??data.metadata?.method;
 const staticPreview=data.metadata?.simulation_executed===false;
 const suggestedSpeed=data.metadata?.suggested_playback_speed;
 const playbackSpeed=Number.isFinite(suggestedSpeed)&&suggestedSpeed>0?suggestedSpeed:(sourceKind.includes('femfx')?.001:1);
@@ -176,7 +177,7 @@ function plot(){
 }
 function showFrame(next){
   index=next;setPoses(frames[index]);element('scrub').value=index;
-  if(data.metadata?.format==='fracture-world.neural-rollout.v1')element('status').textContent=`Engine-free ${data.metadata.method} rollout · ${frames.length} frames · ${frames[index].metrics?.material_components??'?'} material components · ${frames[index].metrics?.broken_faces??'?'} broken faces`;
+  if(data.metadata?.format==='fracture-world.neural-rollout.v1')element('status').textContent=`Engine-free ${methodLabel} rollout · ${frames.length} frames · ${frames[index].metrics?.material_components??'?'} material components · ${frames[index].metrics?.broken_faces??'?'} broken faces`;
   const precision=frames.at(-1).time<.1?5:3;
   element('time').textContent=`${frames[index].time.toFixed(precision)} / ${frames.at(-1).time.toFixed(precision)} s`;plot();
 }

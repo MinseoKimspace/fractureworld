@@ -23,6 +23,19 @@ METHODS = ("raw", "central", "consensus")
 MOTION_ABLATION_METHODS = ("no_motion_central", "no_motion_consensus")
 
 
+def _matched_methods(methods, motion_ablation):
+    if methods is not None and not isinstance(methods, (list, tuple)):
+        raise ValueError("matched methods must be a list or tuple")
+    selected = list(METHODS if methods is None else methods)
+    allowed = {*METHODS, *MOTION_ABLATION_METHODS, "central_pcg", "no_motion_central_pcg"}
+    if not selected or any(not isinstance(method, str) or method not in allowed for method in selected) or len(set(selected)) != len(selected):
+        raise ValueError("matched methods must be unique raw/central/central_pcg/consensus/no_motion_central/no_motion_central_pcg/no_motion_consensus values")
+    if motion_ablation:
+        selected.extend(f"no_motion_{method}" for method in tuple(selected)
+                        if method in {"central", "central_pcg", "consensus"} and f"no_motion_{method}" not in selected)
+    return tuple(selected)
+
+
 def _state_hash(arrays, context):
     digest = hashlib.sha256(json.dumps(context, sort_keys=True, allow_nan=False).encode())
     for value in arrays:
@@ -87,10 +100,13 @@ def _solver_agreement(prepared, indexed, states, first, second):
         key = candidate["index"]
         a, b = indexed.get((key, first)), indexed.get((key, second))
         available = bool(a and b and a["accepted"] and b["accepted"])
-        reports.append(dict(candidate=key, comparison_available=available,
-                            objective_difference_consensus_minus_central=b["selection_objective"] - a["selection_objective"] if available else None,
+        difference = b["selection_objective"] - a["selection_objective"] if available else None
+        reports.append(dict(candidate=key, methods=[first, second], comparison_available=available,
+                            objective_difference_second_minus_first=difference,
                             positions_rms_metres=float(np.sqrt(np.mean((states[(key, first)][0] - states[(key, second)][0])**2))) if available else None,
                             velocities_rms_metres_per_second=float(np.sqrt(np.mean((states[(key, first)][1] - states[(key, second)][1])**2))) if available else None))
+        if (first.removeprefix("no_motion_"), second.removeprefix("no_motion_")) == ("central", "consensus"):
+            reports[-1]["objective_difference_consensus_minus_central"] = difference
     return reports
 
 
@@ -137,7 +153,7 @@ def _reference_metrics(initial, positions, velocities, mask, fixed, reference):
 
 @torch.no_grad()
 def compare_matched_step(initial, model, config=None, step=0, *, reference=None, progress=None, cancel=None, motion_ablation=False,
-                         cold_corrector=False):
+                         cold_corrector=False, methods=None):
     config = config or runtime.RolloutConfig()
     if isinstance(step, bool) or not isinstance(step, (int, np.integer)) or step < 0:
         raise ValueError("matched step must be a nonnegative integer")
@@ -145,7 +161,8 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
         raise ValueError("motion ablation must be Boolean")
     if not isinstance(cold_corrector, bool):
         raise ValueError("cold corrector must be Boolean")
-    methods = (*METHODS, *MOTION_ABLATION_METHODS) if motion_ablation else METHODS
+    methods = _matched_methods(methods, motion_ablation)
+    motion_ablation = any(method.startswith("no_motion_") for method in methods)
     model.eval()
     device = next(model.parameters()).device
     if device.type == "cpu":
@@ -223,7 +240,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 interrupted = True
                 break
             start = perf_counter()
-            motion_source = "physical_prior" if method in MOTION_ABLATION_METHODS else "learned"
+            motion_source = "physical_prior" if method.startswith("no_motion_") else "learned"
             selected_proposal = candidate["physical_motion"] if motion_source == "physical_prior" else candidate
             solver_method = method.removeprefix("no_motion_")
             solver_seconds = 0.
@@ -300,7 +317,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                                   selection_complete=not interrupted,
                                   verified_constraints=selected["verified_constraints"] if selected else None,
                                   status="selected" if selected else "no_accepted_candidate")
-        selections[method].update(motion_source="physical_prior" if method in MOTION_ABLATION_METHODS else "learned",
+        selections[method].update(motion_source="physical_prior" if method.startswith("no_motion_") else "learned",
                                   solver_method=method.removeprefix("no_motion_"))
     reference_values = reference() if callable(reference) else reference
     if reference_values is not None:
@@ -315,7 +332,10 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                                                if record["method"] == method and record["candidate"] == selected["selected_candidate"])
     indexed = {(record["candidate"], record["method"]): record for record in records}
     agreement = _solver_agreement(prepared, indexed, states, "central", "consensus")
-    physical_agreement = _solver_agreement(prepared, indexed, states, *MOTION_ABLATION_METHODS) if motion_ablation else []
+    physical_agreement = _solver_agreement(prepared, indexed, states, *MOTION_ABLATION_METHODS) if set(MOTION_ABLATION_METHODS).issubset(methods) else []
+    pcg_agreement = _solver_agreement(prepared, indexed, states, "central", "central_pcg") if {"central", "central_pcg"}.issubset(methods) else []
+    physical_pcg_agreement = _solver_agreement(prepared, indexed, states, "no_motion_central", "no_motion_central_pcg") if {
+        "no_motion_central", "no_motion_central_pcg"}.issubset(methods) else []
     selected_pairs = []
     for first, second in combinations(methods, 2):
         a, b = selections[first]["selected_candidate"], selections[second]["selected_candidate"]
@@ -338,6 +358,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 neural_fracture_and_support_shared=True, fully_neural_free_baseline=False,
                 methods=selections, candidates=records, central_consensus=agreement, selected_state_comparisons=selected_pairs,
                 no_motion_central_consensus=physical_agreement,
+                central_central_pcg=pcg_agreement, no_motion_central_central_pcg=physical_pcg_agreement,
                 motion_ablation_comparisons=ablation_comparisons,
                 reference_used_for_proposals=False, reference_used_for_selection=False,
                 reference_used_only_for_evaluation=reference_values is not None, engine_calls=0,
@@ -345,7 +366,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 completion_semantics="completed means all requested method evaluations were attempted, not solver convergence or physical validity",
                 constraint_scope="recorded endpoint geometry, conservative swept geometry, energy and supplied solver constraints; unknown is not verified",
                 timing_scope="generation is shared once; per-method times exclude shared encoding/FM and later independent reference evaluation",
-                nonlinear_comparison="same objective within each motion-source central/consensus pair; fidelity centers differ across motion sources; compare held-out accuracy, not cross-source objective values")
+                nonlinear_comparison="same objective within each motion source across solvers; fidelity centers differ across motion sources; compare held-out accuracy, not cross-source objective values")
 
 
 def _initial_observation(item, frame, model):
@@ -368,7 +389,7 @@ def _initial_observation(item, frame, model):
 
 
 def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto", *, split="test", frames=None, progress=None, cancel=None,
-                             motion_ablation=False, cold_corrector=False, case_ids=None):
+                             motion_ablation=False, cold_corrector=False, case_ids=None, methods=None):
     if split not in {"train", "validation", "test", "all"}:
         raise ValueError("matched comparison split must select train, validation, test or all")
     if not isinstance(motion_ablation, bool):
@@ -378,7 +399,10 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
     if case_ids is not None and (not isinstance(case_ids, (list, tuple)) or not case_ids or
                                  any(not isinstance(name, str) or not name for name in case_ids) or len(set(case_ids)) != len(case_ids)):
         raise ValueError("matched case IDs must be unique nonempty strings")
-    method_names = (*METHODS, *MOTION_ABLATION_METHODS) if motion_ablation else METHODS
+    method_names = _matched_methods(methods, motion_ablation)
+    custom_methods = methods is not None
+    add_motion_ablation = motion_ablation
+    motion_ablation = any(method.startswith("no_motion_") for method in method_names)
     if frames is not None and (not isinstance(frames, (list, tuple)) or not frames or
                                any(isinstance(frame, bool) or not isinstance(frame, int) or frame < 0 for frame in frames) or len(set(frames)) != len(frames)):
         raise ValueError("matched frames must be unique nonnegative recorded frame indices")
@@ -442,8 +466,10 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
                               input_native_step=int(native_steps[frame]), corrector_reuse=not cold_corrector))
             try:
                 options = dict(cold_corrector=True) if cold_corrector else {}
+                if custom_methods:
+                    options["methods"] = method_names
                 row = compare_matched_step(initial, model, config, int(native_steps[frame]), reference=reference, progress=progress,
-                                           cancel=cancel, motion_ablation=motion_ablation, **options)
+                                           cancel=cancel, motion_ablation=add_motion_ablation, **options)
             except KeyboardInterrupt:
                 row = dict(status="interrupted", case_id=trajectory.case_id, candidate_count=None, attempted_method_runs=None)
             row.update(frame=frame, input_native_step=int(native_steps[frame]))

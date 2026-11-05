@@ -6,6 +6,7 @@ import numpy as np
 from scipy import sparse
 
 from .dynamics_corrector import CorrectorIteration, CorrectorTolerances, _diagnostics, _factor_inverse_gram, _feasibility, _limit, _prior_is_minimum, _result, _shared_problem, solve_central, solve_consensus
+from .dynamics_pcg import solve_central_pcg
 from .dynamics_solver_workspace import consensus_setup, energy_key, inverse_gram, save_consensus
 
 
@@ -26,11 +27,11 @@ def _energy_result(problem, energy, method, state, tolerances, converged, status
     return result
 
 
-def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, start=None):
+def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, start=None, method="central"):
     start = perf_counter() if start is None else start
-    _phase_progress(progress, "central", "linear_feasibility", "started", start)
+    _phase_progress(progress, method, "linear_feasibility", "started", start)
     feasibility = _feasibility(problem, tolerances)
-    _phase_progress(progress, "central", "linear_feasibility", feasibility["status"], start,
+    _phase_progress(progress, method, "linear_feasibility", feasibility["status"], start,
                     phase_runtime_seconds=feasibility["runtime_seconds"])
     state = problem.prior.copy()
     iterations, outer = 0, 0
@@ -38,6 +39,12 @@ def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, s
     previous = None
     previous_violation, stagnant = None, 0
     status, converged = "maximum_iterations", False
+
+    def linear_progress(event):
+        if progress:
+            progress({**event, "subproblem_runtime_seconds": event["runtime_seconds"],
+                      "runtime_seconds": perf_counter() - start, "outer_iteration": outer + 1})
+
     if feasibility["status"] != "feasible":
         status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
     else:
@@ -48,9 +55,10 @@ def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, s
             local = copy(problem)
             local.factors = (*problem.factors, *cuts)
             remaining = None if max_iterations is None else max_iterations - iterations
-            _phase_progress(progress, "central", "linear_subproblem", "started", start, outer_iteration=outer + 1)
-            solution = solve_central(local, tolerances, remaining, cancel)
-            _phase_progress(progress, "central", "linear_subproblem", solution.status, start,
+            _phase_progress(progress, method, "linear_subproblem", "started", start, outer_iteration=outer + 1)
+            solution = (solve_central_pcg(local, tolerances, remaining, cancel, progress=linear_progress if progress else None)
+                        if method == "central_pcg" else solve_central(local, tolerances, remaining, cancel))
+            _phase_progress(progress, method, "linear_subproblem", solution.status, start,
                             outer_iteration=outer + 1, phase_runtime_seconds=solution.runtime_seconds,
                             iterations=solution.iterations)
             outer += 1
@@ -58,6 +66,8 @@ def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, s
             reports.append({"outer_iteration": outer, "status": solution.status, "iterations": solution.iterations,
                             "feasibility": solution.diagnostics["feasibility"], "objective": solution.objective,
                             "runtime_seconds": solution.runtime_seconds})
+            if method == "central_pcg":
+                reports[-1]["pcg"] = solution.diagnostics.get("pcg")
             if not solution.converged:
                 status = "local_energy_model_infeasible_unknown" if solution.status == "PrimalInfeasible" and cuts else solution.status
                 break
@@ -66,7 +76,7 @@ def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, s
             reports[-1]["normalized_energy_violation"] = float(violation)
             state = candidate
             if progress:
-                progress(dict(event="energy_corrector_progress", method="central", iteration=iterations,
+                progress(dict(event="energy_corrector_progress", method=method, iteration=iterations,
                               outer_iteration=outer, objective=solution.objective, primal_residual=None,
                               dual_residual=None, constraint_violation=solution.diagnostics["constraint_violation"],
                               energy_violation=float(max(violation, 0.0)), rho=None,
@@ -94,8 +104,9 @@ def _central(problem, energy, tolerances, max_iterations, cancel, progress, *, s
                                         np.arange(len(candidate)), -gradient, [bound], True))
             previous = candidate.copy()
             previous_violation = violation
-    return _energy_result(problem, energy, "central", state, tolerances, converged, status, iterations, [], start, feasibility,
-                          algorithm="Clarabel sequential energy tangent cuts with exact final energy validation",
+    backend = "PCG active-set" if method == "central_pcg" else "Clarabel"
+    return _energy_result(problem, energy, method, state, tolerances, converged, status, iterations, [], start, feasibility,
+                          algorithm=f"{backend} sequential energy tangent cuts with exact final energy validation",
                           approximation="local nonconvex approximation; accumulated cuts can exclude other feasible branches",
                           outer_iterations=outer, linear_subproblems=reports,
                           initial_feasibility_seconds=feasibility["runtime_seconds"],
@@ -297,8 +308,8 @@ def _consensus(problem, energy, tolerances, rho, max_iterations, cancel, progres
 
 def solve_energy(problem, energy_projection, method, tolerances=None, rho=None, max_iterations=None, cancel=None, *, progress=None, workspace=None):
     start = perf_counter()
-    if method not in {"central", "consensus"}:
-        raise ValueError("energy solver method must be central or consensus")
+    if method not in {"central", "central_pcg", "consensus"}:
+        raise ValueError("energy solver method must be central, central_pcg or consensus")
     _limit(max_iterations)
     tolerances = tolerances or CorrectorTolerances()
     problem = _shared_problem(problem)
@@ -325,8 +336,8 @@ def solve_energy(problem, energy_projection, method, tolerances=None, rho=None, 
                               feasibility, algorithm="unconstrained coordinate minimum with directly verified feasibility",
                               zero_objective_certificate=problem.objective(problem.prior) == 0.0,
                               coordinate_minimum_certificate=True, coordinate_reduction_seconds=coordinate_seconds)
-    if method == "central":
-        result = _central(problem, energy_projection, tolerances, max_iterations, cancel, progress, start=start)
+    if method in {"central", "central_pcg"}:
+        result = _central(problem, energy_projection, tolerances, max_iterations, cancel, progress, start=start, method=method)
     else:
         result = _consensus(problem, energy_projection, tolerances, rho, max_iterations, cancel, progress, start=start, workspace=workspace)
     result.diagnostics["energy"]["coordinate_reduction_seconds"] = coordinate_seconds

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from .dynamics_experiment import (_ACCURACY_METRICS, _AUTONOMOUS_PROPOSAL_CONTROL, _motion_ablation_protocol,
-                                  _paired_accuracy)
+                                  _paired_accuracy, _paired_solver_metrics)
 from .io import file_hash
 
 
@@ -203,6 +203,7 @@ def merge_dynamics_benchmarks(inputs, output):
                   requested_methods=methods, requested_cases=len(case_contracts),
                   requested_method_runs=len(case_contracts) * len(methods), attempted_method_runs=sum(map(len, rows.values())),
                   unattempted_method_runs=0, conditions=summaries, paired_accuracy=paired,
+                  paired_solver_metrics=_paired_solver_metrics(rows, methods),
                   configuration=configuration, all_rollouts_completed=all_completed,
                   cases=[dict(case_id=case, **case_contracts[case]) for case in contract["requested_case_ids"]],
                   motion_ablation=_motion_ablation_protocol(methods), proposal_control=_AUTONOMOUS_PROPOSAL_CONTROL,

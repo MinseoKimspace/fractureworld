@@ -31,7 +31,7 @@ _AUTONOMOUS_PROPOSAL_CONTROL = (
 
 
 def _motion_ablation_protocol(methods):
-    pairs = [[solver, f"no_motion_{solver}"] for solver in ("central", "consensus")]
+    pairs = [[solver, f"no_motion_{solver}"] for solver in ("central", "central_pcg", "consensus")]
     return dict(enabled=any(method.startswith("no_motion_") for method in methods),
                 comparison_pairs=[pair for pair in pairs if set(pair).issubset(methods)],
                 removed="learned motion residual only",
@@ -66,6 +66,18 @@ def _paired_accuracy(rows, methods, metrics):
     return dict(methods=list(methods), total_cases=len(all_cases), common_full_horizon_cases=len(common),
                 common_full_horizon_case_ids=common, excluded_case_ids=sorted(all_cases.difference(common)),
                 comparison_available=len(methods) > 1 and bool(common), metrics=summaries)
+
+
+def _paired_solver_metrics(rows, methods):
+    methods = tuple(methods)
+    metrics = ("runtime_seconds", "corrector_iterations", "optimization_solves")
+    measurements = {method: [{**item, "evaluation": {metric: item.get(metric) for metric in metrics}}
+                             for item in rows[method]] for method in methods}
+    return dict(all_methods=_paired_accuracy(measurements, methods, metrics),
+                pairwise=[_paired_accuracy(measurements, pair, metrics) for pair in combinations(methods, 2)],
+                interpretation="runtime and solver work conditional on shared completed horizons; runtime includes prediction and shared preparation per autonomous rollout",
+                iteration_interpretation="iteration counts are backend-specific: central uses interior-point iterations, central_pcg counts active-set passes plus PCG iterations, consensus counts ADMM iterations; counts are not equivalent units of work",
+                difference_semantics="second method minus first method on each shared case")
 
 
 def _runtime_support_policy(checkpoint, current_fixed):
@@ -104,9 +116,10 @@ def _rollout_agreement(central, consensus, completed):
 def _comparison_methods(methods, learned_corrector):
     selected = list(methods or (["raw", "neural", "central", "consensus"] if learned_corrector is not None
                                 else ["raw", "central", "consensus"]))
-    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
+    allowed = {"physics", "raw", "neural", "central", "central_pcg", "consensus",
+               "no_motion_central", "no_motion_central_pcg", "no_motion_consensus"}
     if len(set(selected)) != len(selected) or not set(selected).issubset(allowed):
-        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus values")
+        raise ValueError("comparison methods must be unique physics/raw/neural/central/central_pcg/consensus/no_motion_central/no_motion_central_pcg/no_motion_consensus values")
     if "neural" in selected and learned_corrector is None:
         raise ValueError("neural baseline requested but checkpoint has no trained corrector")
     return selected
@@ -140,9 +153,16 @@ def compare_dynamics(checkpoint, initial, output, steps, config=None, device="au
         no_motion_agreement = _rollout_agreement(
             directory / "no_motion_central" / "trajectory.npz", directory / "no_motion_consensus" / "trajectory.npz",
             all(conditions[method]["status"] == "completed" for method in ("no_motion_central", "no_motion_consensus")))
+    pcg_agreements = {}
+    for prefix in ("", "no_motion_"):
+        first, second = f"{prefix}central", f"{prefix}central_pcg"
+        pcg_agreements[f"{prefix}central_central_pcg_agreement"] = _rollout_agreement(
+            directory / first / "trajectory.npz", directory / second / "trajectory.npz",
+            all(conditions[method]["status"] == "completed" for method in (first, second))) if {first, second}.issubset(conditions) else None
     report = dict(format="fracture-world.neural-comparison.v1", status="interrupted" if interrupted else "comparison_finished", engine_calls=0,
                   conditions=conditions, central_consensus_agreement=agreement,
                   no_motion_central_consensus_agreement=no_motion_agreement,
+                  **pcg_agreements,
                   motion_ablation=_motion_ablation_protocol(methods),
                   requested_methods=methods, attempted_methods=list(conditions),
                   unattempted_methods=[method for method in methods if method not in conditions],
@@ -242,6 +262,7 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                   requested_methods=methods, requested_method_runs=len(cases) * len(methods),
                   attempted_method_runs=attempted_runs, unattempted_method_runs=len(cases) * len(methods) - attempted_runs,
                   paired_accuracy=paired,
+                  paired_solver_metrics=_paired_solver_metrics(rows, methods),
                   motion_ablation=_motion_ablation_protocol(methods),
                   proposal_control=_AUTONOMOUS_PROPOSAL_CONTROL,
                   protocol="autonomous rollout from each held-out initial state; teacher future is evaluated only after inference",

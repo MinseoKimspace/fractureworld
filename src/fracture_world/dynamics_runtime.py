@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from .dynamics_corrector import CorrectorTolerances, DynamicsProblem, _diagnostics, solve_central, solve_consensus
+from .dynamics_pcg import solve_central_pcg
 from .dynamics_arithmetic import position_publication_envelope
 from .dynamics_energy import CorotationalEnergy, EnergyProjection, native_corotational_energy
 from .dynamics_energy_solvers import solve_energy
@@ -538,8 +539,13 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
             projection = EnergyProjection(problem, energy, budget, config.absolute_tolerance, config.relative_tolerance)
             result = solve_energy(problem, projection, method, tolerance, config.rho, config.max_iterations, cancel, progress=progress, workspace=energy_workspace)
         else:
-            result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel) if method == "central" else solve_consensus(
-                problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations, cancel=cancel, progress=progress, _workspace=linear_workspace)
+            if method == "central":
+                result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel)
+            elif method == "central_pcg":
+                result = solve_central_pcg(problem, tolerance, config.max_iterations, cancel=cancel, progress=progress)
+            else:
+                result = solve_consensus(problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations,
+                                         cancel=cancel, progress=progress, _workspace=linear_workspace)
         outer += 1
         histories.append(dict(outer_iteration=outer, status=result.status, iterations=result.iterations,
                               objective=result.objective, diagnostics=result.diagnostics, runtime_seconds=result.runtime_seconds,
@@ -668,6 +674,7 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
                       "Engine-free neural fracture rollout",
                 source="constant-acceleration physical prediction; no learned dynamics or fracture generation" if physics_only
                        else "learned fracture and support release; learned motion discarded; numerical state correction" if motion_ablated
+                       else "trained neural dynamics with centralized PCG correction" if metadata.get("solver_method") == "central_pcg"
                        else "trained neural dynamics with optional proximal consensus",
                 bodies=[dict(id=0, **first, color="#d3ab75")], frames=frames,
                 metadata={**metadata, **{key: initial.metadata[key] for key in ("floor_height_m", "up_axis") if key in initial.metadata},
@@ -678,11 +685,12 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
 @torch.no_grad()
 def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="consensus", config=None, device="auto", progress=None,
                      *, cancel=None):
-    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
+    allowed = {"physics", "raw", "neural", "central", "central_pcg", "consensus",
+               "no_motion_central", "no_motion_central_pcg", "no_motion_consensus"}
     if method not in allowed or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-        raise ValueError("select physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus and a positive number of steps")
-    motion_ablated = method in {"no_motion_central", "no_motion_consensus"}
-    solver_method = method.removeprefix("no_motion_") if method in {"central", "consensus"} or motion_ablated else None
+        raise ValueError("select physics/raw/neural/central/central_pcg/consensus/no_motion_central/no_motion_central_pcg/no_motion_consensus and a positive number of steps")
+    motion_ablated = method in {"no_motion_central", "no_motion_central_pcg", "no_motion_consensus"}
+    solver_method = method.removeprefix("no_motion_") if method in {"central", "central_pcg", "consensus"} or motion_ablated else None
     constrained = solver_method is not None
     config = config or RolloutConfig()
     initial = load_initial(initial_path)
@@ -791,9 +799,17 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                                                                          next_velocities, old, mask, fixed, next_fixed,
                                                                          model, config)
                     objective = prior
-                balance = step_energy_diagnostics(initial, positions, velocities, next_positions, next_velocities,
-                                                   old, fixed, model, config, nonlinear=energy_model)
-                energy_valid = balance["energy_satisfied"]
+                invalid_orientation = (config.mechanics_mode != "disabled"
+                                       and diagnostic["geometry"].get("inverted_tetrahedra", 0) > 0)
+                if invalid_orientation:
+                    diagnostic["mechanics_domain"] = dict(
+                        status="fail", reason="elastic mechanics requires positive tetrahedron orientation",
+                        inverted_or_degenerate_tetrahedra=diagnostic["geometry"]["inverted_tetrahedra"])
+                    balance = dict(status="unknown", energy_satisfied=None,
+                                   reason="candidate is outside the positive-orientation mechanics domain")
+                else:
+                    balance = step_energy_diagnostics(initial, positions, velocities, next_positions, next_velocities,
+                                                       old, fixed, model, config, nonlinear=energy_model)
                 diagnostic["energy"] = balance
                 record = dict(candidate=index, prior=prior, objective=objective, broken_faces=int(mask.sum()),
                               candidate_hash=candidate_hash,
@@ -804,14 +820,25 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
                 status = "timestep_rejected"
                 events.append(dict(step=step + 1, time=times[-1], status=status, candidates=candidate_records))
                 break
-            old_broken, old_fixed = old.copy(), fixed.copy()
-            start_elastic_state = current_elastic_state(initial, positions, old_broken, old_fixed)
-            _, chosen, old, positions, velocities, fixed, record = min(accepted, key=lambda item: (item[0], item[1]))
-            if config.mechanics_mode != "disabled":
-                initial = advance_elastic_state(initial, positions, velocities, old_broken, old, old_fixed, fixed, start_elastic_state)
-            if not np.isfinite(positions).all() or not np.isfinite(velocities).all():
-                status = "nonfinite_prediction"
+            _, chosen, next_broken, next_positions, next_velocities, next_fixed, record = min(accepted, key=lambda item: (item[0], item[1]))
+            domain = record["correction"].get("mechanics_domain")
+            if domain is not None and domain["status"] == "fail":
+                status = "timestep_rejected"
+                events.append(dict(step=step + 1, time=times[-1], status=status, selected_candidate=chosen,
+                                   reason=domain["reason"], failure_kind="invalid_mechanics_state",
+                                   candidates=candidate_records))
                 break
+            if not np.isfinite(next_positions).all() or not np.isfinite(next_velocities).all():
+                status = "nonfinite_prediction"
+                events.append(dict(step=step + 1, time=times[-1], status=status,
+                                   reason="selected motion contains nonfinite values", candidates=candidate_records))
+                break
+            next_initial = initial
+            if config.mechanics_mode != "disabled":
+                start_elastic_state = current_elastic_state(initial, positions, old, fixed)
+                next_initial = advance_elastic_state(initial, next_positions, next_velocities, old, next_broken,
+                                                     fixed, next_fixed, start_elastic_state)
+            initial, old, positions, velocities, fixed = next_initial, next_broken, next_positions, next_velocities, next_fixed
             times.append(initial.time + (step + 1) * initial.dt)
             position_history.append(positions.copy())
             velocity_history.append(velocities.copy())
@@ -840,6 +867,12 @@ def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="c
     except FloatingPointError as error:
         status = "nonfinite_prediction"
         events.append(dict(step=step + 1, time=times[-1], status=status, reason=str(error)))
+    if events and events[-1]["status"] != "committed":
+        with (directory / "progress.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(events[-1], allow_nan=False) + "\n")
+        if progress:
+            progress(dict(event="rollout_step_failed", method=method, step=events[-1]["step"],
+                          time=times[-1], status=status, reason=events[-1].get("reason")))
     condition_splits = checkpoint["condition_splits"]
     split = next((name for name, conditions in condition_splits.items() if initial.condition_digest in conditions), "unseen_condition")
     committed = [event for event in events if event.get("status") == "committed"]

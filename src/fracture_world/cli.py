@@ -77,7 +77,8 @@ def parser():
     initial.add_argument("--frame", type=int, default=0)
     initial.add_argument("--support-policy", choices=["prescribed", "free", "learned"], required=True)
     initial.add_argument("--output", type=Path, required=True)
-    rollout_methods = ["physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"]
+    rollout_methods = ["physics", "raw", "neural", "central", "central_pcg", "consensus",
+                       "no_motion_central", "no_motion_central_pcg", "no_motion_consensus"]
     for name in ("dynamics-rollout", "dynamics-compare"):
         command = commands.add_parser(name, help="Run learned fracture dynamics without a runtime physics engine")
         command.add_argument("--checkpoint", type=Path, required=True)
@@ -117,7 +118,7 @@ def parser():
     teacher.add_argument("--specification", type=Path)
     teacher.add_argument("--device", default="cpu")
     teacher.add_argument("--output", type=Path, required=True)
-    matched = commands.add_parser("dynamics-matched", help="Compare raw, central and consensus on frozen identical one-step inputs")
+    matched = commands.add_parser("dynamics-matched", help="Compare selected methods on frozen identical one-step inputs")
     matched.add_argument("--checkpoint", type=Path, required=True)
     matched.add_argument("--data", type=Path, required=True)
     matched.add_argument("--output", type=Path, required=True)
@@ -126,8 +127,9 @@ def parser():
     matched.add_argument("--split", choices=["validation", "test"], default="test")
     matched.add_argument("--frames", nargs="+", type=int)
     matched.add_argument("--case-ids", nargs="+", help="Evaluate only named cases from the recorded split")
+    matched.add_argument("--methods", nargs="+", choices=[method for method in rollout_methods if method not in {"physics", "neural"}])
     matched.add_argument("--cold-corrector", action="store_true", help="Disable corrector state and outer-loop cache reuse for a controlled comparison")
-    matched.add_argument("--motion-ablation", action="store_true", help="Add physical-motion-prior central/consensus arms sharing the same learned fracture and support candidate pool")
+    matched.add_argument("--motion-ablation", action="store_true", help="Add physical-motion-prior arms for the selected solvers sharing the same learned fracture and support candidate pool")
     return root
 
 
@@ -213,6 +215,8 @@ def run(args):
                     "engine_calls": 0, "report": str((args.output / "comparison.json").resolve()),
                     "central_consensus_agreement": report["central_consensus_agreement"],
                     "no_motion_central_consensus_agreement": report.get("no_motion_central_consensus_agreement"),
+                    "central_central_pcg_agreement": report.get("central_central_pcg_agreement"),
+                    "no_motion_central_central_pcg_agreement": report.get("no_motion_central_central_pcg_agreement"),
                     "motion_ablation": report.get("motion_ablation")})
         if report["status"] == "interrupted":
             raise SystemExit(130)
@@ -259,6 +263,8 @@ def run(args):
             options["cold_corrector"] = True
         if args.case_ids is not None:
             options["case_ids"] = args.case_ids
+        if args.methods is not None:
+            options["methods"] = args.methods
         report = compare_matched_dynamics(args.checkpoint, args.data, args.output, load_rollout_config(args.specification),
                                           args.device, split=args.split, frames=args.frames, progress=progress, motion_ablation=args.motion_ablation, **options)
         output(dict(status=report["status"], report=str((args.output / "matched.json").resolve()),
