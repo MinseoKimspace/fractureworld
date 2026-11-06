@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import weakref
 
 import numpy as np
 import torch
@@ -8,7 +9,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from torch import nn
 from torch.nn import functional as F
-from torch_geometric.data import HeteroData
+from torch_geometric.data import Batch, HeteroData
 from torch_geometric.nn import GATv2Conv, HGTConv
 from torchdiffeq import odeint
 
@@ -36,9 +37,15 @@ class FractureFlowContext:
 class DynamicsGraphCache:
     def __init__(self):
         self.entries = {}
+        self.scenes = []
 
-    def resolve(self, name, tensors, build):
-        if torch.is_inference_mode_enabled() or any(value.requires_grad for value in tensors):
+    def scene(self, index):
+        while len(self.scenes) <= index:
+            self.scenes.append(DynamicsGraphCache())
+        return self.scenes[index]
+
+    def resolve(self, name, tensors, build, *, allow_grad_inputs=False):
+        if torch.is_inference_mode_enabled() or (not allow_grad_inputs and any(value.requires_grad for value in tensors)):
             return build()
         try:
             versions = tuple(value._version for value in tensors)
@@ -47,15 +54,15 @@ class DynamicsGraphCache:
         previous = self.entries.get(name)
         if previous is not None:
             inputs, old_versions, result = previous
-            if old_versions == versions and all(old is current for old, current in zip(inputs, tensors)):
+            if old_versions == versions and all(old() is current for old, current in zip(inputs, tensors)):
                 return result
         result = build()
-        self.entries[name] = (tuple(tensors), versions, result)
+        self.entries[name] = (tuple(weakref.ref(value) for value in tensors), versions, result)
         return result
 
 
-def _cached(cache, name, tensors, build):
-    return build() if cache is None else cache.resolve(name, tensors, build)
+def _cached(cache, name, tensors, build, *, allow_grad_inputs=False):
+    return build() if cache is None else cache.resolve(name, tensors, build, allow_grad_inputs=allow_grad_inputs)
 
 
 def support_release_mask(face_pairs, broken, fixed, release_probability):
@@ -149,30 +156,34 @@ def _validated_batch(batch):
 
 
 def _contact_pairs(batch, radius, cache=None):
-    positions = batch["positions"].detach().cpu().numpy()
-    count = len(positions)
-    face_pairs = _cached(cache, "cpu_face_pairs", (batch["face_pairs"],),
-                         lambda: batch["face_pairs"].detach().cpu().numpy().copy())
+    def build_pairs():
+        positions = batch["positions"].detach().cpu().numpy()
+        count = len(positions)
+        face_pairs = _cached(cache, "cpu_face_pairs", (batch["face_pairs"],),
+                             lambda: batch["face_pairs"].detach().cpu().numpy().copy())
 
-    def connectivity():
-        intact_faces = face_pairs[~batch["broken"].detach().cpu().numpy()]
-        intact = intact_faces.reshape(-1, 2)
-        adjacency = coo_matrix((np.ones(len(intact), dtype=np.int8), (intact[:, 0], intact[:, 1])),
-                               shape=(count, count)).tocsr()
-        groups = connected_components(adjacency, directed=False, return_labels=True)[1]
-        cell_pairs = np.sort(intact_faces[:, 0] // 4, axis=1)
-        neighbors = np.unique(cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1])
-        return groups, neighbors
+        def connectivity():
+            intact_faces = face_pairs[~batch["broken"].detach().cpu().numpy()]
+            intact = intact_faces.reshape(-1, 2)
+            adjacency = coo_matrix((np.ones(len(intact), dtype=np.int8), (intact[:, 0], intact[:, 1])),
+                                   shape=(count, count)).tocsr()
+            groups = connected_components(adjacency, directed=False, return_labels=True)[1]
+            cell_pairs = np.sort(intact_faces[:, 0] // 4, axis=1)
+            neighbors = np.unique(cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1])
+            return groups, neighbors
 
-    groups, neighboring_cells = _cached(cache, "contact_connectivity",
-                                         (batch["rest_positions"], batch["face_pairs"], batch["broken"]), connectivity)
-    pairs = cKDTree(positions).query_pairs(radius, output_type="ndarray")
-    if len(pairs):
-        pairs = pairs[(pairs[:, 0] // 4 != pairs[:, 1] // 4) & (groups[pairs[:, 0]] != groups[pairs[:, 1]])]
-        cell_pairs = pairs // 4
-        cell_codes = cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1]
-        pairs = pairs[~np.isin(cell_codes, neighboring_cells)]
-    return torch.as_tensor(pairs.reshape(-1, 2), device=batch["positions"].device, dtype=torch.long)
+        groups, neighboring_cells = _cached(cache, "contact_connectivity",
+                                             (batch["rest_positions"], batch["face_pairs"], batch["broken"]), connectivity)
+        pairs = cKDTree(positions).query_pairs(radius, output_type="ndarray")
+        if len(pairs):
+            pairs = pairs[(pairs[:, 0] // 4 != pairs[:, 1] // 4) & (groups[pairs[:, 0]] != groups[pairs[:, 1]])]
+            cell_pairs = pairs // 4
+            cell_codes = cell_pairs[:, 0] * (count // 4) + cell_pairs[:, 1]
+            pairs = pairs[~np.isin(cell_codes, neighboring_cells)]
+        return torch.as_tensor(pairs.reshape(-1, 2), device=batch["positions"].device, dtype=torch.long)
+
+    return _cached(cache, ("contact_pairs", float(radius)),
+                   (batch["positions"], batch["face_pairs"], batch["broken"]), build_pairs, allow_grad_inputs=True)
 
 
 def constant_acceleration_prediction(batch):
@@ -388,22 +399,58 @@ class TemporalDynamicsModel(nn.Module):
         nn.init.zeros_(self.support_head.weight)
         nn.init.zeros_(self.support_head.bias)
 
-    def encode(self, batch, proposal=None):
+    def _scene_graph(self, batch, proposal, cache):
         dt = _validated_batch(batch)
         physical = _constant_acceleration_prediction(batch, dt) if self.config["motion_prior"] == "constant_acceleration" else None
-        graph = _build_dynamics_graph(batch, dt, **{key: self.config[key] for key in (
+        return _build_dynamics_graph(batch, dt, **{key: self.config[key] for key in (
             "length_scale", "velocity_scale", "mass_scale", "material_scale", "contact_radius")}, proposal=proposal,
-                                      physical_proposal=physical, cache=self._graph_cache)
+                                      physical_proposal=physical, cache=cache)
+
+    def _encode_graph(self, graph):
         hidden = {name: F.gelu(self.encoders[name](features)) for name, features in graph.x_dict.items()}
         for layer, norms in zip(self.graph_layers, self.norms):
             updates = layer(hidden, graph.edge_index_dict)
             hidden = {name: F.gelu(norms[name](value + updates[name])) if updates.get(name) is not None else value
                       for name, value in hidden.items()}
-        cell_context = self.transformer(torch.cat((hidden["cell"], hidden["body"]), dim=0)[None])[0, :-1]
-        corner_context = self.corner_fusion(torch.cat((hidden["corner"], cell_context.repeat_interleave(4, dim=0)), dim=-1))
+        return hidden
+
+    def _fuse_context(self, batch, corner_hidden, face_hidden, cell_context):
+        corner_context = self.corner_fusion(torch.cat((corner_hidden, cell_context.repeat_interleave(4, dim=0)), dim=-1))
         pair_cells = batch["face_pairs"][:, 0] // 4
-        face_context = self.face_fusion(torch.cat((hidden["face"], cell_context[pair_cells[:, 0]], cell_context[pair_cells[:, 1]]), dim=-1))
+        face_context = self.face_fusion(torch.cat((face_hidden, cell_context[pair_cells[:, 0]], cell_context[pair_cells[:, 1]]), dim=-1))
         return corner_context, face_context
+
+    def encode(self, batch, proposal=None):
+        hidden = self._encode_graph(self._scene_graph(batch, proposal, self._graph_cache))
+        cell_context = self.transformer(torch.cat((hidden["cell"], hidden["body"]), dim=0)[None])[0, :-1]
+        return self._fuse_context(batch, hidden["corner"], hidden["face"], cell_context)
+
+    def encode_batch(self, batches, proposals=None):
+        batches = list(batches)
+        proposals = [None] * len(batches) if proposals is None else list(proposals)
+        if len(batches) != len(proposals):
+            raise ValueError("each dynamics scene requires one proposal")
+        if not batches:
+            return []
+        first = batches[0]["positions"]
+        if any(batch["positions"].device != first.device or batch["positions"].dtype != first.dtype for batch in batches):
+            raise ValueError("batched dynamics scenes must share dtype and device")
+        graphs = [self._scene_graph(batch, proposal, self._graph_cache.scene(index))
+                  for index, (batch, proposal) in enumerate(zip(batches, proposals))]
+        graph = Batch.from_data_list(graphs, exclude_keys=["contact_pairs", "floor_corner_ids"])
+        hidden = self._encode_graph(graph)
+        cell_counts = [item["cell"].num_nodes for item in graphs]
+        cells = hidden["cell"].split(cell_counts)
+        bodies = hidden["body"].split(1)
+        tokens = [torch.cat((cell, body)) for cell, body in zip(cells, bodies)]
+        padded = nn.utils.rnn.pad_sequence(tokens, batch_first=True)
+        lengths = torch.tensor([len(item) for item in tokens], device=first.device)
+        padding = torch.arange(padded.shape[1], device=first.device)[None] >= lengths[:, None]
+        contexts = self.transformer(padded, src_key_padding_mask=padding)
+        corners = hidden["corner"].split([item["corner"].num_nodes for item in graphs])
+        faces = hidden["face"].split([item["face"].num_nodes for item in graphs])
+        return [self._fuse_context(batch, corner, face, context[:count])
+                for batch, corner, face, context, count in zip(batches, corners, faces, contexts, cell_counts)]
 
     def _prediction(self, batch, corner_context, face_context, proposal=None):
         dt = torch.as_tensor(batch["dt"], device=batch["positions"].device, dtype=batch["positions"].dtype)
@@ -449,6 +496,10 @@ class TemporalDynamicsModel(nn.Module):
 
     def forward(self, batch):
         return self._prediction(batch, *self.encode(batch))
+
+    def forward_batch(self, batches):
+        batches = list(batches)
+        return [self._prediction(batch, *context) for batch, context in zip(batches, self.encode_batch(batches))]
 
     def forward_with_flow_context(self, batch):
         corner_context, face_context = self.encode(batch)
@@ -531,3 +582,9 @@ class NeuralDynamicsCorrector(TemporalDynamicsModel):
 
     def forward(self, batch, proposal):
         return self._prediction(batch, *self.encode(batch, proposal=proposal), proposal=proposal)
+
+    def forward_batch(self, batches, proposals):
+        batches, proposals = list(batches), list(proposals)
+        contexts = self.encode_batch(batches, proposals)
+        return [self._prediction(batch, *context, proposal=proposal)
+                for batch, proposal, context in zip(batches, proposals, contexts)]

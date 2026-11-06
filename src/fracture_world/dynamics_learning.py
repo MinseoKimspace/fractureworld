@@ -103,6 +103,12 @@ class DynamicsTrainingConfig:
     motion_prior: str = "constant_acceleration"
     stream_data: bool = False
     rollout_steps: int = 1
+    batch_size: int = 1
+    lr_patience: int = 0
+    lr_factor: float = 0.5
+    min_learning_rate: float = 1.e-6
+    early_stopping_patience: int = 0
+    min_improvement: float = 0.0
 
 
 def state_batch(topology, positions, velocities, broken, fixed, gravity, material, dt, device, floor_height=None):
@@ -150,10 +156,10 @@ class _TrainingMetrics:
         self.last = None
         self.count = 0
 
-    def update(self, loss, terms):
+    def update(self, loss, terms, count=1):
         self.last = torch.stack([loss.detach(), *(terms[key] for key in self.names[1:])]).to(torch.float64)
-        self.sums.add_(self.last)
-        self.count += 1
+        self.sums.add_(self.last * count)
+        self.count += count
 
     def scores(self):
         return dict(zip(self.names, (self.sums / self.count).cpu().tolist())) if self.count else None
@@ -176,12 +182,14 @@ def _scales(trajectories):
 
 
 def _loss(model, batch, target_positions, target_velocities, target_broken, target_fixed, config, proposal=None,
-          flow=True, fracture_positive_weight=1.0, support_positive_weight=1.0, return_output=False, flow_generator=None):
+          flow=True, fracture_positive_weight=1.0, support_positive_weight=1.0, return_output=False, flow_generator=None,
+          output=None):
     context = None
-    if flow and proposal is None and hasattr(model, "forward_with_flow_context"):
-        output, context = model.forward_with_flow_context(batch)
-    else:
-        output = model(batch) if proposal is None else model(batch, proposal)
+    if output is None:
+        if flow and proposal is None and hasattr(model, "forward_with_flow_context"):
+            output, context = model.forward_with_flow_context(batch)
+        else:
+            output = model(batch) if proposal is None else model(batch, proposal)
     mass = batch["masses"] / batch["masses"].sum()
     velocity = model.config["velocity_scale"]
     position_error = ((output["positions"] - target_positions) / (batch["dt"] * velocity)).square().sum(dim=1)
@@ -255,6 +263,37 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
                                       for key in components[0]}
 
 
+def _rollout_loss_batch(network, trajectory, frames, device, config, *, fixed_predictor=None,
+                        fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generators=None):
+    prepared = _TrainingTrajectory(trajectory, device) if prepared is None else prepared
+    batches = [prepared.batch(int(frame)) for frame in frames]
+    horizons = [min(config.rollout_steps, len(trajectory) - int(frame)) for frame in frames]
+    losses, components = [[] for _ in frames], [[] for _ in frames]
+    for offset in range(max(horizons)):
+        active = [index for index, horizon in enumerate(horizons) if offset < horizon]
+        inputs = [{**batches[index], "dt": float(prepared.timesteps[int(frames[index]) + offset])} for index in active]
+        proposals = fixed_predictor.forward_batch(inputs) if fixed_predictor is not None else [None] * len(inputs)
+        outputs = network.forward_batch(inputs, proposals) if fixed_predictor is not None else network.forward_batch(inputs)
+        for index, batch, proposal, output in zip(active, inputs, proposals, outputs):
+            frame = int(frames[index]) + offset
+            generator = None if flow_generators is None else flow_generators[index]
+            loss, terms = _loss(network, batch, *prepared.targets(frame), config, proposal,
+                                flow=fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
+                                support_positive_weight=support_positive_weight, flow_generator=generator, output=output)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"nonfinite temporal dynamics training loss in {trajectory.case_id} at frame {frame}")
+            if config.rollout_steps > 1:
+                _validate_autoregressive_prediction(output, trajectory.case_id, frame + 1)
+            losses[index].append(loss)
+            components[index].append(terms)
+            batches[index] = {**batch, "positions": output["positions"], "velocities": output["velocities"],
+                              "broken": batch["broken"] | output["broken"], "fixed": batch["fixed"] & output["next_fixed"]}
+    window_losses = torch.stack([torch.stack(values).mean() for values in losses])
+    terms = {key: torch.stack([torch.stack([value[key] for value in window]).mean(dtype=torch.float64)
+                              for window in components]).mean() for key in components[0][0]}
+    return window_losses.mean(), terms
+
+
 def _checkpoint_splits(trajectories, checkpoint):
     names = ("train", "validation", "test")
     manifest = checkpoint.get("splits")
@@ -288,11 +327,20 @@ def _checkpoint_splits(trajectories, checkpoint):
 
 
 def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, device="auto", stream_data=False,
-                           rollout_steps=None, learning_rate=None):
+                           rollout_steps=None, learning_rate=None, batch_size=None, lr_patience=None, lr_factor=None,
+                           min_learning_rate=None, early_stopping_patience=None, min_improvement=None, resume=None):
     if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
         raise ValueError("corrector epochs must be a positive integer")
     model, _, checkpoint, _ = load_dynamics_model(checkpoint_path, "cpu")
     saved = checkpoint.get("training", {})
+    if resume is not None:
+        resumed = torch.load(Path(resume), map_location="cpu", weights_only=True)
+        if (resumed.get("training_mode") != "neural_corrector_only" or
+                resumed.get("training_state", {}).get("stage") != "neural_corrector"):
+            raise ValueError("corrector resume requires a corrector-only last.pt checkpoint")
+        if resumed.get("predictor_checkpoint_sha256") != file_hash(checkpoint_path):
+            raise ValueError("resuming requires the original frozen predictor checkpoint")
+        saved = resumed["training"]
     options = {field.name: saved[field.name] for field in fields(DynamicsTrainingConfig) if field.name in saved}
     for name in ("hidden", "heads", "graph_layers", "transformer_layers", "flow_architecture", "flow_layers",
                  "motion_prior", "learn_support_release"):
@@ -300,12 +348,13 @@ def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, dev
     options.setdefault("epochs", 1)
     options.update(corrector_epochs=epochs, device=device, stream_data=stream_data)
     options["split_unit"] = checkpoint.get("generalization_protocol", options.get("split_unit", "loading_condition"))
-    if rollout_steps is not None:
-        options["rollout_steps"] = rollout_steps
-    if learning_rate is not None:
-        options["learning_rate"] = learning_rate
+    overrides = dict(rollout_steps=rollout_steps, learning_rate=learning_rate, batch_size=batch_size,
+                     lr_patience=lr_patience, lr_factor=lr_factor, min_learning_rate=min_learning_rate,
+                     early_stopping_patience=early_stopping_patience, min_improvement=min_improvement)
+    options.update({name: value for name, value in overrides.items() if value is not None})
     config = DynamicsTrainingConfig(**options)
-    return train_dynamics(data_dir, output_dir, config, predictor_checkpoint=checkpoint_path)
+    return train_dynamics(data_dir, output_dir, config, resume=resume,
+                          predictor_checkpoint=checkpoint_path if resume is None else None)
 
 
 def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None):
@@ -315,6 +364,15 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
         raise ValueError("epochs and learning rate must be positive; corrector_epochs must be nonnegative")
     if isinstance(config.rollout_steps, bool) or not isinstance(config.rollout_steps, int) or config.rollout_steps < 1:
         raise ValueError("rollout_steps must be a positive integer")
+    for name in ("batch_size", "lr_patience", "early_stopping_patience"):
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < (1 if name == "batch_size" else 0):
+            raise ValueError(f"{name} must be a {'positive' if name == 'batch_size' else 'nonnegative'} integer")
+    if (not np.isfinite([config.lr_factor, config.min_learning_rate, config.min_improvement]).all() or
+            not 0 < config.lr_factor < 1 or config.min_learning_rate <= 0 or not 0 <= config.min_improvement < 1):
+        raise ValueError("learning-rate factor, minimum learning rate and relative improvement must be finite and admissible")
+    if config.lr_patience and config.min_learning_rate > config.learning_rate:
+        raise ValueError("minimum learning rate cannot exceed the initial learning rate")
     if not np.isfinite([config.learning_rate, config.fracture_weight, config.flow_weight]).all():
         raise ValueError("training weights must be finite")
     if config.fracture_weight <= 0 or config.flow_weight <= 0:
@@ -325,7 +383,7 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
     if resumed is not None:
         if resumed.get("format") != FORMAT or "training_state" not in resumed:
             raise ValueError("resume requires a resumable last.pt checkpoint; legacy model weights remain valid for inference")
-        previous = resumed["training"]
+        previous = asdict(DynamicsTrainingConfig(**resumed["training"]))
         variable_options = {"epochs", "corrector_epochs", "device", "stream_data"}
         if any(previous.get(key) != value for key, value in asdict(config).items() if key not in variable_options):
             raise ValueError("resuming requires unchanged model, loss, split, seed and rollout settings")
@@ -373,6 +431,8 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
     training = splits["train"]
     if not training:
         raise ValueError("no training trajectories")
+    if (config.lr_patience or config.early_stopping_patience) and not splits["validation"]:
+        raise ValueError("learning-rate scheduling and early stopping require a held-out validation split")
     coverage = None
     if config.require_event_coverage and frozen_checkpoint is None:
         from .dynamics_readiness import inspect_dynamics_dataset
@@ -462,96 +522,161 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
 
     def train_stage(network, epochs, stage, fixed_predictor=None):
         optimizer = torch.optim.AdamW(network.parameters(), lr=config.learning_rate)
+        scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=config.lr_factor, patience=config.lr_patience,
+            threshold=config.min_improvement, threshold_mode="rel", min_lr=config.min_learning_rate)
+            if config.lr_patience else None)
         if fixed_predictor is not None:
             fixed_predictor.requires_grad_(False)
             fixed_predictor.eval()
+            network._graph_cache = fixed_predictor._graph_cache
         best, best_state, first_epoch = float("inf"), None, 0
+        significant_best, bad_epochs, stop_reason = float("inf"), 0, None
+        selection = None
         key = "model" if stage == "predictor" else "corrector"
+
+        def run_split(name, epoch, is_training):
+            split_started = last_progress = perf_counter()
+            network.train(is_training)
+            metrics = _TrainingMetrics(device)
+            window_count = sum(len(item) for item in splits[name])
+            prepare_seconds, optimizer_steps = 0.0, 0
+            interval_started, interval_windows = split_started, 0
+            for case_index, trajectory in enumerate(splits[name], start=1):
+                prepare_started = perf_counter()
+                prepared = _TrainingTrajectory(trajectory, device)
+                prepare_seconds += perf_counter() - prepare_started
+                order = np.random.permutation(len(trajectory)) if is_training else range(len(trajectory))
+                for begin in range(0, len(order), config.batch_size):
+                    frames = order[begin:begin + config.batch_size]
+                    generators = None if is_training else [
+                        _validation_generator(trajectory.case_id, int(frame), config.seed, device) for frame in frames]
+                    with torch.set_grad_enabled(is_training):
+                        if is_training:
+                            optimizer.zero_grad(set_to_none=True)
+                        options = dict(fixed_predictor=fixed_predictor, fracture_positive_weight=fracture_positive_weight,
+                                       support_positive_weight=support_positive_weight, prepared=prepared)
+                        if len(frames) == 1:
+                            loss, terms = _rollout_loss(network, trajectory, int(frames[0]), device, config,
+                                                        flow_generator=None if generators is None else generators[0], **options)
+                        else:
+                            loss, terms = _rollout_loss_batch(network, trajectory, frames, device, config,
+                                                              flow_generators=generators, **options)
+                        if is_training:
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0, error_if_nonfinite=True)
+                            optimizer.step()
+                            optimizer_steps += 1
+                    metrics.update(loss, terms, len(frames))
+                    if perf_counter() - last_progress >= 5:
+                        current_loss = float(metrics.last[0])
+                        now = perf_counter()
+                        elapsed = now - split_started
+                        seconds_per_window = elapsed / metrics.count
+                        interval_count = metrics.count - interval_windows
+                        print(json.dumps(dict(event="training_progress", stage=stage, epoch=epoch,
+                                              timestamp=datetime.now(timezone.utc).isoformat(),
+                                              split=name, case=trajectory.case_id, case_index=case_index,
+                                              cases=len(splits[name]), transition=begin + len(frames),
+                                              transitions=len(trajectory), rollout_steps=config.rollout_steps,
+                                              batch_size=len(frames), optimizer_steps=optimizer_steps,
+                                              learning_rate=optimizer.param_groups[0]["lr"],
+                                              gpu_peak_memory_bytes=(torch.cuda.max_memory_allocated(device)
+                                                                     if device.type == "cuda" else None),
+                                              windows_completed=metrics.count, windows_total=window_count,
+                                              elapsed_seconds=elapsed, seconds_per_window=seconds_per_window,
+                                              interval_seconds_per_window=(now - interval_started) / interval_count,
+                                              eta_seconds=(window_count - metrics.count) * seconds_per_window,
+                                              data_prepare_seconds=prepare_seconds,
+                                              loss=current_loss, device=str(device)), allow_nan=False), flush=True)
+                        last_progress = interval_started = perf_counter()
+                        interval_windows = metrics.count
+                del prepared
+            timing = dict(seconds=perf_counter() - split_started, windows=metrics.count,
+                          optimizer_steps=optimizer_steps, data_prepare_seconds=prepare_seconds)
+            if metrics.count:
+                timing["seconds_per_window"] = timing["seconds"] / metrics.count
+            return metrics.scores(), timing
+
         if resumed is not None and resumed["training_state"]["stage"] == stage:
             saved = resumed["training_state"]
             network.load_state_dict(resumed[key], strict=True)
             optimizer.load_state_dict(saved["optimizer"])
             best, best_state, first_epoch = saved["best_loss"], saved["best_state"], saved["completed_epoch"]
+            significant_best, bad_epochs = saved.get("significant_best_loss", best), saved.get("bad_epochs", 0)
+            stop_reason = saved.get("stop_reason")
+            if scheduler is not None and saved.get("scheduler") is not None:
+                scheduler.load_state_dict(saved["scheduler"])
+            selection = resumed.get("selection")
+            if "training_baseline" in resumed:
+                checkpoint["training_baseline"] = resumed["training_baseline"]
             _restore_random_state(saved["random_state"])
-            _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state})
+            _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
             setup_progress(dict(phase="resume", status="completed", stage=stage, completed_epoch=first_epoch,
                                 target_epochs=epochs, checkpoint=str(Path(resume).resolve())))
-        last_progress = perf_counter()
+        elif fixed_predictor is not None:
+            baseline_split = "validation" if splits["validation"] else "train"
+            scores, timing = run_split(baseline_split, 0, False)
+            best = significant_best = scores["loss"]
+            best_state = {name: value.detach().cpu().clone() for name, value in network.state_dict().items()}
+            baseline = dict(stage=stage, epoch=0, split=baseline_split, losses=scores, timing=timing)
+            checkpoint["training_baseline"] = baseline
+            selection = dict(stage=stage, epoch=0, loss=best, split=baseline_split)
+            if scheduler is not None:
+                scheduler.step(best)
+            _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
+            print(json.dumps(dict(event="training_baseline", **baseline), allow_nan=False), flush=True)
+        if stop_reason == "validation_plateau":
+            network.load_state_dict(best_state)
+            network.eval()
+            checkpoint["selection"] = selection
+            return best_state
         for epoch in range(first_epoch, epochs):
             epoch_started = perf_counter()
-            scores = {}
-            timings = {}
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            scores, timings = {}, {}
+            learning_rate = optimizer.param_groups[0]["lr"]
             for name in ("train", "validation"):
-                split_started = perf_counter()
-                is_training = name == "train"
-                network.train(is_training)
-                metrics = _TrainingMetrics(device)
-                window_count = sum(len(item) for item in splits[name])
-                prepare_seconds = 0.0
-                interval_started, interval_windows = split_started, 0
-                for case_index, trajectory in enumerate(splits[name], start=1):
-                    prepare_started = perf_counter()
-                    prepared = _TrainingTrajectory(trajectory, device)
-                    prepare_seconds += perf_counter() - prepare_started
-                    order = np.random.permutation(len(trajectory)) if is_training else range(len(trajectory))
-                    for transition_index, frame in enumerate(order, start=1):
-                        generator = None if is_training else _validation_generator(trajectory.case_id, int(frame), config.seed, device)
-                        with torch.set_grad_enabled(is_training):
-                            loss, terms = _rollout_loss(network, trajectory, int(frame), device, config,
-                                                        fixed_predictor=fixed_predictor,
-                                                        fracture_positive_weight=fracture_positive_weight,
-                                                        support_positive_weight=support_positive_weight, prepared=prepared,
-                                                        flow_generator=generator)
-                            if is_training:
-                                optimizer.zero_grad(set_to_none=True)
-                                loss.backward()
-                                torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0, error_if_nonfinite=True)
-                                optimizer.step()
-                        metrics.update(loss, terms)
-                        if perf_counter() - last_progress >= 5:
-                            current_loss = float(metrics.last[0])
-                            now = perf_counter()
-                            elapsed = now - split_started
-                            seconds_per_window = elapsed / metrics.count
-                            interval_count = metrics.count - interval_windows
-                            print(json.dumps(dict(event="training_progress", stage=stage, epoch=epoch + 1,
-                                                  timestamp=datetime.now(timezone.utc).isoformat(),
-                                                  split=name, case=trajectory.case_id, case_index=case_index,
-                                                  cases=len(splits[name]), transition=transition_index,
-                                                  transitions=len(trajectory), rollout_steps=config.rollout_steps,
-                                                  windows_completed=metrics.count, windows_total=window_count,
-                                                  elapsed_seconds=elapsed, seconds_per_window=seconds_per_window,
-                                                  interval_seconds_per_window=(now - interval_started) / interval_count,
-                                                  eta_seconds=(window_count - metrics.count) * seconds_per_window,
-                                                  data_prepare_seconds=prepare_seconds,
-                                                  loss=current_loss, device=str(device)),
-                                             allow_nan=False), flush=True)
-                            last_progress = interval_started = perf_counter()
-                            interval_windows = metrics.count
-                    del prepared
-                scores[name] = metrics.scores()
-                timings[name] = dict(seconds=perf_counter() - split_started, windows=metrics.count,
-                                     data_prepare_seconds=prepare_seconds)
-                if metrics.count:
-                    timings[name]["seconds_per_window"] = timings[name]["seconds"] / metrics.count
+                scores[name], timings[name] = run_split(name, epoch + 1, name == "train")
             criterion = (scores["validation"] or scores["train"])["loss"]
-            record = dict(stage=stage, epoch=epoch + 1, losses=scores, seconds=perf_counter() - started,
-                          epoch_seconds=perf_counter() - epoch_started, split_timing=timings,
-                          device=str(device), overfit_debug=config.overfit, rollout_steps=config.rollout_steps)
             if criterion < best:
                 best = criterion
                 best_state = {key: value.detach().cpu().clone() for key, value in network.state_dict().items()}
-                _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state})
+                selection = dict(stage=stage, epoch=epoch + 1, loss=best,
+                                 split="validation" if scores["validation"] else "train")
+                _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
+            if criterion < significant_best * (1 - config.min_improvement):
+                significant_best, bad_epochs = criterion, 0
+            else:
+                bad_epochs += 1
+            if scheduler is not None:
+                scheduler.step(criterion)
+            stop_reason = ("validation_plateau" if config.early_stopping_patience and bad_epochs >= config.early_stopping_patience
+                           else "epoch_budget" if epoch + 1 == epochs else None)
             training_state = dict(stage=stage, completed_epoch=epoch + 1, device_type=device.type,
                                   optimizer=optimizer.state_dict(), random_state=_random_state(),
-                                  best_loss=best, best_state=best_state)
-            _atomic_checkpoint(directory / "last.pt", {**checkpoint, key: network.state_dict(), "epoch": epoch + 1,
+                                  best_loss=best, best_state=best_state, significant_best_loss=significant_best,
+                                  bad_epochs=bad_epochs, scheduler=None if scheduler is None else scheduler.state_dict(),
+                                  stop_reason=stop_reason)
+            _atomic_checkpoint(directory / "last.pt", {**checkpoint, key: network.state_dict(), "selection": selection,
+                                                        "epoch": epoch + 1,
                                                         "training_state": training_state})
+            record = dict(stage=stage, epoch=epoch + 1, losses=scores, seconds=perf_counter() - started,
+                          epoch_seconds=perf_counter() - epoch_started, split_timing=timings, batch_size=config.batch_size,
+                          learning_rate=learning_rate, next_learning_rate=optimizer.param_groups[0]["lr"],
+                          best_loss=best, significant_best_loss=significant_best, bad_epochs=bad_epochs,
+                          gpu_peak_memory_bytes=(torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None),
+                          stop_reason=stop_reason, baseline_loss=checkpoint.get("training_baseline", {}).get("losses", {}).get("loss"),
+                          device=str(device), overfit_debug=config.overfit, rollout_steps=config.rollout_steps)
             with (directory / "training.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, allow_nan=False) + "\n")
             print(json.dumps(record, allow_nan=False), flush=True)
+            if stop_reason == "validation_plateau":
+                break
         network.load_state_dict(best_state)
         network.eval()
+        checkpoint["selection"] = selection
         return best_state
 
     if resumed is not None and resumed["training_state"]["stage"] == "neural_corrector":

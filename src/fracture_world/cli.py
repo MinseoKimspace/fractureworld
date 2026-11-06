@@ -59,6 +59,14 @@ def parser():
     dynamics_training.add_argument("--flow-architecture", choices=["coupled", "independent"], default="coupled")
     dynamics_training.add_argument("--flow-layers", type=int, default=2)
     dynamics_training.add_argument("--learning-rate", type=float, default=0.0003)
+    dynamics_training.add_argument("--batch-size", type=int, default=1, help="Independent rollout windows per optimizer update")
+    dynamics_training.add_argument("--lr-patience", type=int, default=0, help="Plateau scheduler patience; zero disables scheduling")
+    dynamics_training.add_argument("--lr-factor", type=float, default=0.5)
+    dynamics_training.add_argument("--min-learning-rate", type=float, default=0.000001)
+    dynamics_training.add_argument("--early-stopping-patience", type=int, default=0,
+                                   help="Stop after this many epochs without significant validation improvement; zero disables stopping")
+    dynamics_training.add_argument("--min-improvement", type=float, default=0.0,
+                                   help="Relative validation improvement required to reset plateau counters")
     dynamics_training.add_argument("--fracture-weight", type=float, default=1.0)
     dynamics_training.add_argument("--flow-weight", type=float, default=1.0)
     dynamics_training.add_argument("--device", default="auto")
@@ -75,11 +83,21 @@ def parser():
     corrector_training.add_argument("--checkpoint", type=Path, required=True)
     corrector_training.add_argument("--data", type=Path, required=True)
     corrector_training.add_argument("--output", type=Path, required=True)
-    corrector_training.add_argument("--epochs", type=int, required=True)
+    corrector_training.add_argument("--resume", type=Path,
+                                    help="Resume corrector training from its completed-epoch last.pt")
+    corrector_training.add_argument("--epochs", type=int, required=True, help="Maximum corrector training epochs")
     corrector_training.add_argument("--device", default="auto")
     corrector_training.add_argument("--stream-data", action="store_true")
     corrector_training.add_argument("--rollout-steps", type=int)
     corrector_training.add_argument("--learning-rate", type=float)
+    corrector_training.add_argument("--batch-size", type=int, help="Independent rollout windows per optimizer update")
+    corrector_training.add_argument("--lr-patience", type=int, help="Plateau scheduler patience; zero disables scheduling")
+    corrector_training.add_argument("--lr-factor", type=float)
+    corrector_training.add_argument("--min-learning-rate", type=float)
+    corrector_training.add_argument("--early-stopping-patience", type=int,
+                                    help="Stop after this many epochs without significant validation improvement; zero disables stopping")
+    corrector_training.add_argument("--min-improvement", type=float,
+                                    help="Relative validation improvement required to reset plateau counters")
     initial = commands.add_parser("dynamics-initial", help="Export only one current state, without teacher future arrays")
     initial.add_argument("--case", type=Path, required=True)
     initial.add_argument("--trajectory", type=Path, required=True)
@@ -204,9 +222,12 @@ def run(args):
     elif args.command == "dynamics-train-corrector":
         from .dynamics_learning import train_neural_corrector
 
+        optional = ("resume", "batch_size", "lr_patience", "lr_factor", "min_learning_rate",
+                    "early_stopping_patience", "min_improvement")
+        options = {name: getattr(args, name) for name in optional if getattr(args, name) is not None}
         checkpoint = train_neural_corrector(args.data, args.checkpoint, args.output, epochs=args.epochs,
                                              device=args.device, stream_data=args.stream_data,
-                                             rollout_steps=args.rollout_steps, learning_rate=args.learning_rate)
+                                             rollout_steps=args.rollout_steps, learning_rate=args.learning_rate, **options)
         output({"checkpoint": str(checkpoint)})
     elif args.command == "dynamics-initial":
         from .dynamics_initial import export_initial
