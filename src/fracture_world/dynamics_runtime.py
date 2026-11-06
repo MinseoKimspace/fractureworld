@@ -8,7 +8,6 @@ import numpy as np
 import torch
 
 from .dynamics_corrector import CorrectorTolerances, DynamicsProblem, _diagnostics, solve_central, solve_consensus
-from .dynamics_pcg import solve_central_pcg
 from .dynamics_arithmetic import position_publication_envelope
 from .dynamics_energy import CorotationalEnergy, EnergyProjection, native_corotational_energy
 from .dynamics_energy_solvers import solve_energy
@@ -541,8 +540,6 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
         else:
             if method == "central":
                 result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel)
-            elif method == "central_pcg":
-                result = solve_central_pcg(problem, tolerance, config.max_iterations, cancel=cancel, progress=progress)
             else:
                 result = solve_consensus(problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations,
                                          cancel=cancel, progress=progress, _workspace=linear_workspace)
@@ -674,7 +671,6 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
                       "Engine-free neural fracture rollout",
                 source="constant-acceleration physical prediction; no learned dynamics or fracture generation" if physics_only
                        else "learned fracture and support release; learned motion discarded; numerical state correction" if motion_ablated
-                       else "trained neural dynamics with centralized PCG correction" if metadata.get("solver_method") == "central_pcg"
                        else "trained neural dynamics with optional proximal consensus",
                 bodies=[dict(id=0, **first, color="#d3ab75")], frames=frames,
                 metadata={**metadata, **{key: initial.metadata[key] for key in ("floor_height_m", "up_axis") if key in initial.metadata},
@@ -685,12 +681,11 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
 @torch.no_grad()
 def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="consensus", config=None, device="auto", progress=None,
                      *, cancel=None):
-    allowed = {"physics", "raw", "neural", "central", "central_pcg", "consensus",
-               "no_motion_central", "no_motion_central_pcg", "no_motion_consensus"}
+    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
     if method not in allowed or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-        raise ValueError("select physics/raw/neural/central/central_pcg/consensus/no_motion_central/no_motion_central_pcg/no_motion_consensus and a positive number of steps")
-    motion_ablated = method in {"no_motion_central", "no_motion_central_pcg", "no_motion_consensus"}
-    solver_method = method.removeprefix("no_motion_") if method in {"central", "central_pcg", "consensus"} or motion_ablated else None
+        raise ValueError("select physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus and a positive number of steps")
+    motion_ablated = method in {"no_motion_central", "no_motion_consensus"}
+    solver_method = method.removeprefix("no_motion_") if method in {"central", "consensus"} or motion_ablated else None
     constrained = solver_method is not None
     config = config or RolloutConfig()
     initial = load_initial(initial_path)

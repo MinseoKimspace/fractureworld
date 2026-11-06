@@ -90,7 +90,7 @@ def test_invalid_raw_endpoint_saves_committed_prefix_without_energy_or_elastic_a
     assert len(json.loads((output / "replay.json").read_text())["frames"]) == 2
 
 
-def test_compare_runs_central_and_central_pcg_after_raw_orientation_rejection(tmp_path, monkeypatch):
+def test_compare_runs_central_and_consensus_after_raw_orientation_rejection(tmp_path, monkeypatch):
     checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path, has_corrector=False)
 
     def predict(self, batch):
@@ -102,20 +102,20 @@ def test_compare_runs_central_and_central_pcg_after_raw_orientation_rejection(tm
     output = tmp_path / "comparison"
     report = compare_dynamics(checkpoint, initial, output, 1,
                               orientation_config(mechanics_mode="exact", energy_balance=False), "cpu",
-                              ["raw", "central", "central_pcg"])
+                              ["raw", "central", "consensus"])
     assert report["status"] == "comparison_finished"
-    assert report["attempted_methods"] == ["raw", "central", "central_pcg"]
+    assert report["attempted_methods"] == ["raw", "central", "consensus"]
     assert report["unattempted_methods"] == []
     assert report["all_rollouts_completed"] is False
     assert report["conditions"]["raw"]["status"] == "timestep_rejected"
     assert report["conditions"]["raw"]["completed_steps"] == 0
-    for method in ("central", "central_pcg"):
+    for method in ("central", "consensus"):
         assert report["conditions"][method]["status"] == "completed"
         assert report["conditions"][method]["completed_steps"] == 1
         assert report["conditions"][method]["predictor_calls"] == 1
         assert report["conditions"][method]["optimization_solves"] > 0
         assert (output / method / "report.json").is_file()
-    assert report["central_central_pcg_agreement"]["both_rollouts_completed"] is True
+    assert report["central_consensus_agreement"]["both_rollouts_completed"] is True
 
 
 def test_orientation_guard_does_not_hide_unrelated_value_errors(tmp_path, monkeypatch):

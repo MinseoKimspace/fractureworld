@@ -196,3 +196,22 @@ def test_merge_reports_only_common_complete_cases_with_failures_in_multiple_sour
     assert report["paired_accuracy"]["all_methods"]["common_full_horizon_cases"] == 1
     assert report["conditions"]["central"]["completed_rate"] == .5
     assert report["conditions"]["no_motion_consensus"]["completed_rate"] == .5
+
+
+def test_merge_recomputes_paired_runtime_without_changing_source_reports(tmp_path):
+    central = make_benchmark(tmp_path / "central", ["central"])
+    consensus = make_benchmark(tmp_path / "consensus", ["consensus"])
+    for directory, runtime, iterations in ((central, 3., 7), (consensus, 1., 4)):
+        for path in directory.rglob("*.json"):
+            data = json.loads(path.read_text())
+            if "conditions" in data and "format" in data:
+                for condition in data["conditions"].values():
+                    condition.update(runtime_seconds=runtime, corrector_iterations=iterations, optimization_solves=2)
+            write_report(path, data)
+    before = source_hashes([central, consensus])
+    report = merge_dynamics_benchmarks([central, consensus], tmp_path / "merged.json")
+    pair = report["paired_solver_metrics"]["pairwise"][0]
+    assert pair["methods"] == ["central", "consensus"]
+    assert pair["metrics"]["runtime_seconds"]["mean_difference_second_minus_first"] == -2.
+    assert pair["metrics"]["corrector_iterations"]["mean_difference_second_minus_first"] == -3.
+    assert before == source_hashes([central, consensus])

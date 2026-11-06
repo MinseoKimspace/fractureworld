@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -14,7 +14,7 @@ from torch.nn import functional as F
 
 from .dynamics_data import load_dynamics_dataset, split_dynamics_cases, supervision_counts
 from .dynamics_model import NeuralDynamicsCorrector, TemporalDynamicsModel
-from .io import new_directory, write_json
+from .io import file_hash, new_directory, write_json
 from .learning import choose_device, seed_all
 
 
@@ -54,14 +54,21 @@ def _restore_random_state(state):
         torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
 
 
-def _same_training_sources(recorded, current):
+def _same_training_sources(recorded, current, *, allow_relocated=False):
     if not isinstance(recorded, dict) or recorded.keys() != current.keys():
         return False
     for case_id, metadata in current.items():
-        previous = recorded[case_id]
+        previous = dict(recorded[case_id]) if isinstance(recorded[case_id], dict) else recorded[case_id]
         expected = dict(metadata)
         if isinstance(previous, dict) and "native_settings" not in previous:
             expected.pop("native_settings", None)
+        if allow_relocated and isinstance(previous, dict):
+            for values in (previous, expected):
+                values.pop("source_dataset", None)
+                hashes = values.get("source_hashes")
+                if not isinstance(hashes, dict) or not hashes:
+                    return False
+                values["source_hashes"] = sorted(hashes.values())
         if previous != expected:
             return False
     return True
@@ -248,7 +255,60 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
                                       for key in components[0]}
 
 
-def train_dynamics(data_dir, output_dir, config, *, resume=None):
+def _checkpoint_splits(trajectories, checkpoint):
+    names = ("train", "validation", "test")
+    manifest = checkpoint.get("splits")
+    conditions = checkpoint.get("condition_splits")
+    if not isinstance(manifest, dict) or not isinstance(conditions, dict):
+        raise ValueError("corrector training requires recorded case and loading-condition splits")
+    if any(not isinstance(manifest.get(name), list) or not isinstance(conditions.get(name), list) for name in names):
+        raise ValueError("checkpoint must record train, validation and test splits")
+    assigned = [case for name in names for case in manifest[name]]
+    if any(not isinstance(case, str) for case in assigned) or len(set(assigned)) != len(assigned):
+        raise ValueError("checkpoint case splits must contain unique case IDs")
+    indexed = {item.case_id: item for item in trajectories}
+    if len(indexed) != len(trajectories) or set(indexed) != set(assigned):
+        raise ValueError("corrector data must match every recorded checkpoint case")
+    splits = {name: [indexed[case] for case in manifest[name]] for name in names}
+    observed = {name: {item.condition_digest for item in rows} for name, rows in splits.items()}
+    if any(observed[name] != set(conditions[name]) for name in names):
+        raise ValueError("corrector data loading conditions must match the checkpoint")
+    for index, name in enumerate(names):
+        for other in names[index + 1:]:
+            if observed[name].intersection(observed[other]):
+                raise ValueError("checkpoint loading-condition splits overlap")
+            if checkpoint.get("generalization_protocol") == "shape_family":
+                if {item.shape_family for item in splits[name]}.intersection(item.shape_family for item in splits[other]):
+                    raise ValueError("checkpoint shape-family splits overlap")
+    recorded = checkpoint.get("source")
+    current = {item.case_id: item.metadata for item in trajectories}
+    if recorded is not None and not _same_training_sources(recorded, current, allow_relocated=True):
+        raise ValueError("corrector data archives or physical metadata differ from the checkpoint")
+    return splits
+
+
+def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, device="auto", stream_data=False,
+                           rollout_steps=None, learning_rate=None):
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+        raise ValueError("corrector epochs must be a positive integer")
+    model, _, checkpoint, _ = load_dynamics_model(checkpoint_path, "cpu")
+    saved = checkpoint.get("training", {})
+    options = {field.name: saved[field.name] for field in fields(DynamicsTrainingConfig) if field.name in saved}
+    for name in ("hidden", "heads", "graph_layers", "transformer_layers", "flow_architecture", "flow_layers",
+                 "motion_prior", "learn_support_release"):
+        options[name] = model.config[name]
+    options.setdefault("epochs", 1)
+    options.update(corrector_epochs=epochs, device=device, stream_data=stream_data)
+    options["split_unit"] = checkpoint.get("generalization_protocol", options.get("split_unit", "loading_condition"))
+    if rollout_steps is not None:
+        options["rollout_steps"] = rollout_steps
+    if learning_rate is not None:
+        options["learning_rate"] = learning_rate
+    config = DynamicsTrainingConfig(**options)
+    return train_dynamics(data_dir, output_dir, config, predictor_checkpoint=checkpoint_path)
+
+
+def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None):
     if not isinstance(config, DynamicsTrainingConfig):
         raise TypeError("config must be DynamicsTrainingConfig")
     if config.epochs < 1 or config.corrector_epochs < 0 or config.learning_rate <= 0:
@@ -259,6 +319,8 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
         raise ValueError("training weights must be finite")
     if config.fracture_weight <= 0 or config.flow_weight <= 0:
         raise ValueError("fracture and flow weights must be positive")
+    if predictor_checkpoint is not None and (resume is not None or config.corrector_epochs < 1):
+        raise ValueError("a pretrained predictor requires a fresh corrector run with positive corrector epochs")
     resumed = torch.load(Path(resume), map_location="cpu", weights_only=True) if resume is not None else None
     if resumed is not None:
         if resumed.get("format") != FORMAT or "training_state" not in resumed:
@@ -287,6 +349,12 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
         raise ValueError("resuming requires the same training device type")
     if device.type == "cpu":
         torch.set_num_threads(min(torch.get_num_threads(), 4))
+    frozen_checkpoint, model = None, None
+    frozen_path = predictor_checkpoint
+    if resumed is not None and resumed.get("training_mode") == "neural_corrector_only":
+        frozen_path = resume
+    if frozen_path is not None:
+        model, _, frozen_checkpoint, _ = load_dynamics_model(frozen_path, device)
     options = dict(progress=setup_progress)
     if config.stream_data:
         options["stream"] = True
@@ -299,13 +367,14 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
         if not np.allclose(np.diff(trajectory.times), base_dt, rtol=64 * np.finfo(np.float32).eps, atol=0):
             raise ValueError("temporal dynamics training requires every native step; regenerate with record_stride=1")
     setup_progress(dict(phase="training_inputs", status="completed", cases=len(trajectories)))
-    splits = split_dynamics_cases(trajectories, config.seed, config.overfit, event_stratified=config.event_stratified,
-                                  split_unit=config.split_unit)
+    splits = (_checkpoint_splits(trajectories, frozen_checkpoint) if frozen_checkpoint is not None else
+              split_dynamics_cases(trajectories, config.seed, config.overfit, event_stratified=config.event_stratified,
+                                   split_unit=config.split_unit))
     training = splits["train"]
     if not training:
         raise ValueError("no training trajectories")
     coverage = None
-    if config.require_event_coverage:
+    if config.require_event_coverage and frozen_checkpoint is None:
         from .dynamics_readiness import inspect_dynamics_dataset
 
         coverage = inspect_dynamics_dataset(data_dir, config.seed, config.overfit, config.min_post_event_steps,
@@ -321,16 +390,22 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
     support_negative = sum(item["support_negative"] for item in counts)
     fracture_positive_weight = max(1.0, fracture_negative / fracture_positive) if fracture_positive else 1.0
     support_positive_weight = max(1.0, support_negative / support_positive) if support_positive else 1.0
+    if frozen_checkpoint is not None:
+        weights = frozen_checkpoint.get("class_weights", {})
+        fracture_positive_weight = float(weights.get("fracture_positive", fracture_positive_weight))
+        support_positive_weight = float(weights.get("support_release_positive", support_positive_weight))
     seed_all(config.seed)
     setup_progress(dict(phase="normalization", status="started", cases=len(training)))
-    model_config = dict(hidden=config.hidden, heads=config.heads, graph_layers=config.graph_layers,
-                        transformer_layers=config.transformer_layers, learn_support_release=config.learn_support_release,
-                        flow_architecture=config.flow_architecture, flow_layers=config.flow_layers, motion_prior=config.motion_prior,
-                        **_scales(training))
+    model_config = (dict(model.config) if frozen_checkpoint is not None else
+                    dict(hidden=config.hidden, heads=config.heads, graph_layers=config.graph_layers,
+                         transformer_layers=config.transformer_layers, learn_support_release=config.learn_support_release,
+                         flow_architecture=config.flow_architecture, flow_layers=config.flow_layers, motion_prior=config.motion_prior,
+                         **_scales(training)))
     setup_progress(dict(phase="model_initialization", status="started", device=str(device)))
-    model = TemporalDynamicsModel(**model_config).to(device)
-    model.fracture_logit_offset = float(np.log(fracture_positive_weight))
-    model.support_logit_offset = float(np.log(support_positive_weight))
+    if frozen_checkpoint is None:
+        model = TemporalDynamicsModel(**model_config).to(device)
+        model.fracture_logit_offset = float(np.log(fracture_positive_weight))
+        model.support_logit_offset = float(np.log(support_positive_weight))
     manifest = {name: [item.case_id for item in rows] for name, rows in splits.items()}
     conditions = {name: sorted({item.condition_digest for item in rows}) for name, rows in splits.items()}
     shape_families = {name: sorted({item.shape_family for item in rows}) for name, rows in splits.items()}
@@ -340,7 +415,7 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
         matching = {"model_config": model_config, "splits": manifest, "condition_splits": conditions,
                     "class_weights": dict(fracture_positive=fracture_positive_weight, support_release_positive=support_positive_weight)}
         if (any(resumed.get(key) != value for key, value in matching.items()) or
-                not _same_training_sources(resumed.get("source"), provenance)):
+                not _same_training_sources(resumed.get("source"), provenance, allow_relocated=frozen_checkpoint is not None)):
             raise ValueError("resume checkpoint does not match the dataset, model normalization or supervision")
     directory = Path(output_dir).resolve()
     if resumed is None or directory != Path(resume).resolve().parent:
@@ -375,6 +450,12 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
                   "shape_family_splits": shape_families, "mesh_fingerprint_splits": mesh_fingerprints,
                   "mesh_shape_families": {item.topology.fingerprint: item.shape_family for item in trajectories},
                   "generalization_protocol": config.split_unit}
+    if frozen_checkpoint is not None:
+        checkpoint.update(model=frozen_checkpoint["model"], training_mode="neural_corrector_only",
+                          predictor_training=frozen_checkpoint.get("predictor_training", frozen_checkpoint.get("training", {})),
+                          predictor_checkpoint_sha256=(frozen_checkpoint["predictor_checkpoint_sha256"] if resumed is not None
+                                                       else file_hash(predictor_checkpoint)),
+                          probability_policy=frozen_checkpoint.get("probability_policy", "legacy_weighted_logits"))
     started = perf_counter()
     setup_progress(dict(phase="ready", status="completed", device=str(device),
                         splits={name: len(rows) for name, rows in splits.items()}))
@@ -477,7 +558,7 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None):
         checkpoint["model"] = resumed["model"]
         model.load_state_dict(checkpoint["model"], strict=True)
         model.eval()
-    else:
+    elif frozen_checkpoint is None:
         checkpoint["model"] = train_stage(model, config.epochs, "predictor")
         _atomic_checkpoint(directory / "best.pt", checkpoint)
     if config.corrector_epochs:

@@ -298,3 +298,19 @@ def test_benchmark_stops_after_interrupted_case_without_scoring_unattempted_runs
     assert consensus["fracture_positive_case_f1_failure_penalized"] == (.75 if interrupted_index else None)
     assert report["paired_accuracy"]["all_methods"]["common_full_horizon_cases"] == interrupted_index
     assert json.loads((output / "benchmark.json").read_text())["status"] == "interrupted"
+
+
+def test_paired_solver_metrics_use_method_order_and_shared_completed_cases():
+    def row(case, completed, runtime, iterations):
+        return dict(benchmark_case_id=case, full_horizon_evaluated=completed, runtime_seconds=runtime,
+                    corrector_iterations=iterations, optimization_solves=2)
+
+    rows = {"central": [row("a", True, 1., 4), row("b", False, 100., 100)],
+            "consensus": [row("a", True, 3., 7), row("b", True, 10., 20)]}
+    report = dynamics_experiment._paired_solver_metrics(rows, rows)
+    pair = report["pairwise"][0]
+    assert pair["methods"] == ["central", "consensus"]
+    assert pair["common_full_horizon_case_ids"] == ["a"]
+    assert pair["metrics"]["runtime_seconds"]["means"] == {"central": 1., "consensus": 3.}
+    assert pair["metrics"]["runtime_seconds"]["mean_difference_second_minus_first"] == 2.
+    assert pair["metrics"]["corrector_iterations"]["mean_difference_second_minus_first"] == 3.

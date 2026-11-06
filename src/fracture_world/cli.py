@@ -71,14 +71,23 @@ def parser():
     dynamics_training.add_argument("--split-unit", choices=["loading_condition", "shape_family"], default="loading_condition")
     dynamics_training.add_argument("--motion-prior", choices=["backward_euler", "constant_acceleration"], default="constant_acceleration")
     dynamics_training.add_argument("--stream-data", action="store_true")
+    corrector_training = commands.add_parser("dynamics-train-corrector", help="Train the neural corrector from a frozen predictor checkpoint")
+    corrector_training.add_argument("--checkpoint", type=Path, required=True)
+    corrector_training.add_argument("--data", type=Path, required=True)
+    corrector_training.add_argument("--output", type=Path, required=True)
+    corrector_training.add_argument("--epochs", type=int, required=True)
+    corrector_training.add_argument("--device", default="auto")
+    corrector_training.add_argument("--stream-data", action="store_true")
+    corrector_training.add_argument("--rollout-steps", type=int)
+    corrector_training.add_argument("--learning-rate", type=float)
     initial = commands.add_parser("dynamics-initial", help="Export only one current state, without teacher future arrays")
     initial.add_argument("--case", type=Path, required=True)
     initial.add_argument("--trajectory", type=Path, required=True)
     initial.add_argument("--frame", type=int, default=0)
     initial.add_argument("--support-policy", choices=["prescribed", "free", "learned"], required=True)
     initial.add_argument("--output", type=Path, required=True)
-    rollout_methods = ["physics", "raw", "neural", "central", "central_pcg", "consensus",
-                       "no_motion_central", "no_motion_central_pcg", "no_motion_consensus"]
+    rollout_methods = ["physics", "raw", "neural", "central", "consensus",
+                       "no_motion_central", "no_motion_consensus"]
     for name in ("dynamics-rollout", "dynamics-compare"):
         command = commands.add_parser(name, help="Run learned fracture dynamics without a runtime physics engine")
         command.add_argument("--checkpoint", type=Path, required=True)
@@ -192,6 +201,13 @@ def run(args):
 
         config = DynamicsTrainingConfig(**{name: getattr(args, name) for name in DynamicsTrainingConfig.__dataclass_fields__})
         output({"checkpoint": str(train_dynamics(args.data, args.output, config, resume=args.resume))})
+    elif args.command == "dynamics-train-corrector":
+        from .dynamics_learning import train_neural_corrector
+
+        checkpoint = train_neural_corrector(args.data, args.checkpoint, args.output, epochs=args.epochs,
+                                             device=args.device, stream_data=args.stream_data,
+                                             rollout_steps=args.rollout_steps, learning_rate=args.learning_rate)
+        output({"checkpoint": str(checkpoint)})
     elif args.command == "dynamics-initial":
         from .dynamics_initial import export_initial
 
@@ -215,8 +231,6 @@ def run(args):
                     "engine_calls": 0, "report": str((args.output / "comparison.json").resolve()),
                     "central_consensus_agreement": report["central_consensus_agreement"],
                     "no_motion_central_consensus_agreement": report.get("no_motion_central_consensus_agreement"),
-                    "central_central_pcg_agreement": report.get("central_central_pcg_agreement"),
-                    "no_motion_central_central_pcg_agreement": report.get("no_motion_central_central_pcg_agreement"),
                     "motion_ablation": report.get("motion_ablation")})
         if report["status"] == "interrupted":
             raise SystemExit(130)

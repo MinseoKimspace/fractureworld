@@ -134,9 +134,13 @@ def project_quadratic_energy(projection, state, cancel=None):
         return result(state, False, "interrupted")
     initial_energy = projection.state_value(state)
     evaluations += 1
+    if not np.isfinite(initial_energy):
+        raise FloatingPointError("nonfinite quadratic initial energy")
     if initial_energy <= target:
         return result(state, True, "already_feasible", multiplier=0., stationarity_residual=0., complementarity_residual=0.)
     initial_gradient = projection.state_gradient(state)
+    if not np.isfinite(initial_gradient).all():
+        raise FloatingPointError("nonfinite quadratic initial gradient")
     gradient_squared = float(initial_gradient @ initial_gradient)
     if not np.isfinite(gradient_squared) or gradient_squared == 0.:
         return result(state, False, "quadratic_stationary_hard_case_unknown",
@@ -146,6 +150,8 @@ def project_quadratic_energy(projection, state, cancel=None):
         nonlocal factorizations, evaluations, refinements, last_certificate
         if cancel is not None and cancel():
             raise InterruptedError
+        if not np.isfinite(multiplier):
+            raise ArithmeticError("nonfinite quadratic multiplier")
         matrix = identity + multiplier * model.hessian
         factorizations += 1
         factor, certificate = _positive_factor(matrix, projection.stationarity_tolerance)
@@ -197,6 +203,8 @@ def project_quadratic_energy(projection, state, cancel=None):
                     positive_definiteness=point["certificate"])
 
     multiplier = max((initial_energy - target) / gradient_squared, np.finfo(float).eps)
+    if not np.isfinite(multiplier):
+        raise FloatingPointError("nonfinite quadratic initial multiplier")
     lower = dict(multiplier=0., state=state, energy=initial_energy, residual=initial_energy - target,
                  derivative=-gradient_squared, gradient=initial_gradient,
                  stationarity=0., stationarity_tolerance=projection.stationarity_tolerance)

@@ -355,3 +355,33 @@ def test_nonfinite_flow_sample_is_not_silently_thresholded_into_an_unbroken_mask
     assert report["status"] == "nonfinite_prediction"
     assert report["completed_steps"] == 0
     assert "sampled fracture field" in report["events"][-1]["reason"]
+
+
+@pytest.mark.parametrize("method", ["central", "consensus"])
+def test_nonfinite_corrector_energy_saves_the_completed_rollout_prefix(tmp_path, monkeypatch, method):
+    from fracture_world import dynamics_runtime as runtime
+
+    checkpoint, initial, _, _ = portable_rollout_inputs(tmp_path)
+    original = runtime._correct
+    calls = 0
+
+    def correct(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise FloatingPointError("nonfinite quadratic initial energy")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_correct", correct)
+    config = RolloutConfig(fracture_samples=1, fracture_policy="shared_sample", flow_steps=1,
+                           max_iterations=10000, max_contact_iterations=3)
+    directory = tmp_path / method
+    report = rollout_dynamics(checkpoint, initial, directory, 3, method, config, "cpu")
+    assert report["status"] == "nonfinite_prediction"
+    assert report["completed_steps"] == 1
+    assert report["events"][-1]["reason"] == "nonfinite quadratic initial energy"
+    assert json.loads((directory / "report.json").read_text())["completed_steps"] == 1
+    with np.load(directory / "trajectory.npz", allow_pickle=False) as archive:
+        assert len(archive["times"]) == 2
+        assert np.isfinite(archive["positions"]).all()
+        assert np.isfinite(archive["velocities"]).all()

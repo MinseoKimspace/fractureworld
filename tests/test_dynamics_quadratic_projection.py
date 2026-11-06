@@ -128,6 +128,50 @@ def test_stationary_indefinite_hard_case_is_unknown_even_when_a_feasible_branch_
     assert projection.state_value(feasible) < 0.
 
 
+def test_nonfinite_quadratic_energy_cannot_enter_multiplier_bracket():
+    projection, state = indefinite_projection(1e-120)
+    projection.energy.stiffness = sparse.diags(
+        np.r_[-1e-120, 1e-120, np.zeros(projection.energy.stiffness.shape[0] - 2)], format="csr")
+    state[:] = 0.
+    state[0] = state[1] = 1e221
+    checks = 0
+
+    def cancel():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        model = quadratic_energy_coefficients(projection)
+        assert np.isfinite(model.hessian.data).all() and np.isfinite(model.linear).all() and np.isfinite(model.constant)
+        assert np.isnan(projection.state_value(state))
+        gradient = projection.state_gradient(state)
+        assert np.isfinite(gradient @ gradient)
+        with pytest.raises(FloatingPointError, match="nonfinite quadratic initial energy"):
+            project_quadratic_energy(projection, state, cancel)
+    assert checks == 1
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+def test_nonfinite_quadratic_initial_gradient_is_rejected(monkeypatch, value):
+    projection, state = indefinite_projection(1e-8)
+    original = projection.state_gradient
+    monkeypatch.setattr(projection, "state_gradient", lambda candidate:
+                        np.full_like(candidate, value) if np.array_equal(candidate, state) else original(candidate))
+    with pytest.raises(FloatingPointError, match="nonfinite quadratic initial gradient"):
+        project_quadratic_energy(projection, state)
+
+
+def test_nonfinite_quadratic_initial_multiplier_is_rejected():
+    projection, state = indefinite_projection(1e-8)
+    projection.budget = -1e100
+    state[:] = 0.
+    state[len(state) // 2] = 1e-150
+    with np.errstate(over="ignore"):
+        with pytest.raises(FloatingPointError, match="nonfinite quadratic initial multiplier"):
+            project_quadratic_energy(projection, state)
+
+
 def test_quadratic_projection_identity_cancellation_and_failure_are_explicit(monkeypatch):
     projection = quadratic_fixture()
     feasible = projection.problem.prior.copy()

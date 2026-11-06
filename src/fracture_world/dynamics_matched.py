@@ -27,12 +27,12 @@ def _matched_methods(methods, motion_ablation):
     if methods is not None and not isinstance(methods, (list, tuple)):
         raise ValueError("matched methods must be a list or tuple")
     selected = list(METHODS if methods is None else methods)
-    allowed = {*METHODS, *MOTION_ABLATION_METHODS, "central_pcg", "no_motion_central_pcg"}
+    allowed = {*METHODS, *MOTION_ABLATION_METHODS}
     if not selected or any(not isinstance(method, str) or method not in allowed for method in selected) or len(set(selected)) != len(selected):
-        raise ValueError("matched methods must be unique raw/central/central_pcg/consensus/no_motion_central/no_motion_central_pcg/no_motion_consensus values")
+        raise ValueError("matched methods must be unique raw/central/consensus/no_motion_central/no_motion_consensus values")
     if motion_ablation:
         selected.extend(f"no_motion_{method}" for method in tuple(selected)
-                        if method in {"central", "central_pcg", "consensus"} and f"no_motion_{method}" not in selected)
+                        if method in {"central", "consensus"} and f"no_motion_{method}" not in selected)
     return tuple(selected)
 
 
@@ -333,9 +333,6 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
     indexed = {(record["candidate"], record["method"]): record for record in records}
     agreement = _solver_agreement(prepared, indexed, states, "central", "consensus")
     physical_agreement = _solver_agreement(prepared, indexed, states, *MOTION_ABLATION_METHODS) if set(MOTION_ABLATION_METHODS).issubset(methods) else []
-    pcg_agreement = _solver_agreement(prepared, indexed, states, "central", "central_pcg") if {"central", "central_pcg"}.issubset(methods) else []
-    physical_pcg_agreement = _solver_agreement(prepared, indexed, states, "no_motion_central", "no_motion_central_pcg") if {
-        "no_motion_central", "no_motion_central_pcg"}.issubset(methods) else []
     selected_pairs = []
     for first, second in combinations(methods, 2):
         a, b = selections[first]["selected_candidate"], selections[second]["selected_candidate"]
@@ -358,7 +355,6 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 neural_fracture_and_support_shared=True, fully_neural_free_baseline=False,
                 methods=selections, candidates=records, central_consensus=agreement, selected_state_comparisons=selected_pairs,
                 no_motion_central_consensus=physical_agreement,
-                central_central_pcg=pcg_agreement, no_motion_central_central_pcg=physical_pcg_agreement,
                 motion_ablation_comparisons=ablation_comparisons,
                 reference_used_for_proposals=False, reference_used_for_selection=False,
                 reference_used_only_for_evaluation=reference_values is not None, engine_calls=0,

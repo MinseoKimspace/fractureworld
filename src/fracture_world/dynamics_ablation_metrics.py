@@ -80,7 +80,7 @@ def motion_ablation_comparisons(records, selections, *, candidate_count=None):
         raise TypeError("motion ablation selections must be a method mapping")
     if candidate_count is not None and (isinstance(candidate_count, bool) or not isinstance(candidate_count, Integral) or candidate_count < 0):
         raise ValueError("motion ablation candidate count must be a nonnegative integer")
-    pairs = tuple(pair for pair in (*MOTION_PAIRS, ("central_pcg", "no_motion_central_pcg"))
+    pairs = tuple(pair for pair in MOTION_PAIRS
                   if any(method in selections for method in pair)) if selections else MOTION_PAIRS
     paired_methods = {method for pair in pairs for method in pair}
     indexed = {}
@@ -149,8 +149,6 @@ def summarize_motion_ablation(rows, summary=None):
     for row in rows:
         for comparison in row.get("motion_ablation_comparisons", []):
             solver, scope = comparison["solver"], comparison["scope"]
-            if solver == "central_pcg" and solver not in summary:
-                summary[solver] = {name: _accumulator() for name in ("fixed_candidate", "selected")}
             if solver not in summary or scope not in summary[solver]:
                 raise ValueError("motion ablation comparison has an unknown solver or scope")
             values = summary[solver][scope]

@@ -235,6 +235,34 @@ def test_cli_rollout_window_matches_training_config():
     assert config.rollout_steps == 3
 
 
+@pytest.mark.parametrize("options,expected", [
+    ([], dict(device="auto", stream_data=False, rollout_steps=None, learning_rate=None)),
+    (["--device", "cpu", "--stream-data", "--rollout-steps", "3", "--learning-rate", "0.001"],
+     dict(device="cpu", stream_data=True, rollout_steps=3, learning_rate=0.001)),
+])
+def test_cli_trains_only_corrector_from_checkpoint(tmp_path, monkeypatch, capsys, options, expected):
+    from fracture_world.cli import parser, run
+
+    calls = []
+    trained_checkpoint = tmp_path / "trained" / "best.pt"
+
+    def train_corrector(data, checkpoint, output, **kwargs):
+        calls.append((data, checkpoint, output, kwargs))
+        return trained_checkpoint
+
+    def train_predictor(*args, **kwargs):
+        pytest.fail("corrector-only command invoked predictor training")
+
+    monkeypatch.setattr(dynamics_learning, "train_neural_corrector", train_corrector)
+    monkeypatch.setattr(dynamics_learning, "train_dynamics", train_predictor)
+    data, checkpoint, output = tmp_path / "data", tmp_path / "base.pt", tmp_path / "trained"
+    arguments = parser().parse_args(["dynamics-train-corrector", "--data", str(data), "--checkpoint", str(checkpoint),
+                                    "--output", str(output), "--epochs", "4", *options])
+    run(arguments)
+    assert calls == [(data, checkpoint, output, dict(epochs=4, **expected))]
+    assert json.loads(capsys.readouterr().out) == {"checkpoint": str(trained_checkpoint)}
+
+
 @pytest.mark.parametrize("steps", [0, -1, True, 1.5])
 def test_training_rejects_invalid_autoregressive_window_before_loading_data(tmp_path, steps):
     with pytest.raises(ValueError, match="rollout_steps"):
