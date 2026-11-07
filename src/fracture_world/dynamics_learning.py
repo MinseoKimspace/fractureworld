@@ -330,7 +330,7 @@ def _checkpoint_splits(trajectories, checkpoint):
 def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, device="auto", stream_data=False,
                            rollout_steps=None, learning_rate=None, batch_size=None, lr_patience=None, lr_factor=None,
                            min_learning_rate=None, early_stopping_patience=None, min_improvement=None, resume=None,
-                           baseline_checkpoint=None):
+                           baseline_checkpoint=None, skip_baseline=None):
     if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
         raise ValueError("corrector epochs must be a positive integer")
     model, _, checkpoint, _ = load_dynamics_model(checkpoint_path, "cpu")
@@ -356,10 +356,12 @@ def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, dev
     options.update({name: value for name, value in overrides.items() if value is not None})
     config = DynamicsTrainingConfig(**options)
     return train_dynamics(data_dir, output_dir, config, resume=resume,
-                          predictor_checkpoint=checkpoint_path if resume is None else None, baseline_checkpoint=baseline_checkpoint)
+                          predictor_checkpoint=checkpoint_path if resume is None else None,
+                          baseline_checkpoint=baseline_checkpoint, skip_baseline=skip_baseline)
 
 
-def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None, baseline_checkpoint=None):
+def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None, baseline_checkpoint=None,
+                   skip_baseline=None):
     if not isinstance(config, DynamicsTrainingConfig):
         raise TypeError("config must be DynamicsTrainingConfig")
     if config.epochs < 1 or config.corrector_epochs < 0 or config.learning_rate <= 0:
@@ -383,6 +385,10 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
         raise ValueError("a pretrained predictor requires a fresh corrector run with positive corrector epochs")
     if baseline_checkpoint is not None and (resume is not None or predictor_checkpoint is None):
         raise ValueError("a baseline checkpoint requires a fresh corrector-only run")
+    if skip_baseline is not None and not isinstance(skip_baseline, bool):
+        raise TypeError("skip_baseline must be boolean")
+    if skip_baseline and (baseline_checkpoint is not None or config.corrector_epochs < 1):
+        raise ValueError("skipping the baseline requires corrector training without a baseline checkpoint")
     resumed = torch.load(Path(resume), map_location="cpu", weights_only=True) if resume is not None else None
     if resumed is not None:
         if resumed.get("format") != FORMAT or "training_state" not in resumed:
@@ -399,6 +405,11 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
             raise ValueError("target epoch count cannot precede the saved completed epoch")
         if state["stage"] == "neural_corrector" and config.epochs != previous["epochs"]:
             raise ValueError("predictor epochs cannot change after neural-corrector training has begun")
+        previous_skip = resumed.get("baseline_policy") == "skipped"
+        if skip_baseline is not None and skip_baseline != previous_skip:
+            raise ValueError("resuming requires the recorded baseline policy")
+        skip_baseline = previous_skip
+    skip_baseline = bool(skip_baseline)
     setup_started = perf_counter()
 
     def setup_progress(update):
@@ -522,9 +533,12 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
                           probability_policy=frozen_checkpoint.get("probability_policy", "legacy_weighted_logits"))
     if resumed is not None and "batch_size_changes" in resumed:
         checkpoint["batch_size_changes"] = list(resumed["batch_size_changes"])
+    if config.corrector_epochs:
+        checkpoint["baseline_policy"] = "skipped" if skip_baseline else "evaluated"
     started = perf_counter()
     setup_progress(dict(phase="ready", status="completed", device=str(device),
-                        splits={name: len(rows) for name, rows in splits.items()}))
+                        splits={name: len(rows) for name, rows in splits.items()},
+                        baseline_policy=checkpoint.get("baseline_policy")))
 
     def train_stage(network, epochs, stage, fixed_predictor=None):
         optimizer = torch.optim.AdamW(network.parameters(), lr=config.learning_rate)
@@ -631,7 +645,7 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
             setup_progress(dict(phase="resume", status="completed", stage=stage, completed_epoch=first_epoch,
                                 target_epochs=epochs, checkpoint=str(Path(resume).resolve()),
                                 previous_batch_size=previous_batch_size, batch_size=config.batch_size))
-        elif fixed_predictor is not None:
+        elif fixed_predictor is not None and not skip_baseline:
             baseline_split = "validation" if splits["validation"] else "train"
             windows = sum(len(item) for item in splits[baseline_split])
             context = dynamics_baseline.baseline_context(checkpoint, asdict(config), baseline_split, windows, device)
@@ -658,6 +672,8 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
             _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
             print(json.dumps(dict(event="training_baseline", source=baseline_source, cache=str(cache_path), **baseline),
                              allow_nan=False), flush=True)
+        elif fixed_predictor is not None:
+            print(json.dumps(dict(event="training_baseline", source="skipped", stage=stage)), flush=True)
         if stop_reason == "validation_plateau":
             network.load_state_dict(best_state)
             network.eval()

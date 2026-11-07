@@ -107,6 +107,73 @@ def test_fresh_corrector_reuses_cached_baseline_without_changing_weights_or_rand
     assert file_hash(path) == original_hash
 
 
+def test_skip_baseline_starts_with_training_and_selects_a_trained_epoch(pretrained, tmp_path, monkeypatch, capsys):
+    data, path = pretrained
+    original_hash = file_hash(path)
+
+    def reject_baseline(*args, **kwargs):
+        pytest.fail("skipped baseline attempted to inspect or evaluate baseline data")
+
+    for name in ("baseline_context", "read_cached_baseline", "read_checkpoint_baseline"):
+        monkeypatch.setattr(dynamics_baseline, name, reject_baseline)
+    watch_baseline_evaluations(monkeypatch, reject=True)
+    capsys.readouterr()
+    output = train_neural_corrector(data, path, tmp_path / "skip", epochs=1, device="cpu", batch_size=6,
+                                    rollout_steps=2, lr_patience=1, early_stopping_patience=2, skip_baseline=True)
+    checkpoint = torch.load(output, weights_only=True)
+    assert checkpoint["baseline_policy"] == "skipped"
+    assert checkpoint["selection"]["epoch"] == 1
+    assert "training_baseline" not in checkpoint and "training_baseline_context" not in checkpoint
+    assert not (tmp_path / ".baseline-cache").exists()
+    assert file_hash(path) == original_hash
+    records = [json.loads(line) for line in (output.parent / "training.jsonl").read_text().splitlines()]
+    assert len(records) == 1 and records[0]["epoch"] == 1 and records[0]["baseline_loss"] is None
+    assert records[0]["split_timing"]["train"]["optimizer_steps"] == 1
+    assert records[0]["split_timing"]["validation"]["windows"] == 3
+    last = torch.load(output.parent / "last.pt", weights_only=True)
+    assert last["training_state"]["scheduler"] is not None
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert not any(message.get("epoch") == 0 for message in messages)
+    assert any(message.get("event") == "training_baseline" and message["source"] == "skipped" for message in messages)
+
+
+def test_skip_baseline_resume_inherits_policy_and_matches_uninterrupted_training(pretrained, tmp_path, monkeypatch):
+    data, path = pretrained
+    complete = train_neural_corrector(data, path, tmp_path / "complete", epochs=2, device="cpu", batch_size=2,
+                                      skip_baseline=True)
+    save = dynamics_learning._atomic_checkpoint
+
+    def interrupt_epoch(destination, checkpoint):
+        save(destination, checkpoint)
+        if checkpoint.get("training_state", {}).get("completed_epoch") == 1:
+            raise KeyboardInterrupt("completed training epoch without baseline")
+
+    monkeypatch.setattr(dynamics_learning, "_atomic_checkpoint", interrupt_epoch)
+    directory = tmp_path / "resumed"
+    with pytest.raises(KeyboardInterrupt, match="without baseline"):
+        train_neural_corrector(data, path, directory, epochs=2, device="cpu", batch_size=2, skip_baseline=True)
+    monkeypatch.setattr(dynamics_learning, "_atomic_checkpoint", save)
+    resumed = train_neural_corrector(data, path, directory, epochs=2, device="cpu", resume=directory / "last.pt")
+    expected = torch.load(complete.parent / "last.pt", weights_only=True)
+    actual = torch.load(resumed.parent / "last.pt", weights_only=True)
+    assert actual["baseline_policy"] == "skipped"
+    assert "training_baseline" not in actual
+    for name in ("model", "corrector"):
+        for key, value in expected[name].items():
+            torch.testing.assert_close(actual[name][key], value, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="baseline policy"):
+        train_neural_corrector(data, path, tmp_path / "changed-policy", epochs=3, device="cpu",
+                                resume=directory / "last.pt", skip_baseline=False)
+
+
+def test_skip_baseline_rejects_a_conflicting_baseline_checkpoint(pretrained, tmp_path):
+    data, path = pretrained
+    with pytest.raises(ValueError, match="without a baseline checkpoint"):
+        train_neural_corrector(data, path, tmp_path / "conflict", epochs=1, device="cpu", skip_baseline=True,
+                                baseline_checkpoint=tmp_path / "unused.pt")
+    assert not (tmp_path / "conflict").exists()
+
+
 def test_baseline_fingerprint_rejects_changed_rollout_batch_loss_model_and_data(evaluated_baseline):
     _, _, output, checkpoint, context, cache = evaluated_baseline
     for change in ("rollout_steps", "batch_size", "fracture_weight", "model", "data"):

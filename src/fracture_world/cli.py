@@ -85,8 +85,11 @@ def parser():
     corrector_training.add_argument("--output", type=Path, required=True)
     corrector_training.add_argument("--resume", type=Path,
                                     help="Resume corrector training from its completed-epoch last.pt")
-    corrector_training.add_argument("--baseline-checkpoint", type=Path,
-                                    help="Reuse a compatible recorded epoch-zero baseline")
+    baseline_options = corrector_training.add_mutually_exclusive_group()
+    baseline_options.add_argument("--baseline-checkpoint", type=Path,
+                                  help="Reuse a compatible recorded epoch-zero baseline")
+    baseline_options.add_argument("--skip-baseline", action="store_true", default=None,
+                                  help="Start training immediately and select checkpoints using epoch validation")
     corrector_training.add_argument("--epochs", type=int, required=True, help="Maximum corrector training epochs")
     corrector_training.add_argument("--device", default="auto")
     corrector_training.add_argument("--stream-data", action="store_true")
@@ -225,7 +228,7 @@ def run(args):
         from .dynamics_learning import train_neural_corrector
 
         optional = ("resume", "batch_size", "lr_patience", "lr_factor", "min_learning_rate",
-                    "early_stopping_patience", "min_improvement", "baseline_checkpoint")
+                    "early_stopping_patience", "min_improvement", "baseline_checkpoint", "skip_baseline")
         options = {name: getattr(args, name) for name in optional if getattr(args, name) is not None}
         checkpoint = train_neural_corrector(args.data, args.checkpoint, args.output, epochs=args.epochs,
                                              device=args.device, stream_data=args.stream_data,
