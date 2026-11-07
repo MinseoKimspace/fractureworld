@@ -5,7 +5,7 @@ from numpy.testing import assert_allclose
 import pytest
 
 from fracture_world import dynamics_corrector
-from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, LinearizedContact, _shared_problem, solve_central, solve_consensus
+from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, LinearizedContact, _shared_problem, solve_central
 from fracture_world.mesh import VolumeMesh
 
 
@@ -57,8 +57,7 @@ def test_shared_prior_uses_mass_weighted_average_without_losing_prediction_disag
     assert reduced.objective(reduced.prior) > 0
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_shared_internal_contact_cannot_hide_an_impossible_positive_gap(solver):
+def test_shared_internal_contact_cannot_hide_an_impossible_positive_gap():
     original = shared_problem()
     first, second = original.mesh.corner_face_pairs[0, 0]
     contact = LinearizedContact.pair(first, second, [1., 0., 0.], -.001)
@@ -69,7 +68,7 @@ def test_shared_internal_contact_cannot_hide_an_impossible_positive_gap(solver):
     factor = next(factor for factor in reduced.factors if factor.name == "contact:0")
     assert factor.matrix.nnz == 0
     assert factor.bound[0] > 0
-    result = solver(problem, max_iterations=2000)
+    result = solve_central(problem, max_iterations=2000)
     assert result.status == "PrimalInfeasible"
     assert not result.converged
 

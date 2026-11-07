@@ -4,7 +4,7 @@ from math import isfinite
 from numbers import Integral, Real
 
 
-MOTION_PAIRS = (("central", "no_motion_central"), ("consensus", "no_motion_consensus"))
+MOTION_PAIRS = (("central", "no_motion_central"),)
 RMSE_METRICS = ("position_mass_weighted_rmse_m", "velocity_mass_weighted_rmse_m_per_s")
 
 

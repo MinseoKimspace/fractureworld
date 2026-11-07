@@ -10,7 +10,7 @@ from fracture_world.dynamics_corrector import LinearizedContact
 from test_dynamics_phase_runtime import phase_fixture
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_runtime_reuses_current_contact_and_frozen_operators_without_changing_constraints(method):
     initial, model, proposal, config = phase_fixture(penetrated=True)
     config = replace(config, max_contact_iterations=None)
@@ -60,7 +60,7 @@ def test_reusable_balance_requires_exact_current_state_and_contacts():
         runtime._problem(*args, reusable_balance=first.elastic_balance)
 
 
-def fake_coupled_retry(monkeypatch, *, progressing_dual=False):
+def fake_coupled_retry(monkeypatch):
     initial, model, proposal, config = phase_fixture()
     config = replace(config, max_contact_iterations=None)
     calls = dict(stabilization=0, solves=0)
@@ -73,11 +73,8 @@ def fake_coupled_retry(monkeypatch, *, progressing_dual=False):
             offset[:, 0] = .01 if index % 2 else .02
         return offset, dict(status="pass")
 
-    def solve(problem, projection, method, *args, workspace=None, **kwargs):
+    def solve(problem, projection, method, *args, **kwargs):
         calls["solves"] += 1
-        if workspace is not None:
-            workspace["linear"] = dict(state=np.zeros_like(problem.prior), rho=.1,
-                                       scaled_dual=np.array([calls["solves"] if progressing_dual else 0.]))
         return SimpleNamespace(positions=initial.positions.copy(), velocities=initial.velocities.copy(),
                                converged=True, status="converged", iterations=1, runtime_seconds=.01,
                                objective=0., diagnostics={}, history=[])
@@ -93,7 +90,7 @@ def test_stabilization_retry_cycle_is_reported_unknown_without_an_iteration_cap(
     initial, model, proposal, config, calls = fake_coupled_retry(monkeypatch)
     events = []
     result, report = runtime._correct(initial, initial.positions, initial.velocities, proposal,
-                                      initial.broken, initial.fixed, model, config, "consensus", progress=events.append)
+                                      initial.broken, initial.fixed, model, config, "central", progress=events.append)
     assert result is None
     assert report["status"] == "outer_fixed_point_cycle_unknown"
     assert calls["solves"] == 3
@@ -107,87 +104,6 @@ def test_stabilization_retry_cycle_is_reported_unknown_without_an_iteration_cap(
     assert all(event["reason"] == "stabilization_recheck" for event in retries)
     assert all(event["constraints_satisfied"] is False for event in retries)
     assert retries[-1]["cumulative_iterations"] == 3
-
-
-def test_outer_cycle_detection_keeps_progressing_duals_distinct(monkeypatch):
-    initial, model, proposal, config, calls = fake_coupled_retry(monkeypatch, progressing_dual=True)
-    result, report = runtime._correct(initial, initial.positions, initial.velocities, proposal,
-                                      initial.broken, initial.fixed, model, config, "consensus",
-                                      cancel=lambda: calls["solves"] >= 5)
-    assert result is None
-    assert report["status"] == "interrupted"
-    assert calls["solves"] == 5
-    assert not any(item["complete_outer_state_repeated"] for item in report["outer_retries"])
-
-
-def test_failed_stabilization_recheck_translates_only_the_saved_consensus_state(monkeypatch):
-    initial, model, proposal, config, calls = fake_coupled_retry(monkeypatch)
-    translations = []
-    nonlinear_states = []
-    original_solve = runtime.solve_energy
-
-    def solve_with_nonlinear_state(problem, *args, workspace=None, **kwargs):
-        result = original_solve(problem, *args, workspace=workspace, **kwargs)
-        nonlinear = dict(state=np.full_like(problem.prior, 17.), scaled_dual=np.array([23.]),
-                         energy_scaled_dual=np.full_like(problem.prior, 29.), rho=.1)
-        workspace["nonlinear"] = nonlinear
-        nonlinear_states.append(nonlinear)
-        return result
-
-    def translate(workspace, old_problem, new_problem, delta):
-        translations.append(delta.copy())
-        assert set(workspace) == {"linear"}
-        assert workspace["linear"]["rho"] == .1
-        assert_allclose(delta, new_problem.stabilization_offset.reshape(-1, 3)
-                        - old_problem.stabilization_offset.reshape(-1, 3), rtol=0., atol=0.)
-        return dict(translated_states=1, status="translated")
-
-    monkeypatch.setattr(runtime, "solve_energy", solve_with_nonlinear_state)
-    monkeypatch.setattr(runtime, "translate_consensus", translate)
-    result, report = runtime._correct(initial, initial.positions, initial.velocities, proposal,
-                                      initial.broken, initial.fixed, model, config, "consensus")
-    assert result is None
-    assert report["status"] == "outer_fixed_point_cycle_unknown"
-    assert len(translations) == calls["solves"] == 3
-    assert all(item["continuation_states_translated"] == 1 for item in report["outer_retries"])
-    assert_allclose(initial.positions, proposal["positions"].numpy(), rtol=0., atol=0.)
-    for saved in nonlinear_states:
-        assert_allclose(saved["state"], 17., rtol=0., atol=0.)
-        assert_allclose(saved["scaled_dual"], 23., rtol=0., atol=0.)
-        assert_allclose(saved["energy_scaled_dual"], 29., rtol=0., atol=0.)
-
-
-@pytest.mark.parametrize("energy_balance", [False, True])
-def test_changed_contact_geometry_discards_prior_solver_continuation(monkeypatch, energy_balance):
-    initial, model, proposal, config = phase_fixture()
-    config = replace(config, mechanics_mode="disabled", energy_balance=energy_balance, max_contact_iterations=None)
-    calls = dict(contacts=0, solves=0)
-    seen = []
-
-    def contacts(*args):
-        calls["contacts"] += 1
-        return (LinearizedContact.pair(0, -1, [0., 1., 0.], -.01 * calls["contacts"]),)
-
-    def solve(problem, *args, workspace=None, _workspace=None, **kwargs):
-        saved = workspace if energy_balance else _workspace
-        seen.append(dict(saved))
-        saved["marker"] = calls["solves"]
-        calls["solves"] += 1
-        return SimpleNamespace(positions=initial.positions + [.1, 0., 0.], velocities=initial.velocities.copy(),
-                               converged=True, status="converged", iterations=1, runtime_seconds=.01,
-                               objective=0., diagnostics={}, history=[])
-
-    monkeypatch.setattr(runtime, "step_contacts", contacts)
-    monkeypatch.setattr(runtime, "solve_energy", solve)
-    monkeypatch.setattr(runtime, "solve_consensus", solve)
-    monkeypatch.setattr(runtime, "geometry_diagnostics", lambda *args: dict(valid=calls["solves"] > 1))
-    result, report = runtime._correct(initial, initial.positions, initial.velocities, proposal,
-                                      initial.broken, initial.fixed, model, config, "consensus")
-    assert result is not None, report
-    assert calls["contacts"] == calls["solves"] == 2
-    assert seen == [{}, {}]
-    assert report["performance"]["contact_geometry_invalidations"] == 1
-    assert report["performance"]["solver_workspace_resets"] == 1
 
 
 def test_disabled_reuse_rebuilds_operators_and_explicit_history_remains_available():

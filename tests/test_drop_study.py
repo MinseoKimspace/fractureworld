@@ -11,7 +11,7 @@ import torch
 
 from fracture_world import drop_generator
 from fracture_world.drop_generator import ballistic_drop_state, create_drop_suite, prepare_volume
-from fracture_world.dynamics_corrector import DynamicsProblem, solve_central, solve_consensus
+from fracture_world.dynamics_corrector import DynamicsProblem, solve_central
 from fracture_world.dynamics_data import load_dynamics_dataset, material_topology, split_dynamics_cases
 from fracture_world.data import _mesh_digest
 from fracture_world.dynamics_initial import export_initial
@@ -156,10 +156,10 @@ def test_constant_acceleration_correctors_preserve_exact_free_motion():
     problem = DynamicsProblem(volume, current, velocity, current + 0.5 * dt**2 * gravity,
                               velocity + dt * gravity, dt, external_impulse=masses[..., None] * dt * gravity,
                               kinematic_rule="constant_acceleration")
-    for result in (solve_central(problem), solve_consensus(problem, max_iterations=1000)):
-        assert result.converged
-        assert_allclose(result.positions, problem.predicted_positions, atol=1e-8)
-        assert_allclose(result.velocities, problem.predicted_velocities, atol=1e-8)
+    result = solve_central(problem)
+    assert result.converged
+    assert_allclose(result.positions, problem.predicted_positions, atol=1e-8)
+    assert_allclose(result.velocities, problem.predicted_velocities, atol=1e-8)
 
 
 def test_floor_contacts_detect_approach_and_geometric_penetration():

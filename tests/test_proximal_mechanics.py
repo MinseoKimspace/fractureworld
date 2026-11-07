@@ -5,7 +5,7 @@ from numpy.testing import assert_allclose
 import pytest
 from scipy.sparse.linalg import spsolve
 
-from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, _shared_problem, solve_central, solve_consensus
+from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, _shared_problem, solve_central
 from fracture_world.dynamics_data import material_topology
 from fracture_world.dynamics_energy import CorotationalEnergy, EnergyProjection
 from fracture_world.dynamics_energy_solvers import solve_energy
@@ -30,12 +30,11 @@ def mechanical_problem(mode="proximal", weight=1., shared=False):
     return problem, balance
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_proximal_elastic_penalty_moves_a_feasible_but_mechanically_wrong_prediction(method):
     problem, balance = mechanical_problem()
     tolerance = CorrectorTolerances(1e-10, 1e-9)
-    solver = solve_central if method == "central" else solve_consensus
-    result = solver(problem, tolerances=tolerance, max_iterations=20000)
+    result = solve_central(problem, tolerances=tolerance, max_iterations=20000)
     assert result.converged, (result.status, result.diagnostics)
     mass = np.repeat(balance.node_masses / balance.node_masses.sum(), 3)
     normalized = balance.matrix.toarray() / np.repeat(balance.node_masses, 3)[:, None]
@@ -55,11 +54,10 @@ def test_proximal_elastic_penalty_moves_a_feasible_but_mechanically_wrong_predic
     assert_allclose(sum(components.values()), result.objective, atol=1e-12)
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_exact_reference_agrees_with_independent_sparse_implicit_solution(method):
     problem, balance = mechanical_problem("exact")
-    solver = solve_central if method == "central" else solve_consensus
-    result = solver(problem, tolerances=CorrectorTolerances(1e-10, 1e-9), max_iterations=20000)
+    result = solve_central(problem, tolerances=CorrectorTolerances(1e-10, 1e-9), max_iterations=20000)
     assert result.converged, (result.status, result.diagnostics)
     expected = spsolve(balance.matrix, balance.rhs).reshape(-1, 3)[balance.groups]
     assert_allclose(result.velocities.reshape(-1, 3), expected, atol=2e-8)
@@ -79,7 +77,7 @@ def test_shared_reduction_preserves_soft_penalties_duplicates_and_affine_constan
         assert_allclose(reduced.objective(state), problem.objective(full), atol=1e-12, rtol=1e-12)
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_energy_path_does_not_skip_a_nonzero_soft_residual_at_a_feasible_prior(method):
     problem, balance = mechanical_problem()
     energy = CorotationalEnergy(problem.mesh, material()["rest_density"], material()["youngs_modulus"],

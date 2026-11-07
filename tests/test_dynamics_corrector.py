@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
-from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, LinearizedContact, solve_central, solve_consensus
+from fracture_world.dynamics_corrector import CorrectorTolerances, DynamicsProblem, LinearizedContact, solve_central
 from fracture_world.mesh import VolumeMesh
 
 
@@ -19,35 +19,25 @@ def problem_for(mesh, **kwargs):
     return DynamicsProblem(**values)
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_user_cancellation_is_reported_without_a_successful_commit(solver):
-    result = solver(problem_for(mesh_pair()), cancel=lambda: True)
+def test_user_cancellation_is_reported_without_a_successful_commit():
+    result = solve_central(problem_for(mesh_pair()), cancel=lambda: True)
     assert result.status == "interrupted"
     assert not result.converged
 
 
-def check_solvers(problem):
+def check_central(problem):
     tolerance = CorrectorTolerances(1e-10, 1e-9)
     central = solve_central(problem, tolerance)
-    consensus = solve_consensus(problem, tolerances=tolerance, max_iterations=20000)
     assert central.converged, central.status
-    assert consensus.converged, consensus.status
     assert central.diagnostics["constraints_satisfied"]
-    assert consensus.diagnostics["constraints_satisfied"]
-    assert_allclose(consensus.positions, central.positions, atol=1e-7, rtol=1e-7)
-    assert_allclose(consensus.velocities, central.velocities, atol=1e-7, rtol=1e-7)
-    assert_allclose(consensus.objective, central.objective, atol=1e-8, rtol=1e-7)
-    if consensus.history:
-        assert consensus.history[-1].primal_residual <= consensus.history[-1].primal_tolerance
-        assert consensus.history[-1].dual_residual <= consensus.history[-1].dual_tolerance
-    else:
-        assert consensus.iterations == 0
-    return central, consensus
+    state = problem.encode_state(central.positions, central.velocities)
+    assert_allclose(central.objective, problem.objective(state), atol=1e-12, rtol=1e-12)
+    return central
 
 
 def test_intact_face_agrees_and_closed_system_conserves_momentum():
     problem = problem_for(mesh_pair())
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     face = problem.mesh.internal_faces[0]
     a, b = problem.mesh.faces.cells[face]
     for vertex in problem.mesh.faces.vertices[face]:
@@ -68,7 +58,7 @@ def test_broken_face_is_not_retied():
     broken = np.zeros(len(mesh.faces.vertices), dtype=bool)
     broken[mesh.internal_faces] = True
     problem = problem_for(mesh, broken_faces=broken, previous_broken_faces=np.zeros_like(broken))
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     face = mesh.internal_faces[0]
     a, b = mesh.faces.cells[face]
     vertex = mesh.faces.vertices[face, 0]
@@ -83,7 +73,7 @@ def test_supplied_external_impulse_is_in_closed_system_balance():
     impulse = np.zeros((2, 4, 3))
     impulse[..., 0] = 0.01
     problem = problem_for(mesh, external_impulse=impulse)
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     change = np.sum(problem.corner_masses[..., None] * result.velocities, axis=(0, 1))
     assert_allclose(change, impulse.sum(axis=(0, 1)), atol=1e-8)
     assert_allclose(result.diagnostics["angular_momentum_change"], result.diagnostics["supplied_external_angular_impulse"], atol=1e-8)
@@ -94,7 +84,7 @@ def test_fixed_support_reaction_is_reported_as_inferred():
     fixed = np.zeros((2, 4), dtype=bool)
     fixed[:, 0] = True
     problem = problem_for(mesh, fixed=fixed)
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     assert_allclose(result.positions[fixed], problem.positions[fixed], atol=1e-8)
     assert_allclose(result.velocities[fixed], 0, atol=1e-8)
     assert not result.diagnostics["boundary_momentum_verified"]
@@ -107,7 +97,7 @@ def test_frozen_contact_reduces_penetration_without_claiming_impulse_law():
     mesh = mesh_pair()
     contact = LinearizedContact.pair(0, -1, [0, 0, 1], -0.01)
     problem = problem_for(mesh, contacts=(contact,))
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     assert result.positions.reshape(-1, 3)[0, 2] >= 0.01 - 1e-8
     assert result.diagnostics["linearized_contact_gaps"][0] >= -1e-8
     assert not result.diagnostics["boundary_momentum_verified"]
@@ -120,7 +110,7 @@ def test_weighted_vertex_face_contact_is_supported():
     broken[mesh.internal_faces] = True
     contact = LinearizedContact(np.array([0, 4, 5, 6]), np.array([1.0, -0.2, -0.3, -0.5]), [0, 0, 1], -0.02)
     problem = problem_for(mesh, broken_faces=broken, contacts=(contact,))
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     displacement = (result.positions - problem.positions).reshape(-1, 3)
     assert contact.gap + np.sum(contact.weights * displacement[contact.corner_ids, 2]) >= -1e-8
     assert result.diagnostics["boundary_momentum_verified"]
@@ -130,7 +120,7 @@ def test_trapezoidal_kinematics_is_explicit():
     mesh = mesh_pair()
     velocity = np.full((2, 4, 3), 0.2)
     problem = problem_for(mesh, velocities=velocity, kinematic_rule="trapezoidal")
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     assert_allclose(result.positions - problem.positions, problem.dt * (velocity + result.velocities) / 2, atol=1e-8)
     assert problem.metadata["kinematic_rule"] == "trapezoidal"
     assert_allclose(result.diagnostics["angular_residual_or_inferred_boundary_angular_impulse"], 0, atol=1e-8)
@@ -142,20 +132,16 @@ def test_closed_rotating_state_preserves_linear_and_angular_momentum(rule):
     positions = mesh.nodes[mesh.tets]
     velocity = np.cross(np.array([0.3, -0.4, 0.8]), positions) + np.array([0.1, 0.2, -0.1])
     problem = problem_for(mesh, velocities=velocity, kinematic_rule=rule)
-    _, result = check_solvers(problem)
+    result = check_central(problem)
     assert_allclose(result.diagnostics["momentum_residual_or_inferred_boundary_impulse"], 0, atol=1e-8)
     assert_allclose(result.diagnostics["angular_residual_or_inferred_boundary_angular_impulse"], 0, atol=1e-8)
 
 
 def test_zero_budget_and_cancellation_do_not_claim_convergence():
     problem = problem_for(mesh_pair())
-    for result in (solve_central(problem, max_iterations=0), solve_consensus(problem, max_iterations=0), solve_consensus(problem, cancel=lambda: True)):
+    for result in (solve_central(problem, max_iterations=0), solve_central(problem, cancel=lambda: True)):
         assert not result.converged
         assert result.iterations == 0
-    result = solve_consensus(problem, max_iterations=1)
-    assert not result.converged
-    assert result.status == "maximum_iterations"
-    assert result.iterations == 1
 
 
 def test_infeasible_fixed_contact_is_not_reported_as_converged():
@@ -165,13 +151,10 @@ def test_infeasible_fixed_contact_is_not_reported_as_converged():
     result = solve_central(problem)
     assert not result.converged
     assert "Infeasible" in result.status
-    result = solve_consensus(problem, max_iterations=50)
-    assert not result.converged
     assert not result.diagnostics["constraints_satisfied"]
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_constant_acceleration_fixed_support_does_not_enforce_free_fall(solver):
+def test_constant_acceleration_fixed_support_does_not_enforce_free_fall():
     mesh = mesh_pair()
     positions = mesh.nodes[mesh.tets]
     mass = np.broadcast_to(mesh.volumes[:, None] / 4, (len(mesh.tets), 4))
@@ -181,7 +164,7 @@ def test_constant_acceleration_fixed_support_does_not_enforce_free_fall(solver):
     problem = problem_for(mesh, positions=positions, predicted_positions=positions + 0.5 * dt**2 * gravity,
                           predicted_velocities=np.broadcast_to(dt * gravity, positions.shape), dt=dt, fixed=fixed,
                           external_impulse=mass[..., None] * gravity * dt, kinematic_rule="constant_acceleration")
-    result = solver(problem, tolerances=CorrectorTolerances(1e-10, 1e-9))
+    result = solve_central(problem, tolerances=CorrectorTolerances(1e-10, 1e-9))
     assert result.converged, result.status
     assert_allclose(result.positions, positions, atol=1e-8)
     assert_allclose(result.velocities, 0, atol=1e-8)
@@ -189,12 +172,11 @@ def test_constant_acceleration_fixed_support_does_not_enforce_free_fall(solver):
     assert result.diagnostics["feasibility"]["status"] == "feasible"
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_unbounded_iteration_configuration_stops_on_proven_infeasibility(solver):
+def test_unbounded_iteration_configuration_stops_on_proven_infeasibility():
     mesh = mesh_pair()
     problem = problem_for(mesh, fixed=np.ones((len(mesh.tets), 4), dtype=bool),
                           contacts=(LinearizedContact.pair(0, -1, [0, 0, 1], -0.01),))
-    result = solver(problem, max_iterations=None)
+    result = solve_central(problem, max_iterations=None)
     assert not result.converged
     assert result.status == "PrimalInfeasible"
     assert result.iterations == 0
@@ -203,13 +185,12 @@ def test_unbounded_iteration_configuration_stops_on_proven_infeasibility(solver)
     assert result.diagnostics["feasibility"]["engine_calls"] == 0
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_feasibility_solver_failure_is_unknown(solver, monkeypatch):
+def test_feasibility_solver_failure_is_unknown(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("test numerical failure")
 
     monkeypatch.setattr("fracture_world.dynamics_corrector.linprog", fail)
-    result = solver(problem_for(mesh_pair()))
+    result = solve_central(problem_for(mesh_pair()))
     assert not result.converged
     assert result.status == "feasibility_unknown"
     assert result.iterations == 0
@@ -217,8 +198,7 @@ def test_feasibility_solver_failure_is_unknown(solver, monkeypatch):
     assert "test numerical failure" in result.diagnostics["feasibility"]["solver_message"]
 
 
-@pytest.mark.parametrize("solver", [solve_central, solve_consensus])
-def test_ballistic_angular_momentum_uses_continuous_external_torque(solver):
+def test_ballistic_angular_momentum_uses_continuous_external_torque():
     mesh = mesh_pair()
     positions = mesh.nodes[mesh.tets]
     velocity = np.broadcast_to([1.2, 0.3, -0.4], positions.shape).copy()
@@ -231,7 +211,7 @@ def test_ballistic_angular_momentum_uses_continuous_external_torque(solver):
     problem = problem_for(mesh, velocities=velocity, predicted_positions=predicted_position,
                           predicted_velocities=predicted_velocity, dt=dt, external_impulse=impulse,
                           kinematic_rule="constant_acceleration")
-    result = solver(problem)
+    result = solve_central(problem)
     assert result.converged, result.status
     assert_allclose(result.positions, predicted_position, atol=1e-8)
     assert_allclose(result.velocities, predicted_velocity, atol=1e-8)
@@ -271,12 +251,12 @@ def disconnected_problem(**updates):
 def test_disconnected_free_fragments_cannot_reverse_momentum_without_interaction():
     problem = disconnected_problem()
     assert len(problem.momentum_islands) == 2
-    for result in check_solvers(problem):
-        assert_allclose(result.velocities, problem.velocities, atol=1e-8)
-        assert_allclose(result.positions, problem.positions + problem.dt * problem.velocities, atol=1e-8)
-        assert result.objective > 0
-        assert result.diagnostics["free_momentum_island_count"] == 2
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = check_central(problem)
+    assert_allclose(result.velocities, problem.velocities, atol=1e-8)
+    assert_allclose(result.positions, problem.positions + problem.dt * problem.velocities, atol=1e-8)
+    assert result.objective > 0
+    assert result.diagnostics["free_momentum_island_count"] == 2
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 def test_disconnected_fragments_cannot_exchange_angular_momentum():
@@ -287,9 +267,9 @@ def test_disconnected_fragments_cannot_exchange_angular_momentum():
     proposed = np.cross(rotation, lever)
     problem = disconnected_problem(velocities=np.zeros_like(positions), predicted_velocities=proposed,
                                    predicted_positions=positions + base.dt * proposed)
-    for result in check_solvers(problem):
-        assert_allclose(result.velocities, 0, atol=1e-8)
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = check_central(problem)
+    assert_allclose(result.velocities, 0, atol=1e-8)
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 @pytest.mark.parametrize("rule", ["backward_euler", "trapezoidal", "constant_acceleration"])
@@ -302,14 +282,14 @@ def test_each_free_fragment_receives_its_own_supplied_external_impulse(rule):
     problem = disconnected_problem(predicted_positions=positions, predicted_velocities=velocity,
                                    external_impulse=base.corner_masses[..., None] * base.dt * acceleration,
                                    kinematic_rule=rule)
-    for result in check_solvers(problem):
-        momentum = np.sum(problem.corner_masses[..., None] * result.velocities, axis=1)
-        expected = np.sum(problem.corner_masses[..., None] * velocity, axis=1)
-        assert_allclose(momentum, expected, atol=1e-8)
-        if rule != "trapezoidal":
-            assert_allclose(result.positions, positions, atol=1e-8)
-            assert_allclose(result.velocities, velocity, atol=1e-8)
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = check_central(problem)
+    momentum = np.sum(problem.corner_masses[..., None] * result.velocities, axis=1)
+    expected = np.sum(problem.corner_masses[..., None] * velocity, axis=1)
+    assert_allclose(momentum, expected, atol=1e-8)
+    if rule != "trapezoidal":
+        assert_allclose(result.positions, positions, atol=1e-8)
+        assert_allclose(result.velocities, velocity, atol=1e-8)
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 @pytest.mark.parametrize("boundary", ["support", "floor"])
@@ -322,22 +302,22 @@ def test_boundary_on_one_fragment_does_not_disable_another_fragments_balance(bou
         contacts = (LinearizedContact.pair(0, -1, [0, 0, 1], 0),)
     problem = disconnected_problem(fixed=fixed, contacts=contacts)
     tolerance = CorrectorTolerances(1e-10, 1e-9)
-    for result in (solve_central(problem, tolerance), solve_consensus(problem, tolerances=tolerance, max_iterations=20000)):
-        assert result.converged, result.status
-        assert_allclose(result.velocities[1], problem.velocities[1], atol=1e-8)
-        assert result.diagnostics["free_momentum_island_count"] == 1
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = solve_central(problem, tolerance)
+    assert result.converged, result.status
+    assert_allclose(result.velocities[1], problem.velocities[1], atol=1e-8)
+    assert result.diagnostics["free_momentum_island_count"] == 1
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 def test_internal_contact_allows_exchange_only_within_its_interaction_island():
     contact = LinearizedContact.pair(0, 4, [1, 0, 0], 0)
     problem = disconnected_problem(contacts=(contact,))
     assert len(problem.momentum_islands) == 1
-    for result in check_solvers(problem):
-        momentum = np.sum(problem.corner_masses[..., None] * result.velocities, axis=(0, 1))
-        assert_allclose(momentum, 0, atol=1e-8)
-        assert result.diagnostics["free_momentum_island_count"] == 1
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = check_central(problem)
+    momentum = np.sum(problem.corner_masses[..., None] * result.velocities, axis=(0, 1))
+    assert_allclose(momentum, 0, atol=1e-8)
+    assert result.diagnostics["free_momentum_island_count"] == 1
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 def test_new_fracture_keeps_prefracture_impulse_exchange_for_one_step_only():
@@ -372,18 +352,18 @@ def test_releasing_support_keeps_only_its_island_reaction_unknown_for_that_step(
                                    predicted_positions=base.positions + base.dt * prediction,
                                    previous_fixed=previous)
     assert during.metadata["released_support_corners"] == 1
-    for result in check_solvers(during):
-        assert_allclose(result.velocities[0], prediction[0], atol=1e-7)
-        assert_allclose(result.velocities[1], 0, atol=1e-8)
-        assert result.diagnostics["momentum_islands"][0]["boundary"] == "support"
-        assert result.diagnostics["free_momentum_island_count"] == 1
-        assert not result.diagnostics["boundary_momentum_verified"]
+    result = check_central(during)
+    assert_allclose(result.velocities[0], prediction[0], atol=1e-7)
+    assert_allclose(result.velocities[1], 0, atol=1e-8)
+    assert result.diagnostics["momentum_islands"][0]["boundary"] == "support"
+    assert result.diagnostics["free_momentum_island_count"] == 1
+    assert not result.diagnostics["boundary_momentum_verified"]
     after = disconnected_problem(velocities=velocity, predicted_velocities=prediction,
                                   predicted_positions=base.positions + base.dt * prediction)
-    for result in check_solvers(after):
-        assert_allclose(result.velocities, 0, atol=1e-8)
-        assert result.diagnostics["free_momentum_island_count"] == 2
-        assert result.diagnostics["free_momentum_islands_verified"]
+    result = check_central(after)
+    assert_allclose(result.velocities, 0, atol=1e-8)
+    assert result.diagnostics["free_momentum_island_count"] == 2
+    assert result.diagnostics["free_momentum_islands_verified"]
 
 
 @pytest.mark.parametrize("previous", [np.zeros(8, dtype=bool), np.zeros((2, 4), dtype=int), True])

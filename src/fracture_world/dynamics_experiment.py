@@ -6,7 +6,7 @@ import numpy as np
 from .dynamics_evaluation import _native_clock, evaluate_dynamics
 from .dynamics_data import load_dynamics_dataset
 from .dynamics_initial import export_initial
-from .dynamics_learning import load_dynamics_model
+from .dynamics_learning import load_dynamics_predictor
 from .dynamics_runtime import RolloutConfig, rollout_dynamics
 from .io import file_hash, new_directory, write_json
 
@@ -31,7 +31,7 @@ _AUTONOMOUS_PROPOSAL_CONTROL = (
 
 
 def _motion_ablation_protocol(methods):
-    pairs = [[solver, f"no_motion_{solver}"] for solver in ("central", "consensus")]
+    pairs = [[method, f"no_motion_{method}"] for method in methods if f"no_motion_{method}" in methods]
     return dict(enabled=any(method.startswith("no_motion_") for method in methods),
                 comparison_pairs=[pair for pair in pairs if set(pair).issubset(methods)],
                 removed="learned motion residual only",
@@ -76,7 +76,7 @@ def _paired_solver_metrics(rows, methods):
     return dict(all_methods=_paired_accuracy(measurements, methods, metrics),
                 pairwise=[_paired_accuracy(measurements, pair, metrics) for pair in combinations(methods, 2)],
                 interpretation="runtime and solver work conditional on shared completed horizons; runtime includes prediction and shared preparation per autonomous rollout",
-                iteration_interpretation="iteration counts are backend-specific: central uses interior-point iterations, consensus counts ADMM iterations; counts are not equivalent units of work",
+                iteration_interpretation="iteration counts retain each source backend's units of work",
                 difference_semantics="second method minus first method on each shared case")
 
 
@@ -97,38 +97,19 @@ def _checked_constraint_summary(results):
                 completed_and_checked_constraints_valid_rate=float(np.mean(verified)) if verified else None)
 
 
-def _rollout_agreement(central, consensus, completed):
-    with np.load(central, allow_pickle=False) as a, np.load(consensus, allow_pickle=False) as b:
-        count = min(len(a["times"]), len(b["times"]))
-        future = slice(1, count)
-        available = count > 1
-        return dict(common_frames=count, common_prediction_frames=max(count - 1, 0), agreement_available=available,
-                    both_rollouts_completed=bool(completed),
-                    positions_rms_metres=float(np.sqrt(np.mean((a["positions"][future] - b["positions"][future])**2))) if available else None,
-                    velocities_rms_metres_per_second=float(np.sqrt(np.mean((a["velocities"][future] - b["velocities"][future])**2))) if available else None,
-                    fracture_disagreements=int(np.count_nonzero(a["broken"][future] != b["broken"][future])) if available else None,
-                    same_objective=None, same_objective_formulation=True,
-                    objective_scope="same formulation within a motion-source pair; autonomous current states and candidate pools may differ, so identical per-step objectives are not enforced",
-                    interpretation="shared future predictions only; incomplete rollouts do not validate the full horizon; agreement is not evidence of proximal superiority"
-                    if available else "no shared future prediction; initial-state equality provides no implementation validation")
-
-
-def _comparison_methods(methods, learned_corrector):
-    selected = list(methods or (["raw", "neural", "central", "consensus"] if learned_corrector is not None
-                                else ["raw", "central", "consensus"]))
-    allowed = {"physics", "raw", "neural", "central", "consensus",
-               "no_motion_central", "no_motion_consensus"}
-    if len(set(selected)) != len(selected) or not set(selected).issubset(allowed):
-        raise ValueError("comparison methods must be unique physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus values")
-    if "neural" in selected and learned_corrector is None:
-        raise ValueError("neural baseline requested but checkpoint has no trained corrector")
+def _comparison_methods(methods):
+    if methods is not None and not isinstance(methods, (list, tuple)):
+        raise ValueError("comparison methods must be a list or tuple")
+    selected = list(["raw"] if methods is None else methods)
+    if (not selected or any(not isinstance(method, str) or method not in {"physics", "raw"} for method in selected)
+            or len(set(selected)) != len(selected)):
+        raise ValueError("comparison methods must be unique physics/raw values")
     return selected
 
 
 def compare_dynamics(checkpoint, initial, output, steps, config=None, device="auto", methods=None,
                      reference_case=None, reference_trajectory=None, progress=None):
-    _, learned_corrector, _, _ = load_dynamics_model(checkpoint, device)
-    methods = _comparison_methods(methods, learned_corrector)
+    methods = _comparison_methods(methods)
     if reference_trajectory and not reference_case:
         raise ValueError("reference_trajectory requires reference_case")
     config = config or RolloutConfig()
@@ -144,38 +125,30 @@ def compare_dynamics(checkpoint, initial, output, steps, config=None, device="au
         for method in conditions:
             conditions[method]["evaluation"] = evaluate_dynamics(directory / method, reference_case, reference_trajectory,
                                                                  directory / method / "evaluation.json")
-    agreement = None
-    if {"central", "consensus"}.issubset(conditions):
-        agreement = _rollout_agreement(directory / "central" / "trajectory.npz", directory / "consensus" / "trajectory.npz",
-                                       all(conditions[method]["status"] == "completed" for method in ("central", "consensus")))
-    no_motion_agreement = None
-    if {"no_motion_central", "no_motion_consensus"}.issubset(conditions):
-        no_motion_agreement = _rollout_agreement(
-            directory / "no_motion_central" / "trajectory.npz", directory / "no_motion_consensus" / "trajectory.npz",
-            all(conditions[method]["status"] == "completed" for method in ("no_motion_central", "no_motion_consensus")))
     report = dict(format="fracture-world.neural-comparison.v1", status="interrupted" if interrupted else "comparison_finished", engine_calls=0,
-                  conditions=conditions, central_consensus_agreement=agreement,
-                  no_motion_central_consensus_agreement=no_motion_agreement,
-                  motion_ablation=_motion_ablation_protocol(methods),
+                  conditions=conditions,
                   requested_methods=methods, attempted_methods=list(conditions),
                   unattempted_methods=[method for method in methods if method not in conditions],
                   proposal_control=_AUTONOMOUS_PROPOSAL_CONTROL,
                   protocol="autonomous rollout from one initial state; every committed prediction is the next step's input",
                   numerical_reference_used_for_inference=False,
-                  neural_baseline_available=learned_corrector is not None,
                   all_rollouts_completed=not interrupted and len(conditions) == len(methods)
                   and all(item["status"] == "completed" for item in conditions.values()))
     write_json(directory / "comparison.json", report)
     return report
 
 
-def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="auto", methods=None, split="test", progress=None):
+def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="auto", methods=None, split="test", progress=None,
+                       *, case_ids=None):
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError("benchmark steps must be a positive integer number of native timesteps")
     if split not in {"validation", "test"}:
         raise ValueError("benchmark split must select validation or test")
-    _, learned_corrector, saved, _ = load_dynamics_model(checkpoint, device)
-    methods = _comparison_methods(methods, learned_corrector)
+    if case_ids is not None and (not isinstance(case_ids, (list, tuple)) or not case_ids or
+                                 any(not isinstance(name, str) or not name for name in case_ids) or len(set(case_ids)) != len(case_ids)):
+        raise ValueError("benchmark case IDs must be unique nonempty strings")
+    methods = _comparison_methods(methods)
+    _, saved, _ = load_dynamics_predictor(checkpoint, device)
     if saved["training"]["overfit"]:
         raise ValueError("held-out benchmarking cannot use an overfit-debug checkpoint")
     conditions = set(saved["condition_splits"][split])
@@ -184,6 +157,12 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
              if item.case_id in names and item.condition_digest in conditions]
     if len(cases) != len(names) or not cases:
         raise ValueError("benchmark data must contain every recorded held-out case and matching loading condition")
+    available_cases = len(cases)
+    if case_ids is not None:
+        unknown = set(case_ids).difference(item.case_id for item in cases)
+        if unknown:
+            raise ValueError(f"benchmark case IDs must belong to the selected split: {sorted(unknown)}")
+        cases = [item for item in cases if item.case_id in case_ids]
     directory = new_directory(output)
     records, rows = [], {method: [] for method in methods}
     interrupted = False
@@ -248,7 +227,7 @@ def benchmark_dynamics(checkpoint, data, output, steps, config=None, device="aut
                   difference_semantics="second method minus first method on each shared case; negative differences are lower values, not an automatic claim of better physics")
     attempted_runs = sum(len(results) for results in rows.values())
     report = dict(schema="fracture-world.dynamics-benchmark.v1", status="interrupted" if interrupted else "benchmark_finished",
-                  cases=records, conditions=summaries,
+                  cases=records, conditions=summaries, available_split_cases=available_cases,
                   requested_cases=len(cases), attempted_cases=len(records), unattempted_cases=len(cases) - len(records),
                   requested_case_ids=[item.case_id for item in cases],
                   unattempted_case_ids=[item.case_id for item in cases[len(records):]],

@@ -15,17 +15,11 @@ SOURCES = {'FEMFX': {'code': 'https://github.com/GPUOpen-Effects/FEMFX',
  'torchdiffeq': {'code': 'https://github.com/rtqichen/torchdiffeq',
                  'license': 'MIT',
                  'use': 'External Runge-Kutta integration of the learned field velocity'},
- 'ADMM': {'paper': 'https://web.stanford.edu/~boyd/papers/admm_distr_stats.html',
-          'use': 'General consensus for engine-free material-corner state correction; fixed-topology convex '
-                 'inner solves do not guarantee global nonlinear fracture convergence'},
  'WorldParticle': {'paper': 'https://arxiv.org/abs/2605.15305',
                    'code': 'https://github.com/WorldParticle/WorldParticle',
-                   'use': 'Architectural reference for learned Lagrangian prediction-correction; the '
+                   'use': 'Architectural reference for learned Lagrangian state prediction; the '
                           'temporal fracture model is independently implemented with PyTorch and PyG',
                    'upstream_code_or_weights_copied': False},
- 'ADMMProjectiveDynamics': {'paper': 'https://www.cse.iitd.ac.in/~narain/admm-pd/',
-                            'use': 'Prior art for local constraint projections and shared state correction; '
-                                   'independent implementation with SciPy and Clarabel'},
  'CorotationalEnergy': {'code': 'https://github.com/GPUOpen-Effects/FEMFX/tree/95cf656731a2465ae1d400138170af2d6575b5bb/amd_femfx/src',
                        'use': 'Independent isotropic nonplastic corotational energy, gradient and polar Hessian-vector implementation matching the numerical teacher material law',
                        'scope': 'Mechanical energy passivity with static boundaries; no calibrated fracture-energy law or global nonconvex convergence guarantee'},

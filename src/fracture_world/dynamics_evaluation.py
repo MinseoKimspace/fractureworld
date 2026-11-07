@@ -144,6 +144,20 @@ def _energy_interval(energy, previous_positions, previous_velocities, positions,
                             relative_positive_increment=None, energy_change_j=change)
 
 
+def _material_geometry(positions, broken, face_pairs):
+    positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+    tetrahedra = positions.reshape(-1, 4, 3)
+    edges = tetrahedra[:, 1:] - tetrahedra[:, :1]
+    scales = np.max(np.abs(edges), axis=(1, 2))[:, None, None]
+    normalized = np.divide(edges, scales, out=np.zeros_like(edges), where=scales > 0)
+    determinants = np.linalg.det(normalized)
+    pairs = face_pairs[~broken].reshape(-1, 2)
+    gaps = np.linalg.norm(positions[pairs[:, 0]] - positions[pairs[:, 1]], axis=1)
+    return dict(inverted_tetrahedra=int(np.count_nonzero(determinants < 0)),
+                degenerate_tetrahedra=int(np.count_nonzero(np.abs(determinants) <= 64 * np.finfo(float).eps)),
+                maximum_intact_face_gap_m=float(np.max(gaps, initial=0.0)))
+
+
 def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output_file=None):
     teacher = load_dynamics_trajectory(case_path, trajectory_path)
     report, arrays = _read_rollout(rollout_directory, teacher)
@@ -163,6 +177,18 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
     if velocity_scale is not None and (isinstance(velocity_scale, bool) or not isinstance(velocity_scale, (int, float))
                                        or not np.isfinite(velocity_scale) or velocity_scale <= 0):
         raise ValueError("energy_velocity_scale must be finite and positive when recorded")
+    prediction_geometry = [_material_geometry(positions, broken, teacher.topology.face_pairs)
+                           for positions, broken in zip(arrays["positions"], arrays["broken"])]
+    future_geometry = prediction_geometry[1:]
+    all_prediction_geometry = dict(
+        future_frames=len(future_geometry),
+        frames_with_inverted_tetrahedra=sum(frame["inverted_tetrahedra"] > 0 for frame in future_geometry),
+        frames_with_degenerate_tetrahedra=sum(frame["degenerate_tetrahedra"] > 0 for frame in future_geometry),
+        maximum_inverted_tetrahedra=max((frame["inverted_tetrahedra"] for frame in future_geometry), default=None),
+        maximum_degenerate_tetrahedra=max((frame["degenerate_tetrahedra"] for frame in future_geometry), default=None),
+        maximum_intact_face_gap_m=max((frame["maximum_intact_face_gap_m"] for frame in future_geometry), default=None),
+        overlap_checks_performed=False, swept_checks_performed=False,
+        scope="tetrahedron orientation and intact material-face corner continuity at every saved future prediction")
     frames = []
     floor = teacher.metadata.get("conditioning_context", {}).get("floor_height_m")
     for predicted_frame, target_frame in pairs:
@@ -186,6 +212,8 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
             components, reference_components = energy.components(positions, velocities), energy.components(target_positions, target_velocities)
             increment = reference_increment = None
         predicted_cuts, target_cuts = arrays["broken"][predicted_frame], teacher.broken[target_frame]
+        geometry = prediction_geometry[int(predicted_frame)]
+        reference_geometry = _material_geometry(target_positions, target_cuts, teacher.topology.face_pairs)
         predicted_count = len(np.unique(component_labels(len(teacher.topology.mesh.tets), teacher.topology.mesh.dual_edges, predicted_cuts)))
         target_count = len(np.unique(component_labels(len(teacher.topology.mesh.tets), teacher.topology.mesh.dual_edges, target_cuts)))
         frames.append(dict(rollout_frame=int(predicted_frame), teacher_frame=int(target_frame),
@@ -195,6 +223,7 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
                            new_fracture=_new_fracture_classification(predicted_cuts[None], target_cuts[None], initial_broken)
                            if predicted_frame else None,
                            predicted_components=int(predicted_count), teacher_components=int(target_count),
+                           **geometry, **{f"reference_{key}": value for key, value in reference_geometry.items()},
                            component_count_absolute_error=int(abs(predicted_count - target_count)),
                            linear_momentum_error_kg_m_per_s=float(np.linalg.norm(momentum - target_momentum)),
                            angular_momentum_about_origin_error_kg_m2_per_s=float(np.linalg.norm(angular - target_angular)),
@@ -229,6 +258,12 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
              if frame[increment_key]["relative_positive_increment"] is not None), default=None)
         energy_metrics[f"{prefix}relative_energy_increment_intervals"] = sum(
             frame[increment_key]["relative_positive_increment"] is not None for frame in future)
+    geometry_metrics = {}
+    for prefix in ("", "reference_"):
+        for name, frame_key in (("inverted_tetrahedra", "inverted_tetrahedra"),
+                                ("degenerate_tetrahedra", "degenerate_tetrahedra"),
+                                ("intact_face_gap_m", "maximum_intact_face_gap_m")):
+            geometry_metrics[f"maximum_{prefix}{name}"] = max((frame[f"{prefix}{frame_key}"] for frame in future), default=None)
     result = dict(format="fracture-world.dynamics-evaluation.v1", method=report["method"], rollout_status=report["status"],
                   reference="same FEMFX numerical teacher, not physical ground truth", evaluation_only_teacher_future=True,
                   inference_teacher_future_used=False, engine_calls=0, mesh_fingerprint=teacher.topology.fingerprint,
@@ -243,6 +278,10 @@ def evaluate_dynamics(rollout_directory, case_path, trajectory_path=None, output
                   last_rollout_native_step=int(native_steps[-1]),
                   time_alignment="native integer step IDs; float32 accumulated teacher clock and analytic rollout clock",
                   initial_teacher_frame=initial_frame, position_mass_weighted_rmse_m=mean("position_mass_weighted_rmse_m"),
+                  geometry_diagnostic_scope="tetrahedron orientation and intact material-face corner continuity at aligned frames",
+                  orientation_degeneracy_tolerance=64 * np.finfo(float).eps,
+                  all_prediction_geometry=all_prediction_geometry,
+                  **geometry_metrics,
                   velocity_mass_weighted_rmse_m_per_s=mean("velocity_mass_weighted_rmse_m_per_s"),
                   linear_momentum_error_kg_m_per_s=mean("linear_momentum_error_kg_m_per_s"),
                   angular_momentum_about_origin_error_kg_m2_per_s=mean("angular_momentum_about_origin_error_kg_m2_per_s"),

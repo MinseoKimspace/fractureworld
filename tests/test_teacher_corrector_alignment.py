@@ -221,7 +221,7 @@ def test_matched_methods_evaluate_identical_endpoint_with_one_common_energy_cont
     config = replace(source_config(), fracture_samples=0, fracture_policy="marginal_search")
     report = dynamics_matched.compare_matched_step(observation, FixedProposal(), config)
     assert report["candidate_count"] == 1
-    assert [record["method"] for record in report["candidates"]] == ["raw", "central", "consensus"]
+    assert [record["method"] for record in report["candidates"]] == ["raw", "central", "no_motion_central"]
     assert len(calls) == 3
     for positions, velocities in calls:
         assert_array_equal(positions, next_positions)

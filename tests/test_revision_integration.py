@@ -6,27 +6,32 @@ from numpy.testing import assert_allclose
 import pytest
 import torch
 
-from fracture_world.dynamics_runtime import RolloutConfig, _correct, fracture_candidates, rollout_dynamics
+from fracture_world.dynamics_initial import load_initial
+from fracture_world.dynamics_learning import load_dynamics_model, state_batch
+from fracture_world.dynamics_matched import compare_matched_step
+from fracture_world.dynamics_runtime import RolloutConfig, _correct, fracture_candidates
 from fracture_world.mesh import VolumeMesh
 from test_dynamics_runtime import portable_rollout_inputs
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_default_correction_follows_the_checkpoint_constant_acceleration_prior(tmp_path, method):
-    checkpoint, initial, topology, _ = portable_rollout_inputs(tmp_path)
+def test_default_offline_correction_follows_the_checkpoint_constant_acceleration_prior(tmp_path):
+    checkpoint, initial_path, topology, _ = portable_rollout_inputs(tmp_path)
     saved = torch.load(checkpoint, weights_only=True)
     saved["model_config"]["motion_prior"] = "constant_acceleration"
     torch.save(saved, checkpoint)
-    output = tmp_path / method
-    report = rollout_dynamics(checkpoint, initial, output, 1, method,
-                              RolloutConfig(fracture_samples=0, fracture_policy="marginal_search"), "cpu")
-    assert report["status"] == "completed"
-    assert report["configuration"]["kinematic_rule"] == "constant_acceleration"
-    assert report["all_committed_energy_valid"]
-    assert report["all_committed_swept_geometry_valid"]
-    with np.load(output / "trajectory.npz", allow_pickle=False) as archive:
-        assert_allclose(archive["positions"][-1], topology.rest_positions + [0, 0, -0.00005], atol=1e-8)
-        assert_allclose(archive["velocities"][-1], np.tile([0, 0, -0.01], (8, 1)), atol=1e-8)
+    initial = load_initial(initial_path)
+    model, _, _, device = load_dynamics_model(checkpoint, "cpu")
+    batch = state_batch(topology, initial.positions, initial.velocities, initial.broken, initial.fixed,
+                        initial.gravity, initial.material, initial.dt, device)
+    with torch.no_grad():
+        proposal = model(batch)
+    result, report = _correct(initial, initial.positions, initial.velocities, proposal, initial.broken, initial.fixed,
+                              model, RolloutConfig(fracture_samples=0, fracture_policy="marginal_search"), "central")
+    assert result is not None, report
+    assert result.diagnostics["energy"]["energy_satisfied"]
+    assert report["swept_geometry"]["valid"]
+    assert_allclose(result.positions.reshape(-1, 3), topology.rest_positions + [0, 0, -0.00005], atol=1e-8)
+    assert_allclose(result.velocities.reshape(-1, 3), np.tile([0, 0, -0.01], (8, 1)), atol=1e-8)
 
 
 def test_damped_teacher_is_rejected_by_the_undamped_constrained_model(tmp_path):
@@ -37,9 +42,9 @@ def test_damped_teacher_is_rejected_by_the_undamped_constrained_model(tmp_path):
     metadata["teacher_physics"] = {"rayleigh_mass_damping": 0.15}
     values["metadata_json"] = np.asarray(json.dumps(metadata))
     np.savez_compressed(initial, **values)
-    with pytest.raises(ValueError, match="zero damping"):
-        rollout_dynamics(checkpoint, initial, tmp_path / "invalid", 1, "consensus", device="cpu")
-    assert not (tmp_path / "invalid").exists()
+    model, _, _, _ = load_dynamics_model(checkpoint, "cpu")
+    with pytest.raises(ValueError, match="undamped frictionless"):
+        compare_matched_step(load_initial(initial), model)
 
 
 def test_fm_search_contains_only_generated_samples_without_classifier_or_extra_cracks():
@@ -56,7 +61,7 @@ def test_fm_search_contains_only_generated_samples_without_classifier_or_extra_c
     assert {tuple(mask) for mask in candidates} == {(True, False, False), (False, True, False)}
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_physical_correction_can_prefer_a_sampled_fracture_without_reference_labels(method):
     mesh = VolumeMesh([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]],
                       [[0, 1, 2, 3], [4, 1, 2, 3]])
@@ -83,7 +88,7 @@ def test_physical_correction_can_prefer_a_sampled_fracture_without_reference_lab
     assert objectives[True] < 0.01 * objectives[False]
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 @pytest.mark.parametrize("topology_state", ["disconnected", "previously_fractured"])
 def test_full_corrector_prevents_force_free_momentum_exchange_between_separated_fragments(method, topology_state):
     tetrahedron = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])

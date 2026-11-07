@@ -109,8 +109,7 @@ def parser():
     initial.add_argument("--frame", type=int, default=0)
     initial.add_argument("--support-policy", choices=["prescribed", "free", "learned"], required=True)
     initial.add_argument("--output", type=Path, required=True)
-    rollout_methods = ["physics", "raw", "neural", "central", "consensus",
-                       "no_motion_central", "no_motion_consensus"]
+    rollout_methods = ["physics", "raw"]
     for name in ("dynamics-rollout", "dynamics-compare"):
         command = commands.add_parser(name, help="Run learned fracture dynamics without a runtime physics engine")
         command.add_argument("--checkpoint", type=Path, required=True)
@@ -120,9 +119,9 @@ def parser():
         command.add_argument("--specification", type=Path)
         command.add_argument("--device", default="auto")
         if name == "dynamics-rollout":
-            command.add_argument("--method", choices=rollout_methods, default="consensus")
+            command.add_argument("--method", choices=rollout_methods, default="raw")
         else:
-            command.add_argument("--methods", nargs="+", choices=rollout_methods)
+            command.add_argument("--methods", nargs="+", choices=rollout_methods, default=["raw"])
             command.add_argument("--reference-case", type=Path)
             command.add_argument("--reference-trajectory", type=Path)
     dynamics_evaluation = commands.add_parser("dynamics-evaluate", help="Evaluate frozen neural rollouts against held-out numerical trajectories")
@@ -130,7 +129,7 @@ def parser():
     dynamics_evaluation.add_argument("--case", type=Path, required=True)
     dynamics_evaluation.add_argument("--trajectory", type=Path)
     dynamics_evaluation.add_argument("--output", type=Path)
-    benchmark = commands.add_parser("dynamics-benchmark", help="Evaluate all held-out cases with separate positive-fracture metrics")
+    benchmark = commands.add_parser("dynamics-benchmark", help="Evaluate selected held-out cases with separate positive-fracture metrics")
     benchmark.add_argument("--checkpoint", type=Path, required=True)
     benchmark.add_argument("--data", type=Path, required=True)
     benchmark.add_argument("--output", type=Path, required=True)
@@ -138,7 +137,8 @@ def parser():
     benchmark.add_argument("--specification", type=Path)
     benchmark.add_argument("--device", default="auto")
     benchmark.add_argument("--split", choices=["validation", "test"], default="test")
-    benchmark.add_argument("--methods", nargs="+", choices=rollout_methods)
+    benchmark.add_argument("--methods", nargs="+", choices=rollout_methods, default=["raw"])
+    benchmark.add_argument("--case-ids", nargs="+", help="Evaluate only named cases from the recorded split")
     merge = commands.add_parser("dynamics-merge-benchmarks", help="Merge compatible saved benchmark conditions without rerunning inference")
     merge.add_argument("--inputs", nargs="+", type=Path, required=True)
     merge.add_argument("--output", type=Path, required=True)
@@ -159,9 +159,9 @@ def parser():
     matched.add_argument("--split", choices=["validation", "test"], default="test")
     matched.add_argument("--frames", nargs="+", type=int)
     matched.add_argument("--case-ids", nargs="+", help="Evaluate only named cases from the recorded split")
-    matched.add_argument("--methods", nargs="+", choices=[method for method in rollout_methods if method not in {"physics", "neural"}])
+    matched.add_argument("--methods", nargs="+", choices=["raw", "central", "no_motion_central"])
     matched.add_argument("--cold-corrector", action="store_true", help="Disable corrector state and outer-loop cache reuse for a controlled comparison")
-    matched.add_argument("--motion-ablation", action="store_true", help="Add physical-motion-prior arms for the selected solvers sharing the same learned fracture and support candidate pool")
+    matched.add_argument("--motion-ablation", action="store_true", help="Include the physical motion prior with the central solver and shared fracture/support candidates")
     return root
 
 
@@ -255,9 +255,7 @@ def run(args):
                                       args.methods, args.reference_case, args.reference_trajectory, progress)
             output({"status": report["status"], "all_rollouts_completed": report["all_rollouts_completed"],
                     "engine_calls": 0, "report": str((args.output / "comparison.json").resolve()),
-                    "central_consensus_agreement": report["central_consensus_agreement"],
-                    "no_motion_central_consensus_agreement": report.get("no_motion_central_consensus_agreement"),
-                    "motion_ablation": report.get("motion_ablation")})
+                    "requested_methods": report["requested_methods"]})
         if report["status"] == "interrupted":
             raise SystemExit(130)
     elif args.command == "dynamics-evaluate":
@@ -269,8 +267,9 @@ def run(args):
         from .dynamics_runtime import load_rollout_config
 
         progress = lambda event: print(json.dumps(event, allow_nan=False), flush=True)
+        options = dict(case_ids=args.case_ids) if args.case_ids is not None else {}
         report = benchmark_dynamics(args.checkpoint, args.data, args.output, args.steps,
-                                    load_rollout_config(args.specification), args.device, args.methods, args.split, progress)
+                                    load_rollout_config(args.specification), args.device, args.methods, args.split, progress, **options)
         output(dict(status=report["status"], report=str((args.output / "benchmark.json").resolve()), cases=len(report["cases"]),
                     requested_cases=report["requested_cases"], attempted_cases=report["attempted_cases"],
                     unattempted_cases=report["unattempted_cases"],

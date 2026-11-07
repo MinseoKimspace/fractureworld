@@ -7,7 +7,6 @@ from fracture_world.dynamics_corrector import (
     DynamicsProblem,
     _diagnostics,
     solve_central,
-    solve_consensus,
 )
 from fracture_world.dynamics_energy import CorotationalEnergy, EnergyProjection
 from fracture_world.dynamics_energy_solvers import solve_energy
@@ -24,9 +23,7 @@ def connected_mesh():
 
 def solve_linear(problem, method):
     tolerance = CorrectorTolerances(1e-8, 1e-7)
-    if method == "central":
-        return solve_central(problem, tolerance, max_iterations=20000)
-    return solve_consensus(problem, tolerances=tolerance, rho=.01, max_iterations=20000)
+    return solve_central(problem, tolerance, max_iterations=20000)
 
 
 def predicted_state(positions, velocities, gravity, dt, frame):
@@ -55,7 +52,7 @@ def assert_exact_connections(mesh, positions, velocities, broken):
         assert np.array_equal(flat[pairs[:, 0]], flat[pairs[:, 1]])
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_perturbed_predictions_remain_feasible_across_two_hundred_shared_state_steps(method):
     mesh = connected_mesh()
     positions = mesh.nodes[mesh.tets] + [0., 2., 0.]
@@ -81,7 +78,7 @@ def test_perturbed_predictions_remain_feasible_across_two_hundred_shared_state_s
         positions, velocities = result.positions, result.velocities
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_shared_state_rollout_opens_fracture_without_retying_later_steps(method):
     mesh = connected_mesh()
     positions = mesh.nodes[mesh.tets] + [0., 2., 0.]
@@ -112,7 +109,7 @@ def test_shared_state_rollout_opens_fracture_without_retying_later_steps(method)
         positions, velocities = result.positions, result.velocities
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_preexisting_tolerance_sized_corner_drift_is_not_silently_certified_as_feasible(method):
     mesh = connected_mesh()
     positions = mesh.nodes[mesh.tets]
@@ -134,7 +131,7 @@ def test_preexisting_tolerance_sized_corner_drift_is_not_silently_certified_as_f
     assert result.status == "PrimalInfeasible"
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_active_energy_correction_preserves_exact_shared_corners(method):
     mesh = connected_mesh()
     positions = mesh.nodes[mesh.tets]
@@ -147,14 +144,11 @@ def test_active_energy_correction_preserves_exact_shared_corners(method):
     energy = CorotationalEnergy(mesh, 1., 10., .25, gravity)
     projection = EnergyProjection(problem, energy, energy.value(positions, velocities))
     assert not projection.diagnostics(problem.prior)["energy_satisfied"]
-    result = solve_energy(problem, projection, method, CorrectorTolerances(), rho=.01, max_iterations=20000)
+    result = solve_energy(problem, projection, method, CorrectorTolerances(), max_iterations=20000)
     assert result.converged, (result.status, result.diagnostics)
     assert result.diagnostics["energy"]["energy_satisfied"]
     assert_exact_connections(mesh, result.positions, result.velocities, broken)
-    if method == "consensus":
-        assert result.diagnostics["energy"]["energy_proximal_calls"] > 0
-    else:
-        assert result.diagnostics["energy"]["outer_iterations"] > 1
+    assert result.diagnostics["energy"]["outer_iterations"] > 1
     next_prediction = predicted_state(result.positions, result.velocities, gravity, dt, 4)
     next_problem = make_problem(mesh, result.positions, result.velocities, next_prediction, gravity, dt, broken, broken)
     next_result = solve_linear(next_problem, method)

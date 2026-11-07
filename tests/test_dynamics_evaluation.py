@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -58,6 +59,10 @@ def test_exact_numerical_teacher_scores_zero_without_modifying_inference_files(t
     assert result["total_mechanical_energy_absolute_error_j"] == 0
     assert result["maximum_positive_mechanical_energy_increment_j"] == result["maximum_reference_positive_mechanical_energy_increment_j"]
     assert result["final_energy_components_j"] == result["final_reference_energy_components_j"]
+    assert result["maximum_inverted_tetrahedra"] == result["maximum_reference_inverted_tetrahedra"] == 0
+    assert result["maximum_degenerate_tetrahedra"] == result["maximum_reference_degenerate_tetrahedra"] == 0
+    assert result["maximum_intact_face_gap_m"] == result["maximum_reference_intact_face_gap_m"] == 0
+    assert all(frame["inverted_tetrahedra"] == frame["reference_inverted_tetrahedra"] == 0 for frame in result["frames"])
     assert "not physical ground truth" in result["reference"]
     assert (rollout / "report.json").read_bytes() == report_before
     assert (rollout / "trajectory.npz").read_bytes() == archive_before
@@ -81,6 +86,76 @@ def test_mass_weighted_motion_metrics_and_missed_fracture_events_are_measured(tm
     assert result["fracture_timing"]["missed_events"] == 3
     assert result["frames"][-1]["component_count_absolute_error"] == 2
     assert not result["held_out_condition"]
+
+
+@pytest.mark.parametrize("failure", ["inverted", "degenerate"])
+def test_finite_invalid_raw_geometry_remains_evaluable_offline(tmp_path, failure):
+    case, trajectory = recorded_trajectory(tmp_path / "source")
+    teacher = load_dynamics_trajectory(case, trajectory)
+
+    def modify(arrays):
+        if failure == "inverted":
+            arrays["positions"][1:, :4] = arrays["positions"][1:, [1, 0, 2, 3]]
+        else:
+            arrays["positions"][1:, 0] = arrays["positions"][1:, 1]
+
+    rollout = saved_rollout(tmp_path / "rollout", teacher, modify,
+                            {"configuration": {"mechanics_mode": "proximal"}})
+    result = evaluate_dynamics(rollout, case, trajectory, tmp_path / "evaluation.json")
+    key = "inverted_tetrahedra" if failure == "inverted" else "degenerate_tetrahedra"
+    assert result[f"maximum_{key}"] >= 1
+    assert result[f"maximum_reference_{key}"] == 0
+    assert all(frame[key] >= 1 for frame in result["frames"][1:])
+    assert result["frames"][0][key] == 0
+    assert all(np.isfinite(frame["energy_components_j"]["total"]) for frame in result["frames"])
+    assert result["position_mass_weighted_rmse_m"] > 0
+    assert "orientation" in result["geometry_diagnostic_scope"]
+    assert "geometry_valid" not in result
+    assert all("geometry_valid" not in frame for frame in result["frames"])
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_offline_material_corner_gap_excludes_broken_faces(tmp_path, broken):
+    case, trajectory = recorded_trajectory(tmp_path / "source")
+    teacher = load_dynamics_trajectory(case, trajectory)
+
+    def modify(arrays):
+        arrays["positions"][1:] = teacher.positions[0]
+        arrays["positions"][1:, :4, 0] += 0.02
+        arrays["broken"][1:] = broken
+
+    rollout = saved_rollout(tmp_path / "rollout", teacher, modify)
+    result = evaluate_dynamics(rollout, case, trajectory)
+    expected = 0.0 if broken else 0.02
+    assert result["maximum_intact_face_gap_m"] == pytest.approx(expected)
+    assert result["maximum_reference_intact_face_gap_m"] == 0.0
+    assert result["maximum_inverted_tetrahedra"] == 0
+    assert result["maximum_degenerate_tetrahedra"] == 0
+    assert all(frame["maximum_intact_face_gap_m"] == pytest.approx(expected) for frame in result["frames"][1:])
+
+
+def test_sparse_teacher_alignment_keeps_unaligned_raw_inversions_in_geometry_summary(tmp_path, monkeypatch):
+    case, trajectory = recorded_trajectory(tmp_path / "source")
+    teacher = load_dynamics_trajectory(case, trajectory)
+
+    def modify(arrays):
+        arrays["positions"][1, :4] = arrays["positions"][1, [1, 0, 2, 3]]
+
+    rollout = saved_rollout(tmp_path / "rollout", teacher, modify)
+    subset = np.array([0, 2])
+    sparse = replace(teacher, **{name: getattr(teacher, name)[subset]
+                                for name in ("positions", "velocities", "broken", "fixed", "times")})
+    monkeypatch.setattr("fracture_world.dynamics_evaluation.load_dynamics_trajectory", lambda *args: sparse)
+    result = evaluate_dynamics(rollout, case, trajectory)
+    assert [frame["rollout_frame"] for frame in result["frames"]] == [0, 2]
+    assert result["maximum_inverted_tetrahedra"] == 0
+    geometry = result["all_prediction_geometry"]
+    assert geometry["future_frames"] == len(teacher)
+    assert geometry["frames_with_inverted_tetrahedra"] == 1
+    assert geometry["maximum_inverted_tetrahedra"] >= 1
+    assert geometry["maximum_degenerate_tetrahedra"] == 0
+    assert geometry["overlap_checks_performed"] is False
+    assert geometry["swept_checks_performed"] is False
 
 
 def test_support_release_mismatches_are_scored_without_becoming_runtime_inputs(tmp_path):

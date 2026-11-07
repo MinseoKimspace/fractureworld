@@ -24,7 +24,7 @@ frames.forEach((frame,index)=>{
 element('title').textContent=data.title||'Recorded fragment motion';
 const source=String(data.source||'unspecified');
 const sourceKind=source.toLowerCase();
-const methodLabel=data.metadata?.method;
+const methodLabel={raw:'model',physics:'physical prior'}[data.metadata?.method]??data.metadata?.method;
 const staticPreview=data.metadata?.simulation_executed===false;
 const suggestedSpeed=data.metadata?.suggested_playback_speed;
 const playbackSpeed=Number.isFinite(suggestedSpeed)&&suggestedSpeed>0?suggestedSpeed:(sourceKind.includes('femfx')?.001:1);

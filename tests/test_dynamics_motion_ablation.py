@@ -14,7 +14,7 @@ from fracture_world.io import file_hash
 from test_dynamics_runtime import portable_rollout_inputs
 
 
-ABLATION_METHODS = ("raw", "central", "consensus", "no_motion_central", "no_motion_consensus")
+ABLATION_METHODS = ("raw", "central", "no_motion_central")
 
 
 def motion_inputs(directory, monkeypatch, motion_prior="constant_acceleration"):
@@ -94,8 +94,8 @@ def test_motion_ablation_shares_candidates_supports_and_fm_calls_but_changes_onl
     assert len(calls["forwards"]) == report["predictor_calls"] == 1
     assert len(calls["samples"]) == report["fracture_flow_calls"] == 2
     assert calls["samples"][0]["context"] is calls["samples"][1]["context"]
-    assert len(calls["solves"]) == 8
-    assert report["requested_method_runs"] == report["attempted_method_runs"] == 10
+    assert len(calls["solves"]) == 4
+    assert report["requested_method_runs"] == report["attempted_method_runs"] == 6
     assert report["unattempted_method_runs"] == 0
     expected_positions, expected_velocities = expected_physical_motion(initial, model)
     corrected = [row for row in report["candidates"] if row["solver_method"] != "raw"]
@@ -108,7 +108,7 @@ def test_motion_ablation_shares_candidates_supports_and_fm_calls_but_changes_onl
         assert len({row["prior"] for row in records}) == 1
         assert len({row["proposal_hash"] for row in records if row["motion_source"] == "learned"}) == 1
         assert len({row["proposal_hash"] for row in records}) == 2
-    assert report["candidates"][0]["prior"] < report["candidates"][5]["prior"]
+    assert report["candidates"][0]["prior"] < report["candidates"][3]["prior"]
     assert len({tuple(solve["mask"]) for solve in calls["solves"]}) == 2
     for record, solve in zip(corrected, calls["solves"], strict=True):
         assert record["solver_method"] == solve["method"]
@@ -120,7 +120,7 @@ def test_motion_ablation_shares_candidates_supports_and_fm_calls_but_changes_onl
         else:
             assert np.max(np.abs(solve["proposal_velocities"] - expected_velocities)) > .1
     for candidate in range(2):
-        group = calls["solves"][4 * candidate:4 * candidate + 4]
+        group = calls["solves"][2 * candidate:2 * candidate + 2]
         for solve in group[1:]:
             assert_array_equal(solve["mask"], group[0]["mask"])
             assert_array_equal(solve["fixed"], group[0]["fixed"])
@@ -156,7 +156,7 @@ def test_teacher_future_is_evaluated_after_every_motion_arm_and_cannot_change_se
     _, initial, model, config, calls = motion_inputs(tmp_path, monkeypatch)
 
     def future(offset):
-        assert len(calls["solves"]) == 8
+        assert len(calls["solves"]) == 4
         return dict(positions=initial.positions + offset, velocities=initial.velocities + offset,
                     broken=initial.broken.copy(), fixed=initial.fixed.copy())
 
@@ -171,11 +171,11 @@ def test_teacher_future_is_evaluated_after_every_motion_arm_and_cannot_change_se
     assert first["reference_used_for_selection"] is False
 
 
-def test_default_matched_protocol_remains_three_methods_without_motion_ablation(tmp_path, monkeypatch):
+def test_default_matched_protocol_compares_raw_and_both_central_motion_sources(tmp_path, monkeypatch):
     _, initial, model, config, calls = motion_inputs(tmp_path, monkeypatch)
     report = matched.compare_matched_step(initial, model, config)
-    assert tuple(report["methods"]) == ("raw", "central", "consensus")
-    assert report.get("motion_ablation", False) is False
+    assert tuple(report["methods"]) == ("raw", "central", "no_motion_central")
+    assert report["motion_ablation"] is True
     assert report["requested_method_runs"] == report["attempted_method_runs"] == 6
     assert len(calls["solves"]) == 4
     assert len(calls["forwards"]) == 1
@@ -194,7 +194,7 @@ def test_each_motion_arm_reports_one_common_frozen_evaluation_objective(tmp_path
         assert record["frozen_problem_objective"] == pytest.approx(record["prior"] + problem.objective(state))
 
 
-def test_motion_ablation_cli_is_opt_in_on_the_matched_protocol_only():
+def test_motion_ablation_flag_is_available_on_the_matched_protocol_only():
     from fracture_world.cli import parser
 
     arguments = ["dynamics-matched", "--checkpoint", "best.pt", "--data", "collection.json", "--output", "matched"]

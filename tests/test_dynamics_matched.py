@@ -39,20 +39,21 @@ def test_matched_methods_receive_identical_frozen_candidates_and_only_one_encodi
 
     monkeypatch.setattr(model, "encode", capture_encode)
     monkeypatch.setattr(dynamics_matched.runtime, "_correct", capture_correct)
-    config = RolloutConfig(fracture_samples=4, flow_steps=1, max_iterations=10000, max_contact_iterations=3)
+    config = RolloutConfig(fracture_samples=4, fracture_policy="fm_search", flow_steps=1,
+                           max_iterations=10000, max_contact_iterations=3)
     report = compare_matched_step(initial, model, config)
     assert report["status"] == "completed"
     assert len(encoded) == report["predictor_calls"] == 1
     assert report["attempted_method_runs"] == 3 * report["candidate_count"]
     assert report["unattempted_method_runs"] == 0
     assert len(corrected) == 2 * report["candidate_count"]
-    for central, consensus in zip(corrected[::2], corrected[1::2], strict=True):
-        assert central[0] == "central" and consensus[0] == "consensus"
-        for first, second in zip(central[1:], consensus[1:], strict=True):
+    for central, physical in zip(corrected[::2], corrected[1::2], strict=True):
+        assert central[0] == physical[0] == "central"
+        for first, second in zip(central[1:], physical[1:], strict=True):
             np.testing.assert_array_equal(first, second)
     for index in range(report["candidate_count"]):
         rows = [item for item in report["candidates"] if item["candidate"] == index]
-        assert {item["method"] for item in rows} == {"raw", "central", "consensus"}
+        assert {item["method"] for item in rows} == {"raw", "central", "no_motion_central"}
         assert len({item["input_hash"] for item in rows}) == 1
         assert len({item["proposal_hash"] for item in rows}) == 1
         assert len({item["candidate_hash"] for item in rows}) == 1
@@ -83,7 +84,7 @@ def test_teacher_future_is_requested_only_after_all_solver_runs_and_cannot_chang
     second = compare_matched_step(initial, model, config, reference=lambda: future(10., True))
     assert first["input_hash"] == second["input_hash"]
     assert first["candidate_pool"] == second["candidate_pool"]
-    for method in ("raw", "central", "consensus"):
+    for method in ("raw", "central", "no_motion_central"):
         assert first["methods"][method]["selected_candidate"] == second["methods"][method]["selected_candidate"]
         assert first["methods"][method]["evaluation"] != second["methods"][method]["evaluation"]
 
@@ -94,7 +95,7 @@ def test_failed_and_unknown_candidates_are_not_selected_or_counted_as_verified(t
                         (None, dict(status="feasibility_unknown", solves=[])))
     config = RolloutConfig(fracture_samples=0, fracture_policy="marginal_search")
     report = compare_matched_step(initial, model, config)
-    for method in ("central", "consensus"):
+    for method in ("central", "no_motion_central"):
         summary = report["methods"][method]
         assert summary["selected_candidate"] is None
         assert summary["verified_constraints"] is None
@@ -103,7 +104,7 @@ def test_failed_and_unknown_candidates_are_not_selected_or_counted_as_verified(t
             assert record["selection_objective"] is None
             assert record["verified_constraints"] is None
     assert report["methods"]["raw"]["verified_constraints"] is None
-    assert all(not item["comparison_available"] for item in report["central_consensus"])
+    assert all(not item["comparison_available"] for item in report["selected_state_comparisons"])
 
 
 def test_prescribed_supports_override_a_release_capable_model_before_inputs_are_frozen(tmp_path, monkeypatch):
@@ -185,7 +186,7 @@ def test_sparse_teacher_intervals_remain_unknown_without_running_predictor(tmp_p
     sparse = replace(original, **{key: getattr(original, key)[indices] for key in
                                  ("positions", "velocities", "broken", "fixed", "times")})
     saved["training_mesh_fingerprints"] = [sparse.topology.fingerprint]
-    monkeypatch.setattr(dynamics_matched, "load_dynamics_model", lambda *args: (model, None, saved, torch.device("cpu")))
+    monkeypatch.setattr(dynamics_matched, "load_dynamics_predictor", lambda *args: (model, saved, torch.device("cpu")))
     monkeypatch.setattr(dynamics_matched, "load_dynamics_dataset", lambda *args, **kwargs: [sparse])
     monkeypatch.setattr(model, "forward", lambda *args: pytest.fail("sparse interval cannot be a one-step model input"))
     output = tmp_path / "matched"
@@ -193,7 +194,7 @@ def test_sparse_teacher_intervals_remain_unknown_without_running_predictor(tmp_p
     assert report["cases"][0]["unknown_frames"] == 1
     assert report["cases"][0]["completed_frames"] == 0
     assert report["unknown_candidate_pool_observations"] == 1
-    for method in ("raw", "central", "consensus"):
+    for method in ("raw", "central", "no_motion_central"):
         assert report["conditions"][method]["attempted_candidates"] == 0
         assert report["conditions"][method]["verified_candidates"] == 0
     recorded = json.loads((output / report["cases"][0]["report"]).read_text())
@@ -218,10 +219,10 @@ def test_matched_data_runner_accepts_legacy_inference_checkpoint_without_trainin
     assert report["status"] == "completed"
     assert report["cases"][0]["completed_frames"] == 1
     assert report["teacher_future_used_only_for_evaluation"]
-    for method in ("raw", "central", "consensus"):
+    for method in ("raw", "central", "no_motion_central"):
         assert report["conditions"][method]["requested_candidates"] == 2
         assert report["conditions"][method]["attempted_candidates"] == 2
-    for method in ("central", "consensus"):
+    for method in ("central", "no_motion_central"):
         summary = report["conditions"][method]
         assert summary["completed_candidates"] == summary["verified_candidates"] == 0
         assert summary["failed_candidates"] == summary["unknown_candidates"] == 2

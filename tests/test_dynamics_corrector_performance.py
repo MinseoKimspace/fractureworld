@@ -20,16 +20,15 @@ def stored_energy_fixture():
     return initial, model, proposal, replace(config, max_iterations=None, max_contact_iterations=None)
 
 
-@pytest.mark.parametrize('method', ('central', 'consensus'))
 @pytest.mark.parametrize('fixture', ('penetration', 'stored_energy'))
-def test_corrector_continuation_preserves_original_precision_and_physical_checks(method, fixture):
+def test_corrector_continuation_preserves_original_precision_and_physical_checks(fixture):
     initial, model, proposal, config = (stored_energy_fixture() if fixture == 'stored_energy'
                                         else phase_fixture(penetrated=True))
     settings = (config.absolute_tolerance, config.relative_tolerance, config.geometry_tolerance)
     results = []
     for reuse in (False, True):
         result, report = _correct(initial, initial.positions, initial.velocities, proposal, initial.broken, initial.fixed,
-                                  model, config, method, previous_broken=initial.broken,
+                                  model, config, "central", previous_broken=initial.broken,
                                   previous_fixed=initial.fixed, reuse_state=reuse)
         assert result is not None, report
         assert result.converged
@@ -54,15 +53,12 @@ def test_corrector_continuation_preserves_original_precision_and_physical_checks
         assert warm_performance['contact_builds'] < cold_performance['contact_builds']
         assert warm_performance['elastic_balance_builds'] < cold_performance['elastic_balance_builds']
         assert warm_performance['frozen_energy_builds'] < cold_performance['frozen_energy_builds']
-        if method == 'consensus':
-            assert warm_performance['inner_iterations_total'] < cold_performance['inner_iterations_total']
 
 
-@pytest.mark.parametrize('method', ('central', 'consensus'))
-def test_cancelled_reused_corrector_never_publishes_a_successful_state(method):
+def test_cancelled_reused_corrector_never_publishes_a_successful_state():
     initial, model, proposal, config = phase_fixture(penetrated=True)
     result, report = _correct(initial, initial.positions, initial.velocities, proposal, initial.broken, initial.fixed,
-                              model, config, method, cancel=lambda: True, reuse_state=True)
+                              model, config, "central", cancel=lambda: True, reuse_state=True)
     assert result is None
     assert report['status'] == 'interrupted'
 
@@ -116,7 +112,7 @@ def selected_case_inputs(tmp_path, monkeypatch):
     saved['splits'] = dict(test=[case.case_id for case in cases])
     saved['condition_splits'] = dict(test=[case.condition_digest for case in cases])
     saved['training_mesh_fingerprints'] = [item.topology.fingerprint]
-    monkeypatch.setattr(matched, 'load_dynamics_model', lambda *args: (model, None, saved, torch.device('cpu')))
+    monkeypatch.setattr(matched, 'load_dynamics_predictor', lambda *args: (model, saved, torch.device('cpu')))
     monkeypatch.setattr(matched, 'load_dynamics_dataset', lambda *args, **kwargs: cases)
     return checkpoint, cases
 

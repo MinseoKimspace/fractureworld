@@ -52,12 +52,12 @@ def test_recorded_teacher_settings_survive_trajectory_initial_export_and_portabl
     assert load_initial(output).metadata["teacher_physics"] == settings
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
 @pytest.mark.parametrize("parameter", ["rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient"])
-def test_exported_recorded_incompatible_teacher_settings_are_rejected_before_rollout(tmp_path, method, parameter):
+def test_exported_recorded_incompatible_teacher_settings_are_rejected_before_offline_comparison(tmp_path, parameter):
     import torch
 
-    from fracture_world.dynamics_runtime import rollout_dynamics
+    from fracture_world.dynamics_learning import load_dynamics_model
+    from fracture_world.dynamics_matched import compare_matched_step
     from test_dynamics_runtime import portable_rollout_inputs
 
     case, trajectory = recorded_teacher(tmp_path / "source", {parameter: 0.15})
@@ -67,10 +67,9 @@ def test_exported_recorded_incompatible_teacher_settings_are_rejected_before_rol
     saved = torch.load(checkpoint, weights_only=True)
     saved["training_mesh_fingerprints"] = [initial.topology.fingerprint]
     torch.save(saved, checkpoint)
-    output = tmp_path / "invalid"
-    with pytest.raises(ValueError, match="zero damping and friction"):
-        rollout_dynamics(checkpoint, initial_path, output, 1, method, device="cpu")
-    assert not output.exists()
+    model, _, _, _ = load_dynamics_model(checkpoint, "cpu")
+    with pytest.raises(ValueError, match="undamped frictionless"):
+        compare_matched_step(initial, model)
 
 
 @pytest.mark.parametrize("value", [True, "0", None, -0.1, float("nan")])

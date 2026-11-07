@@ -7,29 +7,27 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from .dynamics_corrector import CorrectorTolerances, DynamicsProblem, _diagnostics, solve_central, solve_consensus
+from .dynamics_corrector import CorrectorTolerances, DynamicsProblem, _diagnostics, solve_central
 from .dynamics_arithmetic import position_publication_envelope
 from .dynamics_energy import CorotationalEnergy, EnergyProjection, native_corotational_energy
 from .dynamics_energy_solvers import solve_energy
 from .dynamics_geometry import boundary_triangles, corner_groups, floor_contacts, geometry_diagnostics, linearized_contacts, phase_swept_geometry_diagnostics, render_geometry, swept_geometry_diagnostics
 from .dynamics_frozen_energy import FrozenQuadraticEnergy, TransportEnergy
 from .dynamics_stabilization import solve_stabilization
-from .dynamics_solver_workspace import translate_consensus
 from .dynamics_model import constant_acceleration_prediction, physics_motion_prediction, support_release_mask
 from .dynamics_mechanics import FrozenElasticBalance, elastic_kernel_arguments, fracture_initiation_diagnostics
 from .dynamics_initial import load_initial
-from .dynamics_learning import load_dynamics_model, state_batch
+from .dynamics_learning import load_dynamics_predictor, state_batch
 from .io import file_hash, new_directory, write_json
 from .partition import component_labels
 
 
 @dataclass(frozen=True)
 class RolloutConfig:
-    fracture_samples: int = 2
-    fracture_policy: str = "fm_search"
+    fracture_samples: int = 1
+    fracture_policy: str = "shared_sample"
     flow_steps: int = 8
     fracture_prior_weight: float = 1.0
-    rho: float = 0.01
     absolute_tolerance: float = 1e-8
     relative_tolerance: float = 1e-7
     geometry_tolerance: float = 1e-6
@@ -53,7 +51,7 @@ class RolloutConfig:
             raise ValueError("shared_sample requires exactly one fracture sample")
         if self.fracture_policy == "fm_search" and self.fracture_samples < 1:
             raise ValueError("fm_search requires at least one fracture sample")
-        values = [self.fracture_prior_weight, self.rho, self.absolute_tolerance, self.geometry_tolerance]
+        values = [self.fracture_prior_weight, self.absolute_tolerance, self.geometry_tolerance]
         if not np.isfinite([*values, self.relative_tolerance]).all() or min(values) <= 0 or self.relative_tolerance < 0:
             raise ValueError("rollout weights and tolerances must be finite and positive")
         for value in (self.max_iterations, self.max_contact_iterations):
@@ -74,11 +72,22 @@ class RolloutConfig:
 
 
 def load_rollout_config(path=None):
-    return RolloutConfig(**json.loads(Path(path).read_text(encoding="utf-8"))) if path else RolloutConfig()
+    if path is None:
+        return RolloutConfig()
+    values = json.loads(Path(path).read_text(encoding="utf-8"))
+    values.pop("rho", None)
+    if "fracture_policy" not in values and values.get("fracture_samples", 1) != 1:
+        values["fracture_policy"] = "marginal_search"
+    return RolloutConfig(**values)
 
 
 def _array(value):
     return value.detach().cpu().numpy().astype(float, copy=True)
+
+
+def _synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _proposal_arrays(proposal, positions, velocities):
@@ -383,6 +392,8 @@ def _mechanical_energy(initial, native_precision=False):
 
 def _correct(initial, positions, velocities, proposal, broken, fixed, model, config, method, cancel=None, *, energy_model=None, progress=None, previous_broken=None, previous_fixed=None,
              initial_velocity_envelope=None, reuse_state=True, record_history=False):
+    if method != "central":
+        raise ValueError("offline correction supports central only")
     if not isinstance(reuse_state, bool) or not isinstance(record_history, bool):
         raise ValueError("corrector reuse and history recording must be Boolean")
     started = perf_counter()
@@ -410,10 +421,9 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
             raise ValueError("shared initial velocity envelope must cover the physical and predicted motion domains")
         velocity_envelope = supplied.copy()
     histories, previous_trials, retries = [], [], []
-    energy_workspace, linear_workspace = ({}, {}) if reuse_state else (None, None)
     counts = dict(contact_builds=0, contact_cache_hits=0, elastic_balance_builds=0, elastic_balance_reuses=0,
                   frozen_energy_builds=0, frozen_energy_reuses=0, pending_problem_reuses=0,
-                  contact_geometry_invalidations=0, solver_workspace_resets=0)
+                  contact_geometry_invalidations=0)
     last_trial, last_contacts, last_contact_key = None, None, None
     last_balance, last_frozen = None, None
     pending_problem = None
@@ -471,17 +481,6 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
             array = np.ascontiguousarray(value) if value is not None else np.array([], dtype=float)
             digest.update(str((array.shape, array.dtype.str)).encode())
             digest.update(array.tobytes())
-        for workspace in (energy_workspace, linear_workspace):
-            if workspace is None:
-                continue
-            for phase in (workspace, workspace.get("linear", {}), workspace.get("nonlinear", {})):
-                for key in ("state", "scaled_dual", "energy_scaled_dual", "rho", "energy_key", "phase"):
-                    value = phase.get(key)
-                    if isinstance(value, np.ndarray):
-                        digest.update(str((key, value.shape, value.dtype.str)).encode())
-                        digest.update(np.ascontiguousarray(value).tobytes())
-                    elif value is not None:
-                        digest.update(repr((key, value)).encode())
         signature = digest.digest()
         repeated = signature in retry_states
         retry_states.add(signature)
@@ -511,11 +510,6 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
         if contact_key != last_contact_key:
             if last_contact_key is not None:
                 counts["contact_geometry_invalidations"] += 1
-                counts["solver_workspace_resets"] += int(any(isinstance(workspace, dict) and workspace
-                                                              for workspace in (energy_workspace, linear_workspace)))
-                for workspace in (energy_workspace, linear_workspace):
-                    if isinstance(workspace, dict):
-                        workspace.clear()
             last_balance, last_frozen, pending_problem = None, None, None
             last_contact_key = contact_key
         if pending_problem is not None:
@@ -536,13 +530,10 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
                           contact_constraints=len(contacts), material_corners=problem.corner_count))
         if config.energy_balance:
             projection = EnergyProjection(problem, energy, budget, config.absolute_tolerance, config.relative_tolerance)
-            result = solve_energy(problem, projection, method, tolerance, config.rho, config.max_iterations, cancel, progress=progress, workspace=energy_workspace)
+            result = solve_energy(problem, projection, method, tolerances=tolerance, max_iterations=config.max_iterations,
+                                  cancel=cancel, progress=progress)
         else:
-            if method == "central":
-                result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel)
-            else:
-                result = solve_consensus(problem, tolerances=tolerance, rho=config.rho, max_iterations=config.max_iterations,
-                                         cancel=cancel, progress=progress, _workspace=linear_workspace)
+            result = solve_central(problem, tolerance, config.max_iterations, cancel=cancel)
         outer += 1
         histories.append(dict(outer_iteration=outer, status=result.status, iterations=result.iterations,
                               objective=result.objective, diagnostics=result.diagnostics, runtime_seconds=result.runtime_seconds,
@@ -592,23 +583,15 @@ def _correct(initial, positions, velocities, proposal, broken, fixed, model, con
                 energy_check = verified_energy.balance(positions, velocities, result.positions, result.velocities,
                                                        model.config["velocity_scale"], budget=verified_budget,
                                                        absolute_tolerance=config.absolute_tolerance, relative_tolerance=config.relative_tolerance)
-                stabilization_delta = updated_offset - stabilization_offset
                 stabilization_offset = updated_offset
                 if not verified["constraints_satisfied"] or (config.energy_balance and not energy_check["energy_satisfied"]):
-                    translation = dict(translated_states=0, status="not_available")
                     if reuse_state:
                         pending_problem = verified_problem
-                        active_workspace = energy_workspace if config.energy_balance else linear_workspace
-                        if method == "consensus" and active_workspace:
-                            continuation = {"linear": energy_workspace.get("linear", {})} if config.energy_balance else {"linear": linear_workspace}
-                            translation = translate_consensus(continuation, problem, verified_problem, stabilization_delta)
-                    stabilization["continuation_translation"] = translation
                     if retry("stabilization_recheck", result, contact_key, stabilization_change_normalized=mismatch,
                              constraint_violation=verified["constraint_violation"], constraint_tolerance=verified["constraint_tolerance"],
                              constraints_satisfied=verified["constraints_satisfied"],
                              energy_violation=energy_check["normalized_violation"], energy_tolerance=energy_check["normalized_tolerance"],
-                             energy_satisfied=energy_check["energy_satisfied"],
-                             continuation_states_translated=translation["translated_states"]):
+                             energy_satisfied=energy_check["energy_satisfied"]):
                         return finish(None, dict(status="outer_fixed_point_cycle_unknown", outer_iterations=outer,
                                                  solves=histories, geometry=geometry, mechanics=mechanics, stabilization=stabilization))
                     continue
@@ -671,7 +654,7 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
                       "Engine-free neural fracture rollout",
                 source="constant-acceleration physical prediction; no learned dynamics or fracture generation" if physics_only
                        else "learned fracture and support release; learned motion discarded; numerical state correction" if motion_ablated
-                       else "trained neural dynamics with optional proximal consensus",
+                       else "direct learned motion and fracture prediction",
                 bodies=[dict(id=0, **first, color="#d3ab75")], frames=frames,
                 metadata={**metadata, **{key: initial.metadata[key] for key in ("floor_height_m", "up_axis") if key in initial.metadata},
                           "simulation_executed": True, "suggested_playback_speed": 0.005 if "floor_height_m" in initial.metadata else 0.001,
@@ -679,261 +662,192 @@ def _replay(initial, positions, broken, fixed, times, metrics, metadata):
 
 
 @torch.no_grad()
-def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="consensus", config=None, device="auto", progress=None,
+def rollout_dynamics(checkpoint_path, initial_path, output_dir, steps, method="raw", config=None, device="auto", progress=None,
                      *, cancel=None):
-    allowed = {"physics", "raw", "neural", "central", "consensus", "no_motion_central", "no_motion_consensus"}
-    if method not in allowed or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-        raise ValueError("select physics/raw/neural/central/consensus/no_motion_central/no_motion_consensus and a positive number of steps")
-    motion_ablated = method in {"no_motion_central", "no_motion_consensus"}
-    solver_method = method.removeprefix("no_motion_") if method in {"central", "consensus"} or motion_ablated else None
-    constrained = solver_method is not None
+    if method not in {"physics", "raw"} or isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("select physics/raw and a positive number of steps; use dynamics-matched for offline correction")
+    setup_started = perf_counter()
     config = config or RolloutConfig()
     initial = load_initial(initial_path)
-    teacher_physics = initial.metadata.get("teacher_physics", {})
-    teacher_parameters = ("rayleigh_mass_damping", "rayleigh_stiffness_damping", "friction_coefficient")
-    teacher_compatibility = ("unknown_settings_not_fully_recorded" if not all(key in teacher_physics for key in teacher_parameters)
-                             else "undamped_frictionless_settings_recorded" if all(teacher_physics[key] == 0 for key in teacher_parameters)
-                             else "recorded_damping_or_friction_requires_a_different_physics_model")
-    model, neural_corrector, checkpoint, device = load_dynamics_model(checkpoint_path, device)
-    if config.kinematic_rule == "auto":
-        config = replace(config, kinematic_rule="backward_euler" if config.mechanics_mode != "disabled"
-                         else model.config.get("motion_prior", "backward_euler"))
-    if constrained:
-        unsupported = {key: teacher_physics[key] for key in teacher_parameters if teacher_physics.get(key, 0) != 0}
-        if unsupported:
-            raise ValueError(f"the constrained rollout requires undamped frictionless teacher data; regenerate with zero damping and friction: {unsupported}")
+    model, checkpoint, device = load_dynamics_predictor(checkpoint_path, device)
     mesh_seen = initial.topology.fingerprint in checkpoint["training_mesh_fingerprints"]
-    heldout_shape = checkpoint.get("generalization_protocol") == "shape_family" and initial.topology.fingerprint in checkpoint.get("evaluation_mesh_fingerprints", [])
+    heldout_shape = (checkpoint.get("generalization_protocol") == "shape_family"
+                    and initial.topology.fingerprint in checkpoint.get("evaluation_mesh_fingerprints", []))
     if not mesh_seen and not heldout_shape:
         raise ValueError("this checkpoint was not trained for the selected material mesh")
-    if method == "neural" and neural_corrector is None:
-        raise ValueError("checkpoint contains no trained neural corrector; use --corrector-epochs during training")
     learned_supports = initial.metadata["support_policy"] == "learned_material_corner_release"
     if learned_supports and not model.config.get("learn_support_release", False):
         raise ValueError("learned support release requires a checkpoint trained with --learn-support-release")
     if device.type == "cpu":
         torch.set_num_threads(min(torch.get_num_threads(), 4))
     directory = new_directory(output_dir)
-    positions, velocities, old = initial.positions.copy(), initial.velocities.copy(), initial.broken.copy()
-    energy_model = _mechanical_energy(initial, config.mechanics_mode != "disabled")
-    fixed = initial.fixed.copy()
-    position_history, velocity_history, cut_history = [positions.copy()], [velocities.copy()], [old.copy()]
-    fixed_history = [fixed.copy()]
-    times = [initial.time]
-    metrics = [dict(broken_faces=int(old.sum()), inverted_tetrahedra=0,
-                    material_components=len(np.unique(component_labels(len(initial.topology.mesh.tets), initial.topology.mesh.dual_edges, old))))]
+    positions, velocities, old, fixed = (initial.positions.copy(), initial.velocities.copy(),
+                                         initial.broken.copy(), initial.fixed.copy())
+    position_history, velocity_history = [positions.copy()], [velocities.copy()]
+    cut_history, fixed_history, times = [old.copy()], [fixed.copy()], [initial.time]
+    metrics = [dict(broken_faces=int(old.sum()))]
     events, status = [], "completed"
+    predictor_calls, flow_calls = 0, 0
+    timing = dict(input_staging=0.0, predictor=0.0, fracture_generation=0.0, state_publication=0.0)
+    setup_seconds = perf_counter() - setup_started
+    _synchronize(device)
     started = perf_counter()
-    predictor_calls, neural_calls, flow_calls, optimization_solves, iterations = 0, 0, 0, 0, 0
+    active_stage = None
     try:
         for step in range(steps):
             if cancel is not None and cancel():
                 raise KeyboardInterrupt
+            active_stage, stage_started = "input_staging", perf_counter()
             batch = state_batch(initial.topology, positions, velocities, old, fixed,
                                 initial.gravity, initial.material, initial.dt, device,
                                 initial.metadata.get("floor_height_m"))
+            staged = [value for value in batch.values() if isinstance(value, torch.Tensor) and value.is_floating_point()]
+            if not torch.stack([torch.isfinite(value).all() for value in staged]).all():
+                raise FloatingPointError("current state exceeds the predictor's numeric range")
+            _synchronize(device)
+            timing["input_staging"] += perf_counter() - stage_started
+            active_stage, stage_started = "predictor", perf_counter()
             if method == "physics":
                 proposal = {**constant_acceleration_prediction(batch),
                             "fracture_probability": batch["broken"].to(batch["positions"].dtype),
                             "support_release_probability": torch.zeros_like(batch["masses"])}
-                candidates = [old.copy()]
+                flow_context = None
             else:
-                if config.fracture_samples and len(batch["broken"]):
+                if config.fracture_samples and not old.all():
                     proposal, flow_context = model.forward_with_flow_context(batch)
                 else:
                     proposal, flow_context = model(batch), None
                 predictor_calls += 1
-                if motion_ablated:
-                    proposal = {**proposal, **physics_motion_prediction(batch, model.config.get("motion_prior", "backward_euler"))}
-                _validate_proposal(proposal, positions, velocities)
+            _validate_proposal(proposal, positions, velocities)
+            _synchronize(device)
+            timing["predictor"] += perf_counter() - stage_started
+            active_stage, stage_started = "fracture_generation", perf_counter()
+            if method == "physics" or old.all():
+                candidates = [old.copy()]
+            else:
                 candidates = fracture_candidates(model, batch, proposal, config, step, context=flow_context)
                 flow_calls += config.fracture_samples
-            corrected = neural_corrector(batch, proposal) if method == "neural" else proposal
-            neural_calls += int(method == "neural")
-            _validate_proposal(corrected, positions, velocities)
-            probability = _array(corrected["fracture_probability"])
-            candidate_records, accepted = [], []
+            _synchronize(device)
+            timing["fracture_generation"] += perf_counter() - stage_started
+            active_stage, stage_started = "state_publication", perf_counter()
+            if not candidates:
+                raise ValueError("fracture generation returned no candidates")
+            probability = _array(proposal["fracture_probability"])
+            candidate_records = []
             for index, mask in enumerate(candidates):
-                if cancel is not None and cancel():
-                    raise KeyboardInterrupt
-                prior = 0.0 if config.fracture_policy == "shared_sample" else config.fracture_prior_weight * _fracture_cost(mask, probability, old)
-                candidate_hash = hashlib.sha256(mask.tobytes()).hexdigest()
-                if accepted and prior > min(item[0] for item in accepted) + config.absolute_tolerance:
-                    candidate_records.append(dict(candidate=index, candidate_hash=candidate_hash, prior=prior,
-                                                  status="pruned_by_nonnegative_correction_cost_lower_bound"))
-                    continue
-                next_fixed = release_supports(initial.topology.mesh, mask, fixed,
-                                              _array(corrected["support_release_probability"])) if learned_supports else fixed.copy()
-                candidate_proposal = _candidate_proposal(corrected, positions, velocities,
-                                                          fixed if config.mechanics_mode != "disabled" else next_fixed) if learned_supports else corrected
-                if constrained:
-                    solver_progress = (lambda event: progress({**event, "comparison_method": method,
-                                                              "motion_source": "physical_prior" if motion_ablated else "learned"})) if progress is not None else None
-                    result, diagnostic = _correct(initial, positions, velocities, candidate_proposal, mask, next_fixed, model, config, solver_method, cancel,
-                                                  energy_model=energy_model, progress=solver_progress, previous_broken=old, previous_fixed=fixed)
-                    optimization_solves += len(diagnostic.get("solves", []))
-                    iterations += sum(item["iterations"] for item in diagnostic.get("solves", []))
-                    if result is None:
-                        if diagnostic["status"] == "interrupted":
-                            raise KeyboardInterrupt
-                        candidate_records.append(dict(candidate=index, candidate_hash=candidate_hash,
-                                                      prior=prior, valid=False, correction=diagnostic))
-                        continue
-                    next_positions, next_velocities = result.positions.reshape(-1, 3), result.velocities.reshape(-1, 3)
-                    objective = prior + result.objective
-                else:
-                    next_positions, next_velocities = _proposal_arrays(candidate_proposal, positions, velocities)
-                    next_positions[next_fixed] = positions[next_fixed]
-                    next_velocities[next_fixed] = 0
-                    geometry = geometry_diagnostics(initial.topology.mesh, next_positions, mask, config.geometry_tolerance,
-                                                    initial.metadata.get("floor_height_m"))
-                    swept = swept_geometry_diagnostics(initial.topology.mesh, positions, next_positions, mask,
-                                                       config.geometry_tolerance, initial.metadata.get("floor_height_m"))
-                    diagnostic = dict(status="unconstrained_prediction", geometry=geometry, swept_geometry=swept)
-                    diagnostic["mechanics"] = state_mechanics_diagnostics(initial, positions, velocities, next_positions,
-                                                                         next_velocities, old, mask, fixed, next_fixed,
-                                                                         model, config)
-                    objective = prior
-                invalid_orientation = (config.mechanics_mode != "disabled"
-                                       and diagnostic["geometry"].get("inverted_tetrahedra", 0) > 0)
-                if invalid_orientation:
-                    diagnostic["mechanics_domain"] = dict(
-                        status="fail", reason="elastic mechanics requires positive tetrahedron orientation",
-                        inverted_or_degenerate_tetrahedra=diagnostic["geometry"]["inverted_tetrahedra"])
-                    balance = dict(status="unknown", energy_satisfied=None,
-                                   reason="candidate is outside the positive-orientation mechanics domain")
-                else:
-                    balance = step_energy_diagnostics(initial, positions, velocities, next_positions, next_velocities,
-                                                       old, fixed, model, config, nonlinear=energy_model)
-                diagnostic["energy"] = balance
-                record = dict(candidate=index, prior=prior, objective=objective, broken_faces=int(mask.sum()),
-                              candidate_hash=candidate_hash,
-                              valid=diagnostic["geometry"]["valid"], correction=diagnostic)
-                candidate_records.append(record)
-                accepted.append((objective, index, mask, next_positions, next_velocities, next_fixed, record))
-            if not accepted:
-                status = "timestep_rejected"
-                events.append(dict(step=step + 1, time=times[-1], status=status, candidates=candidate_records))
-                break
-            _, chosen, next_broken, next_positions, next_velocities, next_fixed, record = min(accepted, key=lambda item: (item[0], item[1]))
-            domain = record["correction"].get("mechanics_domain")
-            if domain is not None and domain["status"] == "fail":
-                status = "timestep_rejected"
-                events.append(dict(step=step + 1, time=times[-1], status=status, selected_candidate=chosen,
-                                   reason=domain["reason"], failure_kind="invalid_mechanics_state",
-                                   candidates=candidate_records))
-                break
+                if mask.shape != old.shape or mask.dtype != np.dtype(bool) or np.any(old & ~mask):
+                    raise ValueError("fracture generation must produce irreversible Boolean facet states")
+                prior = (0.0 if config.fracture_policy == "shared_sample" else
+                         config.fracture_prior_weight * _fracture_cost(mask, probability, old))
+                candidate_records.append(dict(candidate=index, prior=prior, objective=prior, broken_faces=int(mask.sum()),
+                                              candidate_hash=hashlib.sha256(mask.tobytes()).hexdigest(), valid=None,
+                                              correction=dict(status="not_applied", geometry=dict(status="not_evaluated", valid=None),
+                                                              swept_geometry=dict(status="not_evaluated", valid=None),
+                                                              mechanics=dict(status="not_evaluated"),
+                                                              energy=dict(status="not_evaluated", energy_satisfied=None))))
+            chosen = min(range(len(candidate_records)), key=lambda index: (candidate_records[index]["prior"], index))
+            next_broken = candidates[chosen].copy()
+            next_fixed = (release_supports(initial.topology.mesh, next_broken, fixed,
+                                            _array(proposal["support_release_probability"]))
+                          if learned_supports and method != "physics" else fixed.copy())
+            published = _candidate_proposal(proposal, positions, velocities, next_fixed) if learned_supports else proposal
+            next_positions, next_velocities = _proposal_arrays(published, positions, velocities)
+            if next_positions.shape != positions.shape or next_velocities.shape != velocities.shape:
+                raise ValueError("predicted motion must have one position and velocity per material corner")
+            next_positions[next_fixed] = positions[next_fixed]
+            next_velocities[next_fixed] = 0
             if not np.isfinite(next_positions).all() or not np.isfinite(next_velocities).all():
-                status = "nonfinite_prediction"
-                events.append(dict(step=step + 1, time=times[-1], status=status,
-                                   reason="selected motion contains nonfinite values", candidates=candidate_records))
-                break
-            next_initial = initial
-            if config.mechanics_mode != "disabled":
-                start_elastic_state = current_elastic_state(initial, positions, old, fixed)
-                next_initial = advance_elastic_state(initial, next_positions, next_velocities, old, next_broken,
-                                                     fixed, next_fixed, start_elastic_state)
-            initial, old, positions, velocities, fixed = next_initial, next_broken, next_positions, next_velocities, next_fixed
+                raise FloatingPointError("selected motion contains nonfinite values")
+            if cancel is not None and cancel():
+                raise KeyboardInterrupt
+            old, positions, velocities, fixed = next_broken, next_positions, next_velocities, next_fixed
             times.append(initial.time + (step + 1) * initial.dt)
             position_history.append(positions.copy())
             velocity_history.append(velocities.copy())
             cut_history.append(old.copy())
             fixed_history.append(fixed.copy())
-            metrics.append(dict(broken_faces=int(old.sum()), objective=record["objective"],
-                                material_components=len(np.unique(component_labels(len(initial.topology.mesh.tets), initial.topology.mesh.dual_edges, old))),
-                                inverted_tetrahedra=record["correction"]["geometry"].get("inverted_tetrahedra", 0),
-                                overlap_pairs=record["correction"]["geometry"].get("overlapping_tetrahedron_pairs", 0),
-                                mechanical_energy_j=record["correction"]["energy"]["components"]["total"],
-                                energy_violation=record["correction"]["energy"]["normalized_violation"]))
+            metrics.append(dict(broken_faces=int(old.sum()), objective=candidate_records[chosen]["objective"]))
             event = dict(step=step + 1, time=times[-1], selected_candidate=chosen, status="committed",
-                         geometry_valid=record["valid"], candidate_pool=[item["candidate_hash"] for item in candidate_records if "candidate_hash" in item],
-                         energy_valid=record["correction"]["energy"]["energy_satisfied"],
-                         swept_geometry_valid=record["correction"]["swept_geometry"]["valid"],
-                         mechanics=record["correction"].get("mechanics", {}),
-                         candidates=candidate_records)
+                         geometry_valid=None, energy_valid=None, swept_geometry_valid=None,
+                         mechanics=dict(status="not_evaluated"),
+                         candidate_pool=[record["candidate_hash"] for record in candidate_records], candidates=candidate_records)
             events.append(event)
             with (directory / "progress.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, allow_nan=False) + "\n")
+            _synchronize(device)
+            timing["state_publication"] += perf_counter() - stage_started
+            active_stage = None
             if progress:
                 progress(dict(method=method, step=step + 1, time=times[-1], broken_faces=int(old.sum()),
-                              geometry_valid=record["valid"], corrector_iterations=iterations))
+                              geometry_valid=None, corrector_iterations=0,
+                              elapsed_seconds=perf_counter() - started, stage_seconds=dict(timing)))
     except KeyboardInterrupt:
         status = "interrupted"
     except FloatingPointError as error:
         status = "nonfinite_prediction"
         events.append(dict(step=step + 1, time=times[-1], status=status, reason=str(error)))
+    _synchronize(device)
+    if active_stage is not None:
+        timing[active_stage] += perf_counter() - stage_started
+    inference_seconds = perf_counter() - started
     if events and events[-1]["status"] != "committed":
         with (directory / "progress.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(events[-1], allow_nan=False) + "\n")
         if progress:
             progress(dict(event="rollout_step_failed", method=method, step=events[-1]["step"],
                           time=times[-1], status=status, reason=events[-1].get("reason")))
-    condition_splits = checkpoint["condition_splits"]
-    split = next((name for name, conditions in condition_splits.items() if initial.condition_digest in conditions), "unseen_condition")
-    committed = [event for event in events if event.get("status") == "committed"]
+    split = next((name for name, conditions in checkpoint["condition_splits"].items()
+                  if initial.condition_digest in conditions), "unseen_condition")
+    completed_steps = len(times) - 1
     report = dict(format="fracture-world.neural-rollout.v1", status=status, method=method,
-                  solver_method=solver_method, motion_source="physical_prior" if motion_ablated else "constant_acceleration" if method == "physics" else "learned",
-                  motion_ablation=motion_ablated, fully_neural_free_baseline=method == "physics",
+                  solver_method=None, motion_source="constant_acceleration" if method == "physics" else "learned",
+                  motion_ablation=False, fully_neural_free_baseline=method == "physics",
                   autonomous=True, state_feedback="previous committed prediction; no teacher state reset",
-                  predictor_forward_includes_discarded_motion_head=motion_ablated,
-                  requested_steps=steps, completed_steps=len(times) - 1, engine_calls=0,
+                  predictor_forward_includes_discarded_motion_head=False,
+                  requested_steps=steps, completed_steps=completed_steps, engine_calls=0,
                   checkpoint_sha256=file_hash(checkpoint_path), initial_sha256=file_hash(initial_path),
                   case_id=initial.case_id, condition_digest=initial.condition_digest, condition_split=split,
-                  mesh_fingerprint=initial.topology.fingerprint,
-                  mesh_seen_during_training=mesh_seen, held_out_shape_family=bool(heldout_shape and not mesh_seen),
+                  mesh_fingerprint=initial.topology.fingerprint, mesh_seen_during_training=mesh_seen,
+                  held_out_shape_family=bool(heldout_shape and not mesh_seen),
                   shape_family=checkpoint.get("mesh_shape_families", {}).get(initial.topology.fingerprint, initial.topology.fingerprint),
                   generalization_protocol=checkpoint.get("generalization_protocol", "loading_condition"),
                   floor_height_m=initial.metadata.get("floor_height_m"),
                   overfit_debug=checkpoint["training"]["overfit"], configuration=asdict(config),
-                  predictor_calls=predictor_calls, neural_corrector_calls=neural_calls,
-                  learned_motion_corrector_calls=0 if motion_ablated else predictor_calls,
+                  predictor_calls=predictor_calls, neural_corrector_calls=0, learned_motion_corrector_calls=0,
                   physical_predictor="constant_acceleration" if method == "physics" else model.config.get("motion_prior", "backward_euler"),
-                  learned_motion_role="discarded; physical motion prior only" if motion_ablated else
-                                      "none" if method == "physics" else "state-dependent correction of the physical motion prior",
-                  predictor_parameters=sum(parameter.numel() for parameter in model.parameters()),
-                  neural_corrector_parameters=sum(parameter.numel() for parameter in neural_corrector.parameters()) if method == "neural" else 0,
-                  fracture_flow_calls=flow_calls, optimization_solves=optimization_solves,
+                  learned_motion_role="none" if method == "physics" else "residual state prediction within the predictor",
+                  predictor_parameters=sum(parameter.numel() for parameter in model.parameters()), neural_corrector_parameters=0,
+                  fracture_flow_calls=flow_calls, optimization_solves=0, corrector_iterations=0,
                   flow_architecture=model.config.get("flow_architecture", "independent"),
                   probability_policy=checkpoint.get("probability_policy", "legacy_weighted_logits"),
-                  corrector_iterations=iterations, runtime_seconds=perf_counter() - started,
+                  runtime_seconds=inference_seconds,
+                  timing=dict(setup_seconds=setup_seconds, inference_seconds=inference_seconds, stages_seconds=timing,
+                              seconds_per_completed_step=inference_seconds / completed_steps if completed_steps else None,
+                              scope="synchronized model execution, fracture generation, state publication and progress logging"),
+                  inference_policy="predictor_and_fracture_generation", runtime_diagnostics="offline_evaluation_required",
                   support_policy=initial.metadata["support_policy"],
                   support_release_training_events=checkpoint.get("support_release_training_events", 0),
                   fracture_training_events=checkpoint.get("fracture_training_events", 0),
                   fracture_model_has_positive_training_examples=checkpoint.get("fracture_training_events", 0) > 0,
                   learned_support_release_has_positive_training_examples=checkpoint.get("support_release_training_events", 0) > 0,
                   teacher_future_used=False, runtime_native_required=False,
-                  teacher_physics_compatibility=teacher_compatibility,
-                  all_committed_geometry_valid=all(event.get("geometry_valid", False) for event in committed) if committed else None,
-                  all_committed_energy_valid=all(event.get("energy_valid", False) for event in committed) if committed else None,
-                  all_committed_swept_geometry_valid=all(event.get("swept_geometry_valid", False) for event in committed) if committed else None,
-                  checked_constraint_steps=len(committed),
-                  mechanics_mode=config.mechanics_mode,
-                  mechanics_weight=config.mechanics_weight,
-                  fracture_initiation_enforced=config.fracture_initiation and constrained,
-                  all_committed_elastic_equalities_valid=all(event.get("mechanics", {}).get("elastic_dynamics", {}).get("status") == "pass"
-                                                           for event in committed) if committed and config.mechanics_mode != "disabled" else None,
-                  elastic_equality_check_scope="residual against the pinned numerical equation; proximal mode minimizes rather than enforces zero residual",
-                  mechanics_scope="frozen-rotation implicit teacher model; contact/support reactions remain partially unknown",
-                  mechanical_energy_law="corotational elastic + kinetic + gravitational; static boundaries, no supplied fracture-energy credit",
-                  energy_balance_enforced=bool(config.energy_balance and constrained),
+                  all_committed_geometry_valid=None, all_committed_energy_valid=None, all_committed_swept_geometry_valid=None,
+                  checked_constraint_steps=0, mechanics_mode="disabled", fracture_initiation_enforced=False,
+                  all_committed_elastic_equalities_valid=None, energy_balance_enforced=False,
                   energy_velocity_scale=float(model.config["velocity_scale"]),
-                  contact_law=("frictionless normal nonpenetration correction; restitution and contact impulse law not independently enforced"
-                               if constrained else "not enforced; endpoint and swept geometry are diagnostics only"),
-                  constitutive_response=("none; constant acceleration with prescribed current supports" if method == "physics"
-                                         else "physical motion prior plus frozen-rotation elastic residual correction" if motion_ablated and config.mechanics_mode != "disabled"
-                                         else "physical motion prior; no explicit elastic constitutive solve" if motion_ablated
-                                         else "learned predictor plus frozen-rotation elastic residual correction" if constrained and config.mechanics_mode != "disabled"
-                                         else "learned predictor; no explicit elastic constitutive solve"),
-                  fracture_choice=("initial fracture topology held fixed; no new fracture generation" if method == "physics"
-                                   else "one shared flow sample; fixed fracture mask during each state correction" if config.fracture_policy == "shared_sample"
-                                   else "FM samples only; independent-marginal surrogate plus feasible motion/energy correction cost; not joint flow likelihood" if config.fracture_policy == "fm_search"
-                                   else "legacy candidate search with independent-marginal surrogate plus motion correction cost; not joint flow likelihood"),
+                  contact_law="learned response; geometric validity evaluated offline",
+                  constitutive_response="constant acceleration" if method == "physics" else "learned material dynamics",
+                  fracture_choice="initial topology" if method == "physics" else config.fracture_policy,
                   events=events)
+    render_started = perf_counter()
+    replay = _replay(initial, position_history, cut_history, fixed_history, times, metrics,
+                     dict(method=method, motion_source=report["motion_source"]))
+    report["timing"]["render_seconds"] = perf_counter() - render_started
+    metadata = {key: value for key, value in report.items() if key != "events"}
+    replay["metadata"].update(metadata)
     np.savez_compressed(directory / "trajectory.npz", times=np.asarray(times), positions=np.asarray(position_history),
-                        velocities=np.asarray(velocity_history), broken=np.asarray(cut_history),
-                        fixed=np.asarray(fixed_history),
-                        metadata_json=json.dumps({key: value for key, value in report.items() if key != "events"}, allow_nan=False))
+                        velocities=np.asarray(velocity_history), broken=np.asarray(cut_history), fixed=np.asarray(fixed_history),
+                        metadata_json=json.dumps(metadata, allow_nan=False))
     write_json(directory / "report.json", report)
-    write_json(directory / "replay.json", _replay(initial, position_history, cut_history, fixed_history, times, metrics,
-                                                  {key: value for key, value in report.items() if key != "events"}))
+    write_json(directory / "replay.json", replay)
     return report

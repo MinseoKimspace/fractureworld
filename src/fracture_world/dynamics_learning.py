@@ -743,20 +743,15 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
     return directory / "best.pt"
 
 
-def load_dynamics_model(path, device="auto"):
+def load_dynamics_predictor(path, device="auto"):
     device = choose_device(device)
-    checkpoint = torch.load(Path(path), map_location=device, weights_only=True)
+    checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
     if checkpoint.get("format") != FORMAT:
         raise ValueError("checkpoint is not a temporal fracture dynamics model")
     model_config = {"flow_architecture": "independent", **checkpoint["model_config"]}
     model = TemporalDynamicsModel(**model_config).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
-    corrector = None
-    if "corrector" in checkpoint:
-        corrector = NeuralDynamicsCorrector(**model_config).to(device)
-        corrector.load_state_dict(checkpoint["corrector"], strict=True)
-        corrector.eval()
     policy = checkpoint.get("probability_policy", "legacy_weighted_logits")
     if policy not in {"legacy_weighted_logits", "subtract_log_training_positive_weight"}:
         raise ValueError("unsupported checkpoint probability policy")
@@ -767,8 +762,18 @@ def load_dynamics_model(path, device="auto"):
         if any(not isinstance(value, (int, float)) or not np.isfinite(value) or value < 1
                for value in (fracture_weight, support_weight)):
             raise ValueError("checkpoint probability correction requires finite training positive weights >= 1")
-        for network in (model, corrector):
-            if network is not None:
-                network.fracture_logit_offset = float(np.log(fracture_weight))
-                network.support_logit_offset = float(np.log(support_weight))
+        model.fracture_logit_offset = float(np.log(fracture_weight))
+        model.support_logit_offset = float(np.log(support_weight))
+    return model, checkpoint, device
+
+
+def load_dynamics_model(path, device="auto"):
+    model, checkpoint, device = load_dynamics_predictor(path, device)
+    corrector = None
+    if "corrector" in checkpoint:
+        corrector = NeuralDynamicsCorrector(**model.config).to(device)
+        corrector.load_state_dict(checkpoint["corrector"], strict=True)
+        corrector.fracture_logit_offset = model.fracture_logit_offset
+        corrector.support_logit_offset = model.support_logit_offset
+        corrector.eval()
     return model, corrector, checkpoint, device

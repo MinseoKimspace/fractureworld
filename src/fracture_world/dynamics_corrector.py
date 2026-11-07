@@ -1,15 +1,13 @@
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Callable
 
 import numpy as np
 from scipy import sparse
-from scipy.linalg import null_space, pinvh
+from scipy.linalg import null_space
 from scipy.optimize import linprog
 
 from .mesh import VolumeMesh
 from .partition import component_labels
-from .dynamics_solver_workspace import consensus_setup, inverse_gram, save_consensus
 
 
 def _finite_array(value, shape, name):
@@ -74,38 +72,16 @@ class _Factor:
     bound: np.ndarray
     inequality: bool = False
     penalty: float | None = None
-    inverse_gram: np.ndarray = field(init=False, repr=False)
-    _soft_inverse: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.penalty is not None and (not np.isfinite(self.penalty) or self.penalty <= 0 or self.inequality):
             raise ValueError("soft residual factors require a positive finite penalty and equality residuals")
-        if len(self.bound) == 1:
-            squared_norm = float(self.matrix.data @ self.matrix.data)
-            self.inverse_gram = np.array([[1.0 / squared_norm if squared_norm else 0.0]])
-        else:
-            self.inverse_gram = pinvh((self.matrix @ self.matrix.T).toarray())
-
-    def projection_inverse(self, rho):
-        if self.penalty is None:
-            return self.inverse_gram
-        if self._soft_inverse is None or self._soft_inverse[0] != rho:
-            gram = (self.matrix @ self.matrix.T).toarray()
-            inverse = np.linalg.solve(gram + (rho / self.penalty) * np.eye(len(self.bound)), np.eye(len(self.bound)))
-            self._soft_inverse = (rho, inverse)
-        return self._soft_inverse[1]
 
     def cost(self, value):
         if self.penalty is None:
             return 0.0
         residual = np.asarray(self.matrix @ value).ravel() - self.bound
         return float(0.5 * self.penalty * (residual @ residual))
-
-    def project(self, value, rho=1.0):
-        residual = self.bound - self.matrix @ value
-        if self.inequality:
-            residual = np.maximum(residual, 0)
-        return value + np.asarray(self.matrix.T @ (self.projection_inverse(rho) @ residual)).ravel()
 
     def violation(self, value):
         residual = np.asarray(self.matrix @ value).ravel() - self.bound
@@ -583,18 +559,6 @@ def _shared_problem(problem):
 
 
 @dataclass(frozen=True)
-class CorrectorIteration:
-    iteration: int
-    objective: float
-    primal_residual: float
-    dual_residual: float
-    primal_tolerance: float
-    dual_tolerance: float
-    constraint_violation: float
-    rho: float
-
-
-@dataclass(frozen=True)
 class CorrectorResult:
     method: str
     positions: np.ndarray
@@ -604,7 +568,7 @@ class CorrectorResult:
     status: str
     iterations: int
     diagnostics: dict
-    history: list[CorrectorIteration]
+    history: list
     runtime_seconds: float
 
 
@@ -752,10 +716,6 @@ def _prior_is_minimum(problem):
     return all(factor.cost(problem.prior[factor.indices]) == 0.0 for factor in problem.factors)
 
 
-def _factor_inverse_gram(problem, rho):
-    return sparse.block_diag([factor.projection_inverse(rho) for factor in problem.factors], format="csr")
-
-
 def _feasibility(problem, tolerances):
     start = perf_counter()
     report = {"method": "scipy.optimize.linprog / HiGHS", "scope": "supplied linear equality and inequality factors", "status": "unknown", "iterations": 0, "engine_calls": 0}
@@ -838,103 +798,3 @@ def solve_central(problem, tolerances=None, max_iterations=None, cancel=None):
     status = "interrupted" if cancel is not None and cancel() else "converged" if converged else str(solution.status)
     converged = converged and status != "interrupted"
     return _result(problem, "central", state, tolerances, converged, status, iterations, [], start, feasibility)
-
-
-def solve_consensus(problem, rho=None, tolerances=None, max_iterations=None, cancel: Callable[[], bool] | None = None, adaptive_rho=True,
-                    *, progress=None, _workspace=None):
-    start = perf_counter()
-    problem = _shared_problem(problem)
-    tolerances = tolerances or CorrectorTolerances()
-    _limit(max_iterations)
-    rho = float(np.median(problem.prior_weights)) if rho is None else float(rho)
-    if not np.isfinite(rho) or rho <= 0:
-        raise ValueError("rho must be finite and positive")
-    state, rho, dual, operators, reuse = consensus_setup(problem, _workspace, rho)
-    save_consensus(problem, _workspace, state, dual, rho, operators)
-    if cancel is not None and cancel():
-        return _result(problem, "consensus", problem.prior, tolerances, False, "interrupted", 0, [], start)
-    if max_iterations == 0:
-        return _result(problem, "consensus", problem.prior, tolerances, False, "maximum_iterations", 0, [], start)
-    continued = _diagnostics(problem, state, tolerances) if reuse["state_reused"] else None
-    feasibility = (dict(method="validated continuation state", status="feasible", iterations=0, runtime_seconds=0.,
-                        engine_calls=0, maximum_violation=continued["constraint_violation"])
-                   if continued is not None and continued["constraints_satisfied"] else _feasibility(problem, tolerances))
-    if feasibility["status"] != "feasible":
-        status = "PrimalInfeasible" if feasibility["status"] == "infeasible" else "feasibility_unknown"
-        return _result(problem, "consensus", problem.prior, tolerances, False, status, 0, [], start, feasibility)
-    if feasibility["method"] == "direct feasible prior certificate" and _prior_is_minimum(problem):
-        save_consensus(problem, _workspace, problem.prior, np.zeros_like(dual), rho, operators)
-        return _result(problem, "consensus", problem.prior, tolerances, True, "converged", 0, [], start, feasibility)
-    indices = operators["indices"]
-    matrix, transpose = operators["matrix"], operators["transpose"]
-    gram = inverse_gram(problem, operators, rho, _factor_inverse_gram)
-    bound = np.concatenate([factor.bound for factor in problem.factors])
-    inequality, soft_rows = operators["inequality"], operators["soft_rows"]
-    local = state[indices].copy()
-    counts = np.bincount(indices, minlength=len(state))
-    local_dimension = len(indices)
-    history = []
-    iteration = 0
-    converged = False
-    status = "maximum_iterations"
-    previous = []
-    try:
-        while max_iterations is None or iteration < max_iterations:
-            if cancel is not None and cancel():
-                status = "interrupted"
-                break
-            old = state.copy()
-            local = state[indices] - dual
-            projection_residual = bound - matrix @ local
-            projection_residual[inequality] = np.maximum(projection_residual[inequality], 0)
-            local += transpose @ (gram @ projection_residual)
-            totals = np.bincount(indices, weights=local + dual, minlength=len(state))
-            state = (problem.prior_weights * problem.prior + rho * totals) / (problem.prior_weights + rho * counts)
-            if not np.isfinite(state).all():
-                state = old
-                status = "nonfinite_iterate"
-                break
-            selected = state[indices]
-            residual = local - selected
-            dual += residual
-            primal_squared = float(residual @ residual)
-            local_squared = float(local @ local)
-            selected_squared = float(selected @ selected)
-            dual_squared = float(dual @ dual)
-            iteration += 1
-            primal = float(np.sqrt(primal_squared))
-            dual_residual = float(rho * np.sqrt(np.dot(counts, (state - old)**2)))
-            primal_tolerance = float(np.sqrt(local_dimension) * tolerances.absolute + tolerances.relative * max(np.sqrt(local_squared), np.sqrt(selected_squared)))
-            dual_tolerance = float(np.sqrt(local_dimension) * tolerances.absolute + tolerances.relative * rho * np.sqrt(dual_squared))
-            constraint_residual = matrix @ selected - bound
-            constraint_residual[inequality] = np.minimum(constraint_residual[inequality], 0)
-            constraint_residual[soft_rows] = 0
-            violation = float(np.max(np.abs(constraint_residual), initial=0))
-            constraint_tolerance = tolerances.absolute + tolerances.relative * max(float(np.max(np.abs(state), initial=0)), 1.0)
-            history.append(CorrectorIteration(iteration, problem.objective(state), primal, dual_residual, primal_tolerance, dual_tolerance, violation, rho))
-            if progress and (iteration == 1 or iteration % 25 == 0):
-                progress(dict(event="corrector_iteration", method="consensus", stage="linear_constraints", iteration=iteration,
-                              objective=history[-1].objective, primal=primal, dual=dual_residual,
-                              primal_tolerance=primal_tolerance, dual_tolerance=dual_tolerance,
-                              constraint_violation=violation, constraint_tolerance=constraint_tolerance,
-                              rho=rho, runtime_seconds=perf_counter() - start))
-            if primal <= primal_tolerance and dual_residual <= dual_tolerance and violation <= constraint_tolerance:
-                converged, status = True, "converged"
-                break
-            if adaptive_rho and iteration % 25 == 0:
-                multiplier = 2.0 if primal > 10 * dual_residual else 0.5 if dual_residual > 10 * primal else 1.0
-                rho *= multiplier
-                dual /= multiplier
-                if multiplier != 1.0:
-                    gram = inverse_gram(problem, operators, rho, _factor_inverse_gram)
-            snapshot = (state.copy(), dual.copy(), rho)
-            if any(snapshot[2] == prior[2] and np.array_equal(snapshot[0], prior[0]) and np.array_equal(snapshot[1], prior[1]) for prior in previous):
-                status = "numerical_cycle"
-                break
-            previous = (previous + [snapshot])[-2:]
-    except KeyboardInterrupt:
-        status = "interrupted"
-    save_consensus(problem, _workspace, state, dual, rho, operators)
-    result = _result(problem, "consensus", state, tolerances, converged, status, iteration, history, start, feasibility)
-    result.diagnostics["continuation"] = reuse
-    return result

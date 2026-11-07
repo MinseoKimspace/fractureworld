@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fracture-world"
 version = "0.1.0"
-description = "Coupled fracture flow matching, engine-free dynamics, proximal correction, and numerical evaluation"
+description = "Coupled fracture flow matching, direct model dynamics, and offline numerical evaluation"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "numpy>=2.0,<3",
@@ -27,7 +27,6 @@ fracture-world = "fracture_world.cli:main"
 [project.urls]
 FEMFX = "https://github.com/GPUOpen-Effects/FEMFX"
 FlowMatching = "https://arxiv.org/abs/2210.02747"
-ADMM = "https://web.stanford.edu/~boyd/papers/admm_distr_stats.html"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fracture_world"]

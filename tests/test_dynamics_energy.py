@@ -3,7 +3,7 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy.spatial.transform import Rotation
 
-from fracture_world.dynamics_corrector import DynamicsProblem, LinearizedContact, _shared_problem, solve_consensus
+from fracture_world.dynamics_corrector import DynamicsProblem, LinearizedContact, _shared_problem
 from fracture_world.dynamics_energy import CorotationalEnergy, EnergyProjection
 from fracture_world.dynamics_energy_solvers import solve_energy
 from fracture_world.mesh import VolumeMesh
@@ -140,8 +140,7 @@ def test_invalid_material_energy_is_rejected(change):
         CorotationalEnergy(**values)
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_energy_constrained_solver_blocks_force_free_expansion(method):
+def test_energy_constrained_solver_blocks_force_free_expansion():
     mesh, energy, positions, velocities = energy_fixture()
     center = positions.mean(axis=1, keepdims=True)
     predicted_velocity = 0.2 * (positions - center)
@@ -149,7 +148,7 @@ def test_energy_constrained_solver_blocks_force_free_expansion(method):
     problem = DynamicsProblem(mesh, positions, velocities, positions + dt * predicted_velocity, predicted_velocity, dt,
                               density=energy.density, position_scale=1.0, velocity_scale=1.0)
     constraint = EnergyProjection(problem, energy, energy.value(positions, velocities))
-    result = solve_energy(problem, constraint, method)
+    result = solve_energy(problem, constraint, "central")
     assert result.converged, (result.status, result.diagnostics)
     assert result.diagnostics["constraints_satisfied"]
     assert result.diagnostics["energy"]["energy_satisfied"]
@@ -157,8 +156,7 @@ def test_energy_constrained_solver_blocks_force_free_expansion(method):
     assert result.diagnostics["energy"]["global_optimality_verified"] is False
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_energy_constrained_ballistic_state_is_not_distorted(method):
+def test_energy_constrained_ballistic_state_is_not_distorted():
     mesh, energy, positions, velocities = energy_fixture((0.0, -9.81, 0.0))
     velocities[:] = [0.5, 0.3, -0.2]
     dt = 0.02
@@ -168,15 +166,14 @@ def test_energy_constrained_ballistic_state_is_not_distorted(method):
                               external_impulse=dt * energy.masses[..., None] * energy.gravity,
                               position_scale=1.0, velocity_scale=1.0, kinematic_rule="constant_acceleration")
     constraint = EnergyProjection(problem, energy, energy.value(positions, velocities))
-    result = solve_energy(problem, constraint, method)
+    result = solve_energy(problem, constraint, "central")
     assert result.converged, result.status
     assert_allclose(result.positions, next_position, atol=1e-8)
     assert_allclose(result.velocities, next_velocity, atol=1e-8)
     assert result.diagnostics["energy"]["energy_satisfied"]
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_elastic_release_can_convert_strain_energy_into_motion(method):
+def test_elastic_release_can_convert_strain_energy_into_motion():
     mesh, energy, positions, velocities = energy_fixture()
     rest = positions.copy()
     positions = rest.mean(axis=1, keepdims=True) + 1.1 * (rest - rest.mean(axis=1, keepdims=True))
@@ -187,14 +184,14 @@ def test_elastic_release_can_convert_strain_energy_into_motion(method):
     problem = DynamicsProblem(mesh, positions, velocities, next_position, next_velocity, dt, density=energy.density,
                               position_scale=1.0, velocity_scale=1.0)
     constraint = EnergyProjection(problem, energy, energy.value(positions, velocities))
-    result = solve_energy(problem, constraint, method)
+    result = solve_energy(problem, constraint, "central")
     assert result.converged, result.status
     assert result.diagnostics["energy"]["energy_satisfied"]
     assert result.diagnostics["energy"]["components"]["kinetic"] > 0
     assert result.diagnostics["energy"]["components"]["elastic"] < energy.components(positions, velocities)["elastic"]
 
 
-def test_energy_local_optimizer_failure_is_not_counted_as_consensus_success(monkeypatch):
+def test_energy_local_optimizer_failure_is_reported_unknown(monkeypatch):
     mesh, energy, positions, velocities = energy_fixture()
     velocity = positions - positions.mean(axis=1, keepdims=True)
     problem = DynamicsProblem(mesh, positions, velocities, positions + 0.05 * velocity, velocity, 0.05,
@@ -205,7 +202,7 @@ def test_energy_local_optimizer_failure_is_not_counted_as_consensus_success(monk
         raise RuntimeError("forced local failure")
 
     monkeypatch.setattr("fracture_world.dynamics_energy.minimize", failure)
-    result = solve_energy(problem, constraint, "consensus")
+    result = constraint.project(problem.prior)
     assert not result.converged
     assert result.status == "energy_projection_unknown"
 
@@ -239,16 +236,15 @@ def test_identity_and_projection_use_the_same_relaxed_energy_set():
     assert result.diagnostics["root_normal_distance"] <= result.diagnostics["root_normal_distance_tolerance"]
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_nonlinear_energy_conflict_terminates_as_unknown_without_iteration_cap(method):
+def test_nonlinear_energy_conflict_terminates_as_unknown_without_iteration_cap():
     mesh, energy, positions, velocities = energy_fixture()
     contact = LinearizedContact.pair(0, -1, [0, 1, 0], -0.01)
     problem = DynamicsProblem(mesh, positions, velocities, positions.copy(), velocities.copy(), 0.05,
                               density=energy.density, contacts=(contact,), position_scale=1.0, velocity_scale=1.0)
     constraint = EnergyProjection(problem, energy, 0.0)
-    result = solve_energy(problem, constraint, method, max_iterations=None)
+    result = solve_energy(problem, constraint, "central", max_iterations=None)
     assert not result.converged
-    assert result.status in {"nonlinear_consensus_stagnation", "local_energy_model_infeasible_unknown", "energy_linearization_stagnation"}
+    assert result.status in {"local_energy_model_infeasible_unknown", "energy_linearization_stagnation"}
     assert result.diagnostics["feasibility"]["status"] == "feasible"
     assert result.diagnostics["energy"]["global_optimality_verified"] is False
 
@@ -262,37 +258,31 @@ def test_negative_gravity_free_energy_budget_has_a_nonnegativity_certificate():
     assert "nonnegative" in result.diagnostics["certificate"]
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_energy_solver_reports_progress_without_changing_results(method):
+def test_energy_solver_reports_progress_without_changing_results():
     mesh, energy, positions, velocities = energy_fixture()
     velocity = 0.2 * (positions - positions.mean(axis=1, keepdims=True))
     problem = DynamicsProblem(mesh, positions, velocities, positions + 0.05 * velocity, velocity, 0.05,
                               density=energy.density, position_scale=1.0, velocity_scale=1.0)
     constraint = EnergyProjection(problem, energy, 0.0)
     reports = []
-    monitored = solve_energy(problem, constraint, method, progress=reports.append)
-    plain = solve_energy(problem, constraint, method)
+    monitored = solve_energy(problem, constraint, "central", progress=reports.append)
+    plain = solve_energy(problem, constraint, "central")
     assert monitored.converged and plain.converged
     assert reports
     assert_allclose(monitored.positions, plain.positions, atol=0)
     assert_allclose(monitored.velocities, plain.velocities, atol=0)
-    assert all(item["event"] in {"energy_corrector_progress", "energy_solver_phase"} and item["method"] == method for item in reports)
+    assert all(item["event"] in {"energy_corrector_progress", "energy_solver_phase"} and item["method"] == "central" for item in reports)
     assert all(item["runtime_seconds"] >= 0 for item in reports)
     assert (np.diff([item["runtime_seconds"] for item in reports]) >= 0).all()
     iterations = [item for item in reports if item["event"] == "energy_corrector_progress"]
     assert iterations
-    assert all({"objective", "constraint_violation", "energy_violation", "primal_residual", "dual_residual", "rho"}.issubset(item) for item in iterations)
+    assert all({"objective", "constraint_violation", "energy_violation"}.issubset(item) for item in iterations)
+    assert not any("rho" in item for item in iterations)
     phases = [item for item in reports if item["event"] == "energy_solver_phase"]
     assert phases and phases[0]["phase"] == "coordinate_setup" and phases[0]["status"] == "completed"
     assert phases[0]["solver_state_variables"] <= phases[0]["full_state_variables"]
     assert phases[1]["status"] == "started"
     assert any(item.get("phase_runtime_seconds", -1) >= 0 for item in phases)
-    if method == "consensus":
-        assert iterations[0]["iteration"] == 1
-        assert all(item["iteration"] % 25 == 0 for item in iterations[1:])
-        projection_phases = [item for item in phases if item["phase"] == "energy_projection"]
-        assert projection_phases[0]["status"] == "started"
-        assert any(item["status"] != "started" for item in projection_phases)
 
 
 def test_energy_acceptance_is_invariant_to_large_gravitational_origin_shift():
@@ -333,75 +323,16 @@ def test_stable_ballistic_energy_change_does_not_subtract_large_potentials():
     assert_allclose(residuals, 0.0, atol=1e-8)
 
 
-def test_energy_feasible_linear_relaxation_needs_no_nonlinear_projection(monkeypatch):
-    mesh, energy, positions, velocities = energy_fixture()
-    velocities[:] = [1.0, 0.0, 0.0]
-    proposal_velocity = velocities + [0.1, 0.0, 0.0]
-    problem = DynamicsProblem(mesh, positions, velocities, positions + 0.01 * proposal_velocity, proposal_velocity, 0.01,
-                              density=energy.density, position_scale=1.0, velocity_scale=1.0)
-    constraint = EnergyProjection(problem, energy, energy.value(positions, velocities))
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("inactive energy must not invoke the nonlinear proximal block")
-
-    monkeypatch.setattr(constraint, "project", forbidden)
-    result = solve_energy(problem, constraint, "consensus")
-    assert result.converged, result.diagnostics
-    assert result.diagnostics["energy"]["inactive_energy_certificate"]
-    assert result.diagnostics["energy"]["energy_proximal_calls"] == 0
-    assert result.iterations > 0
-    assert len(result.history) == result.iterations
-    assert len(result.diagnostics["energy"]["phases"]) == 1
-
-
-def test_active_energy_preserves_linear_duals_and_counts_both_consensus_phases():
+def test_central_energy_respects_the_total_iteration_budget():
     mesh, energy, positions, velocities = energy_fixture()
     proposal_velocity = 0.2 * (positions - positions.mean(axis=1, keepdims=True)) + [0.1, 0.0, 0.0]
     problem = DynamicsProblem(mesh, positions, velocities, positions + 0.05 * proposal_velocity, proposal_velocity, 0.05,
                               density=energy.density, position_scale=1.0, velocity_scale=1.0)
     constraint = EnergyProjection(problem, energy, 0.0)
-    result = solve_energy(problem, constraint, "consensus")
-    assert result.converged, (result.status, result.diagnostics)
-    phases = result.diagnostics["energy"]["phases"]
-    assert [item["name"] for item in phases] == ["linear_consensus_relaxation", "nonlinear_energy_consensus"]
-    assert all(item["iterations"] > 0 for item in phases)
-    assert result.iterations == sum(item["iterations"] for item in phases)
-    assert result.iterations == len(result.history)
-    assert [item.iteration for item in result.history] == list(range(1, result.iterations + 1))
-    assert phases[1]["initial_rho"] == phases[0]["final_rho"]
-    assert phases[1]["initial_linear_scaled_dual_norm"] > 0
-    assert phases[1]["initial_energy_scaled_dual_norm"] == 0
-    assert result.diagnostics["energy"]["energy_satisfied"]
-    assert result.runtime_seconds >= sum(item["runtime_seconds"] for item in phases)
-
-
-def test_linear_relaxation_uses_the_same_total_iteration_budget():
-    mesh, energy, positions, velocities = energy_fixture()
-    proposal_velocity = 0.2 * (positions - positions.mean(axis=1, keepdims=True)) + [0.1, 0.0, 0.0]
-    problem = DynamicsProblem(mesh, positions, velocities, positions + 0.05 * proposal_velocity, proposal_velocity, 0.05,
-                              density=energy.density, position_scale=1.0, velocity_scale=1.0)
-    constraint = EnergyProjection(problem, energy, 0.0)
-    result = solve_energy(problem, constraint, "consensus", max_iterations=1)
+    result = solve_energy(problem, constraint, "central", max_iterations=1)
     assert not result.converged
-    assert result.status == "maximum_iterations"
+    assert result.status == "MaxIterations"
     assert result.iterations == 1
-    assert result.diagnostics["energy"]["energy_proximal_calls"] == 0
-
-
-def test_active_energy_has_no_extra_iteration_after_linear_budget_is_exhausted():
-    mesh, energy, positions, velocities = energy_fixture()
-    proposal_velocity = 0.2 * (positions - positions.mean(axis=1, keepdims=True)) + [0.1, 0.0, 0.0]
-    problem = DynamicsProblem(mesh, positions, velocities, positions + 0.05 * proposal_velocity, proposal_velocity, 0.05,
-                              density=energy.density, position_scale=1.0, velocity_scale=1.0)
-    relaxation = solve_consensus(problem)
-    assert relaxation.converged and relaxation.iterations > 0
-    constraint = EnergyProjection(problem, energy, 0.0)
-    result = solve_energy(problem, constraint, "consensus", max_iterations=relaxation.iterations)
-    assert not result.converged
-    assert result.status == "maximum_iterations"
-    assert result.iterations == relaxation.iterations
-    assert result.diagnostics["energy"]["energy_proximal_calls"] == 0
-    assert result.diagnostics["energy"]["phases"][1]["iterations"] == 0
 
 
 def shared_energy_fixture(gravity=(0., 0., 0.)):
@@ -454,8 +385,7 @@ def test_zero_energy_projection_preserves_shared_corners_and_piece_rigidity():
     assert result.diagnostics["global_projection_verified"]
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_shared_prior_certificate_keeps_irreducible_prediction_cost(method):
+def test_shared_prior_certificate_keeps_irreducible_prediction_cost():
     source, _, projection = shared_energy_fixture()
     predicted_positions = source.positions.copy().reshape(-1, 3)
     predicted_velocities = source.velocities.copy().reshape(-1, 3)
@@ -467,7 +397,7 @@ def test_shared_prior_certificate_keeps_irreducible_prediction_cost(method):
                               density=source.density, position_scale=source.position_scale,
                               velocity_scale=source.velocity_scale)
     constraint = EnergyProjection(problem, projection.energy, 0.)
-    result = solve_energy(problem, constraint, method)
+    result = solve_energy(problem, constraint, "central")
     assert result.converged, (result.status, result.diagnostics)
     assert result.objective > 0.
     assert_allclose(result.objective, problem.objective(problem.encode_state(result.positions, result.velocities)), atol=1e-15)
@@ -476,8 +406,7 @@ def test_shared_prior_certificate_keeps_irreducible_prediction_cost(method):
     assert result.diagnostics["energy"]["coordinate_reduction_seconds"] >= 0.
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
-def test_active_energy_solver_uses_shared_state_and_preserves_original_constraints(method):
+def test_active_energy_solver_uses_shared_state_and_preserves_original_constraints():
     source, _, projection = shared_energy_fixture()
     center = source.positions.mean(axis=(0, 1), keepdims=True)
     velocity = .2 * (source.positions - center) + [.1, 0., 0.]
@@ -486,7 +415,7 @@ def test_active_energy_solver_uses_shared_state_and_preserves_original_constrain
                               density=source.density, position_scale=source.position_scale,
                               velocity_scale=source.velocity_scale)
     constraint = EnergyProjection(problem, projection.energy, 0.)
-    result = solve_energy(problem, constraint, method)
+    result = solve_energy(problem, constraint, "central")
     assert result.converged, (result.status, result.diagnostics)
     assert result.diagnostics["constraints_satisfied"]
     assert result.diagnostics["energy"]["energy_satisfied"]
@@ -494,9 +423,6 @@ def test_active_energy_solver_uses_shared_state_and_preserves_original_constrain
     for first, second in problem.mesh.corner_face_pairs.reshape(-1, 2):
         assert np.array_equal(flat[first], flat[second])
     assert result.diagnostics["shared_coordinates"]["solver_state_variables"] < len(problem.prior)
-    if method == "consensus":
-        assert result.diagnostics["energy"]["energy_proximal_calls"] > 0
-        assert result.diagnostics["energy"]["energy_projection_seconds"] > 0.
 
 
 @pytest.mark.parametrize("coordinates", ["full", "shared"])

@@ -7,15 +7,15 @@ import pytest
 
 from fracture_world import dynamics_experiment
 from fracture_world.cli import parser
-from fracture_world.dynamics_experiment import _comparison_methods, _rollout_agreement, benchmark_dynamics, compare_dynamics
+from fracture_world.dynamics_experiment import _comparison_methods, benchmark_dynamics, compare_dynamics
 
 
-METHODS = ["raw", "central", "consensus", "no_motion_central", "no_motion_consensus"]
+METHODS = ["raw", "physics"]
 
 
 @pytest.mark.parametrize("method", METHODS[-2:])
 @pytest.mark.parametrize("command", ["dynamics-rollout", "dynamics-compare", "dynamics-benchmark"])
-def test_autonomous_cli_accepts_motion_ablation_methods(command, method):
+def test_autonomous_cli_accepts_model_and_physics_methods(command, method):
     arguments = [command, "--checkpoint", "best.pt", "--output", "output", "--steps", "200"]
     if command == "dynamics-benchmark":
         arguments.extend(["--data", "collection.json", "--methods", method])
@@ -27,25 +27,23 @@ def test_autonomous_cli_accepts_motion_ablation_methods(command, method):
     assert (parsed.method if command == "dynamics-rollout" else parsed.methods[0]) == method
 
 
-@pytest.mark.parametrize("corrector,expected", [(None, METHODS[:3]), (object(), ["raw", "neural", "central", "consensus"])])
-def test_autonomous_ablation_does_not_change_default_methods(corrector, expected):
-    assert _comparison_methods(None, corrector) == expected
-    assert _comparison_methods(METHODS, corrector) == METHODS
+def test_autonomous_comparison_defaults_to_the_model():
+    assert _comparison_methods(None) == ["raw"]
+    assert _comparison_methods(METHODS) == METHODS
 
 
 def test_autonomous_ablation_rejects_duplicate_conditions():
     with pytest.raises(ValueError, match="unique"):
-        _comparison_methods(["no_motion_central", "no_motion_central"], None)
+        _comparison_methods(["raw", "raw"])
 
 
-def test_comparison_runs_all_five_full_horizons_before_accessing_reference(tmp_path, monkeypatch):
+def test_comparison_runs_both_full_horizons_before_accessing_reference(tmp_path, monkeypatch):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"existing-checkpoint")
     initial = tmp_path / "initial.npz"
     initial.write_bytes(b"immutable-initial")
     checkpoint_before, initial_before = checkpoint.read_bytes(), initial.read_bytes()
     calls, evaluated = [], []
-    monkeypatch.setattr(dynamics_experiment, "load_dynamics_model", lambda *args: (None, None, {}, "cpu"))
 
     def rollout(received_checkpoint, received_initial, output, steps, method, config, device, progress):
         assert received_checkpoint == checkpoint and received_initial == initial
@@ -69,30 +67,21 @@ def test_comparison_runs_all_five_full_horizons_before_accessing_reference(tmp_p
                               reference_case=tmp_path / "teacher.npz")
     assert calls == evaluated == METHODS
     assert report["all_rollouts_completed"]
-    assert report["motion_ablation"]["comparison_pairs"] == [["central", "no_motion_central"], ["consensus", "no_motion_consensus"]]
-    assert report["motion_ablation"]["fully_neural_free"] is False
-    assert "own committed state" in report["motion_ablation"]["state_feedback"]
     assert "need not match" in report["proposal_control"]
     assert report["numerical_reference_used_for_inference"] is False
-    assert report["no_motion_central_consensus_agreement"]["common_prediction_frames"] == 200
-    assert report["no_motion_central_consensus_agreement"]["positions_rms_metres"] == 1.
-    assert report["no_motion_central_consensus_agreement"]["same_objective"] is None
     assert checkpoint.read_bytes() == checkpoint_before
     assert initial.read_bytes() == initial_before
-    assert json.loads((tmp_path / "comparison" / "comparison.json").read_text())["motion_ablation"]["enabled"]
+    assert json.loads((tmp_path / "comparison" / "comparison.json").read_text())["requested_methods"] == METHODS
 
 
-def test_autonomous_agreement_does_not_claim_identical_state_dependent_objectives(tmp_path):
-    paths = [tmp_path / "central.npz", tmp_path / "consensus.npz"]
-    for index, path in enumerate(paths):
-        state = np.full((3, 4, 3), index, dtype=float)
-        state[0] = 0
-        np.savez(path, times=[0., .1, .2], positions=state, velocities=state, broken=np.zeros((3, 1), dtype=bool))
-    report = _rollout_agreement(*paths, True)
-    assert report["same_objective"] is None
-    assert report["same_objective_formulation"]
-    assert "identical per-step objectives are not enforced" in report["objective_scope"]
-    assert report["positions_rms_metres"] == 1.
+@pytest.mark.parametrize("method", ["central", "no_motion_central", "consensus", "no_motion_consensus", "neural"])
+@pytest.mark.parametrize("command", ["dynamics-rollout", "dynamics-compare", "dynamics-benchmark"])
+def test_online_cli_rejects_correction_methods(command, method):
+    arguments = [command, "--checkpoint", "best.pt", "--output", "output", "--steps", "1"]
+    arguments.extend(["--data", "data"] if command == "dynamics-benchmark" else ["--initial", "initial.npz"])
+    arguments.extend(["--method" if command == "dynamics-rollout" else "--methods", method])
+    with pytest.raises(SystemExit):
+        parser().parse_args(arguments)
 
 
 class BenchmarkCase(SimpleNamespace):
@@ -100,7 +89,7 @@ class BenchmarkCase(SimpleNamespace):
         return len(self.times) - 1
 
 
-def test_benchmark_scores_motion_ablation_on_same_complete_cases_and_keeps_failures(tmp_path, monkeypatch):
+def test_benchmark_scores_model_and_physics_on_same_complete_cases_and_keeps_failures(tmp_path, monkeypatch):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"existing-checkpoint")
     source = tmp_path / "source" / "cases" / "bunny.npz"
@@ -109,7 +98,7 @@ def test_benchmark_scores_motion_ablation_on_same_complete_cases_and_keeps_failu
                          times=np.arange(201) * .01,
                          metadata=dict(source_hashes={str(source): "recorded"}, conditioning_context=dict(dt=.01, steps=200)))
     saved = dict(training=dict(overfit=False), splits=dict(test=["bunny"]), condition_splits=dict(test=["held-out"]))
-    monkeypatch.setattr(dynamics_experiment, "load_dynamics_model", lambda *args: (None, None, saved, "cpu"))
+    monkeypatch.setattr(dynamics_experiment, "load_dynamics_predictor", lambda *args: (None, saved, "cpu"))
     monkeypatch.setattr(dynamics_experiment, "load_dynamics_dataset", lambda *args, **kwargs: [case])
     exported = []
 
@@ -121,7 +110,7 @@ def test_benchmark_scores_motion_ablation_on_same_complete_cases_and_keeps_failu
         assert steps == 200 and methods == METHODS and initial == exported[0]
         conditions = {}
         for index, method in enumerate(methods):
-            failed = method == "no_motion_consensus"
+            failed = method == "physics"
             evaluation = dict(last_compared_native_step=20 if failed else 200,
                               new_fracture=dict(f1=1., predicted_broken_facets=0),
                               position_mass_weighted_rmse_m=float(index), velocity_mass_weighted_rmse_m_per_s=float(index))
@@ -133,14 +122,11 @@ def test_benchmark_scores_motion_ablation_on_same_complete_cases_and_keeps_failu
     monkeypatch.setattr(dynamics_experiment, "export_initial", export)
     monkeypatch.setattr(dynamics_experiment, "compare_dynamics", compare)
     report = benchmark_dynamics(checkpoint, tmp_path / "collection.json", tmp_path / "benchmark", 200, methods=METHODS)
-    assert report["requested_method_runs"] == report["attempted_method_runs"] == 5
-    assert report["motion_ablation"]["enabled"]
+    assert report["requested_method_runs"] == report["attempted_method_runs"] == 2
+    assert report["motion_ablation"]["enabled"] is False
     assert report["reference_used_only_for_evaluation"]
-    assert report["conditions"]["no_motion_consensus"]["failed_cases"] == 1
-    assert report["conditions"]["no_motion_consensus"]["full_horizon_accuracy_cases"] == 0
+    assert report["conditions"]["physics"]["failed_cases"] == 1
+    assert report["conditions"]["physics"]["full_horizon_accuracy_cases"] == 0
     pairs = {tuple(item["methods"]): item for item in report["paired_accuracy"]["pairwise"]}
-    assert pairs[("central", "no_motion_central")]["common_full_horizon_case_ids"] == ["bunny"]
-    error = pairs[("central", "no_motion_central")]["metrics"]["position_mass_weighted_rmse_m"]
-    assert error["mean_difference_second_minus_first"] == 2.
-    assert pairs[("consensus", "no_motion_consensus")]["common_full_horizon_cases"] == 0
+    assert pairs[("raw", "physics")]["common_full_horizon_cases"] == 0
     assert report["paired_accuracy"]["all_methods"]["common_full_horizon_cases"] == 0

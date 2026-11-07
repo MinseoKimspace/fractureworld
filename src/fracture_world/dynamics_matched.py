@@ -14,25 +14,24 @@ from .dynamics_data import _frozen, _teacher_physics, load_dynamics_dataset, loa
 from .dynamics_evaluation import _native_clock, _new_fracture_classification
 from .dynamics_geometry import floor_contacts, geometry_diagnostics, linearized_contacts, swept_geometry_diagnostics
 from .dynamics_initial import DynamicsInitial
-from .dynamics_learning import load_dynamics_model, state_batch
+from .dynamics_learning import load_dynamics_predictor, state_batch
 from .dynamics_model import physics_motion_prediction
 from .io import file_hash, new_directory, write_json
 
 
-METHODS = ("raw", "central", "consensus")
-MOTION_ABLATION_METHODS = ("no_motion_central", "no_motion_consensus")
+METHODS = ("raw", "central", "no_motion_central")
 
 
 def _matched_methods(methods, motion_ablation):
     if methods is not None and not isinstance(methods, (list, tuple)):
         raise ValueError("matched methods must be a list or tuple")
     selected = list(METHODS if methods is None else methods)
-    allowed = {*METHODS, *MOTION_ABLATION_METHODS}
+    allowed = set(METHODS)
     if not selected or any(not isinstance(method, str) or method not in allowed for method in selected) or len(set(selected)) != len(selected):
-        raise ValueError("matched methods must be unique raw/central/consensus/no_motion_central/no_motion_consensus values")
+        raise ValueError("matched methods must be unique raw/central/no_motion_central values")
     if motion_ablation:
         selected.extend(f"no_motion_{method}" for method in tuple(selected)
-                        if method in {"central", "consensus"} and f"no_motion_{method}" not in selected)
+                        if method == "central" and f"no_motion_{method}" not in selected)
     return tuple(selected)
 
 
@@ -92,22 +91,6 @@ def _compact_diagnostics(diagnostic):
     report["solves"] = [{key: value for key, value in item.items() if key != "history"}
                         for item in diagnostic.get("solves", [])]
     return report
-
-
-def _solver_agreement(prepared, indexed, states, first, second):
-    reports = []
-    for candidate in prepared:
-        key = candidate["index"]
-        a, b = indexed.get((key, first)), indexed.get((key, second))
-        available = bool(a and b and a["accepted"] and b["accepted"])
-        difference = b["selection_objective"] - a["selection_objective"] if available else None
-        reports.append(dict(candidate=key, methods=[first, second], comparison_available=available,
-                            objective_difference_second_minus_first=difference,
-                            positions_rms_metres=float(np.sqrt(np.mean((states[(key, first)][0] - states[(key, second)][0])**2))) if available else None,
-                            velocities_rms_metres_per_second=float(np.sqrt(np.mean((states[(key, first)][1] - states[(key, second)][1])**2))) if available else None))
-        if (first.removeprefix("no_motion_"), second.removeprefix("no_motion_")) == ("central", "consensus"):
-            reports[-1]["objective_difference_consensus_minus_central"] = difference
-    return reports
 
 
 def _accumulate_summary(methods, pairwise, row):
@@ -330,9 +313,6 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
             if selected["selected_candidate"] is not None:
                 selected["evaluation"] = next(record["evaluation"] for record in records
                                                if record["method"] == method and record["candidate"] == selected["selected_candidate"])
-    indexed = {(record["candidate"], record["method"]): record for record in records}
-    agreement = _solver_agreement(prepared, indexed, states, "central", "consensus")
-    physical_agreement = _solver_agreement(prepared, indexed, states, *MOTION_ABLATION_METHODS) if set(MOTION_ABLATION_METHODS).issubset(methods) else []
     selected_pairs = []
     for first, second in combinations(methods, 2):
         a, b = selections[first]["selected_candidate"], selections[second]["selected_candidate"]
@@ -353,8 +333,7 @@ def compare_matched_step(initial, model, config=None, step=0, *, reference=None,
                 motion_ablation=motion_ablation, physical_motion_prior=model.config.get("motion_prior", "backward_euler"),
                 corrector_reuse=not cold_corrector,
                 neural_fracture_and_support_shared=True, fully_neural_free_baseline=False,
-                methods=selections, candidates=records, central_consensus=agreement, selected_state_comparisons=selected_pairs,
-                no_motion_central_consensus=physical_agreement,
+                methods=selections, candidates=records, selected_state_comparisons=selected_pairs,
                 motion_ablation_comparisons=ablation_comparisons,
                 reference_used_for_proposals=False, reference_used_for_selection=False,
                 reference_used_only_for_evaluation=reference_values is not None, engine_calls=0,
@@ -402,7 +381,7 @@ def compare_matched_dynamics(checkpoint, data, output, config=None, device="auto
     if frames is not None and (not isinstance(frames, (list, tuple)) or not frames or
                                any(isinstance(frame, bool) or not isinstance(frame, int) or frame < 0 for frame in frames) or len(set(frames)) != len(frames)):
         raise ValueError("matched frames must be unique nonnegative recorded frame indices")
-    model, _, saved, device = load_dynamics_model(checkpoint, device)
+    model, saved, device = load_dynamics_predictor(checkpoint, device)
     if split in {"validation", "test"} and saved["training"]["overfit"]:
         raise ValueError("held-out matched comparison cannot use an overfit-debug checkpoint")
     if device.type == "cpu":

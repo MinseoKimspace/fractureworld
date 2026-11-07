@@ -62,14 +62,17 @@ def test_rollout_encodes_once_per_current_state_and_shares_only_within_the_step(
     assert report["status"] == "completed"
     expected_encodes = 0 if method == "physics" else 3
     assert len(encoded_states) == expected_encodes
-    assert len(sampled_contexts) == (3 * samples if method != "physics" else 0)
+    with np.load(tmp_path / "rollout" / "trajectory.npz", allow_pickle=False) as archive:
+        active_steps = int(np.count_nonzero(np.any(~archive["broken"][:-1], axis=1))) if method != "physics" else 0
+    assert len(sampled_contexts) == active_steps * samples
+    assert report["fracture_flow_calls"] == len(sampled_contexts)
     if method != "physics":
         assert not torch.equal(encoded_states[0], encoded_states[-1])
     if sampled_contexts:
-        for step in range(3):
+        for step in range(active_steps):
             contexts = sampled_contexts[step * samples:(step + 1) * samples]
             assert all(context is contexts[0] for context in contexts)
-        assert len({id(sampled_contexts[step * samples]) for step in range(3)}) == 3
+        assert len({id(sampled_contexts[step * samples]) for step in range(active_steps)}) == active_steps
 
 
 def test_sampling_without_internal_faces_requires_no_additional_encoder_calls(monkeypatch):
@@ -89,7 +92,7 @@ def test_sampling_without_internal_faces_requires_no_additional_encoder_calls(mo
     monkeypatch.setattr(model, "encode", encode)
     with torch.no_grad():
         proposal = model(batch)
-        candidates = fracture_candidates(model, batch, proposal, RolloutConfig(fracture_samples=4, flow_steps=1), 0)
+        candidates = fracture_candidates(model, batch, proposal, RolloutConfig(fracture_samples=4, fracture_policy="fm_search", flow_steps=1), 0)
     assert len(calls) == 1
     assert len(candidates) == 1
     np.testing.assert_array_equal(candidates[0], np.empty(0, dtype=bool))

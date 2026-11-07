@@ -37,11 +37,11 @@ def phase_fixture(*, penetrated=False, shared=False):
     proposal = dict(positions=torch.as_tensor(positions.copy()), velocities=torch.as_tensor(velocities.copy()),
                     fracture_probability=torch.full((len(broken),), .75), support_release_probability=torch.zeros(len(positions)))
     config = RolloutConfig(fracture_policy="marginal_search", fracture_samples=0, mechanics_mode="proximal",
-                           rho=.1, max_iterations=20000, max_contact_iterations=50)
+                           max_iterations=20000, max_contact_iterations=50)
     return initial, model, proposal, config
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_actual_corrector_repairs_initial_penetration_by_source_position_response_without_spurious_velocity(method):
     initial, model, proposal, config = phase_fixture(penetrated=True)
     result, report = _correct(initial, initial.positions, initial.velocities, proposal, initial.broken, initial.fixed,
@@ -80,7 +80,7 @@ def test_actual_corrector_repairs_initial_penetration_by_source_position_respons
     assert_allclose(actual, expected, atol=bound, rtol=0.)
 
 
-@pytest.mark.parametrize("method", ["central", "consensus"])
+@pytest.mark.parametrize("method", ["central"])
 def test_no_contact_source_phase_has_no_stabilization_slack_for_an_old_checkpoint_shaped_proposal(method):
     initial, model, proposal, config = phase_fixture()
     proposal["positions"] = proposal["positions"] + torch.tensor([.02, 0., 0.])
@@ -102,22 +102,15 @@ def test_no_contact_source_phase_has_no_stabilization_slack_for_an_old_checkpoin
     assert result.diagnostics["energy"]["stabilization"]["numerical_stabilization_work"]["total"] == 0.
 
 
-def test_identical_current_fracture_pool_is_validated_by_both_source_phase_correctors():
+def test_current_fracture_pool_is_validated_by_the_central_source_phase_corrector():
     initial, model, proposal, config = phase_fixture(shared=True)
     batch = dict(broken=torch.as_tensor(initial.broken))
     candidates = fracture_candidates(model, batch, proposal, config, 0)
     assert len(candidates) == 2
-    states = {}
-    for method in ("central", "consensus"):
-        states[method] = []
-        for candidate in candidates:
-            result, report = _correct(initial, initial.positions, initial.velocities, proposal, candidate, initial.fixed,
-                                      model, config, method, previous_broken=initial.broken, previous_fixed=initial.fixed)
-            assert result is not None, report
-            assert result.diagnostics["constraints_satisfied"]
-            assert result.diagnostics["energy"]["energy_satisfied"]
-            assert report["geometry"]["valid"]
-            states[method].append((result.positions.copy(), result.velocities.copy()))
-    for central, consensus in zip(states["central"], states["consensus"], strict=True):
-        assert_allclose(central[0], consensus[0], atol=config.geometry_tolerance)
-        assert_allclose(central[1], consensus[1], atol=config.geometry_tolerance / initial.dt)
+    for candidate in candidates:
+        result, report = _correct(initial, initial.positions, initial.velocities, proposal, candidate, initial.fixed,
+                                  model, config, "central", previous_broken=initial.broken, previous_fixed=initial.fixed)
+        assert result is not None, report
+        assert result.diagnostics["constraints_satisfied"]
+        assert result.diagnostics["energy"]["energy_satisfied"]
+        assert report["geometry"]["valid"]

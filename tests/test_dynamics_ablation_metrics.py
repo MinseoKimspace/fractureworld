@@ -8,7 +8,7 @@ from fracture_world.dynamics_ablation_metrics import motion_ablation_comparisons
 
 POSITION = "position_mass_weighted_rmse_m"
 VELOCITY = "velocity_mass_weighted_rmse_m_per_s"
-METHODS = ("central", "no_motion_central", "consensus", "no_motion_consensus")
+METHODS = ("central", "no_motion_central")
 
 
 def evaluation(position, velocity):
