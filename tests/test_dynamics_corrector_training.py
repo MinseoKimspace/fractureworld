@@ -53,6 +53,11 @@ def test_corrector_only_training_preserves_predictor_and_original_splits(pretrai
 
     def inspect_corrector(network, *args, **kwargs):
         predictor = kwargs["fixed_predictor"]
+        if predictor is None:
+            assert kwargs["flow"] is False
+            assert not network.training
+            assert all(not parameter.requires_grad for parameter in network.parameters())
+            return loss(network, *args, **kwargs)
         assert isinstance(network, NeuralDynamicsCorrector)
         assert predictor is not None and not predictor.training
         assert all(not parameter.requires_grad for parameter in predictor.parameters())

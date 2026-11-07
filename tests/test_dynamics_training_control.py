@@ -62,6 +62,7 @@ def controlled_losses(monkeypatch, validation_losses):
         return value, terms
 
     monkeypatch.setattr(dynamics_learning, "_rollout_loss", loss)
+    monkeypatch.setattr(dynamics_learning.dynamics_baseline, "read_cached_baseline", lambda *args: None)
 
 
 def test_corrector_keeps_epoch_zero_baseline_when_validation_worsens(predictor, tmp_path, monkeypatch):
@@ -264,6 +265,41 @@ def test_batched_corrector_training_and_direct_resume_preserve_frozen_predictor(
     with pytest.raises(ValueError, match="original frozen predictor"):
         train_neural_corrector(data, changed, tmp_path / "rejected", epochs=3, device="cpu", resume=directory / "last.pt")
     assert not (tmp_path / "rejected").exists()
+
+
+def test_corrector_resume_allows_larger_batch_and_preserves_optimizer_state(predictor, tmp_path, capsys):
+    data, trajectories, path = predictor
+    original_hash = file_hash(path)
+    first = train_neural_corrector(data, path, tmp_path / "first", epochs=1, device="cpu", batch_size=2)
+    previous = torch.load(first.parent / "last.pt", map_location="cpu", weights_only=True)
+    snapshot = tmp_path / "epoch-one.pt"
+    torch.save(previous, snapshot)
+    continued = train_neural_corrector(data, path, tmp_path / "continued", epochs=2, device="cpu",
+                                      batch_size=6, resume=snapshot)
+    checkpoint = torch.load(continued.parent / "last.pt", map_location="cpu", weights_only=True)
+    assert checkpoint["training"]["batch_size"] == 6
+    assert checkpoint["training_state"]["completed_epoch"] == 2
+    changes = [dict(stage="neural_corrector", after_completed_epoch=1, previous_batch_size=2, batch_size=6)]
+    assert checkpoint["batch_size_changes"] == changes
+    assert torch.load(continued, map_location="cpu", weights_only=True)["batch_size_changes"] == changes
+    training = next(item for item in trajectories if item.case_id in checkpoint["splits"]["train"])
+    additional_steps = math.ceil(len(training) / 6)
+    for parameter, state in previous["training_state"]["optimizer"]["state"].items():
+        actual = checkpoint["training_state"]["optimizer"]["state"][parameter]
+        torch.testing.assert_close(actual["step"], state["step"] + additional_steps, atol=0, rtol=0)
+    for name, value in previous["model"].items():
+        torch.testing.assert_close(checkpoint["model"][name], value, atol=0, rtol=0)
+    assert checkpoint["splits"] == previous["splits"]
+    assert checkpoint["training_baseline"] == previous["training_baseline"]
+    assert file_hash(path) == original_hash
+    records = [json.loads(line) for line in (continued.parent / "training.jsonl").read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["epoch"] == 2
+    assert records[0]["batch_size"] == 6
+    assert records[0]["split_timing"]["train"]["optimizer_steps"] == additional_steps
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    resumed = next(item for item in messages if item.get("phase") == "resume")
+    assert resumed["previous_batch_size"] == 2 and resumed["batch_size"] == 6
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for end-to-end GPU training")

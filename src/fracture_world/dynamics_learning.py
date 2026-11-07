@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from . import dynamics_baseline
 from .dynamics_data import load_dynamics_dataset, split_dynamics_cases, supervision_counts
 from .dynamics_model import NeuralDynamicsCorrector, TemporalDynamicsModel
 from .io import file_hash, new_directory, write_json
@@ -233,7 +234,7 @@ def _validate_autoregressive_prediction(output, case_id, frame):
 
 
 def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor=None,
-                  fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generator=None):
+                  fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generator=None, flow=True):
     batch = transition_batch(trajectory, frame, device) if prepared is None else prepared.batch(frame)
     horizon = min(config.rollout_steps, len(trajectory) - frame)
     losses, components = [], []
@@ -249,7 +250,7 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
             target_values = prepared.targets(frame + offset)
         proposal = fixed_predictor(batch) if fixed_predictor is not None else None
         loss, terms, output = _loss(network, batch, *target_values, config, proposal,
-                                    flow=fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
+                                    flow=flow and fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
                                     support_positive_weight=support_positive_weight, return_output=True, flow_generator=flow_generator)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"nonfinite temporal dynamics training loss in {trajectory.case_id} at frame {frame + offset}")
@@ -264,7 +265,7 @@ def _rollout_loss(network, trajectory, frame, device, config, *, fixed_predictor
 
 
 def _rollout_loss_batch(network, trajectory, frames, device, config, *, fixed_predictor=None,
-                        fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generators=None):
+                        fracture_positive_weight=1.0, support_positive_weight=1.0, prepared=None, flow_generators=None, flow=True):
     prepared = _TrainingTrajectory(trajectory, device) if prepared is None else prepared
     batches = [prepared.batch(int(frame)) for frame in frames]
     horizons = [min(config.rollout_steps, len(trajectory) - int(frame)) for frame in frames]
@@ -278,7 +279,7 @@ def _rollout_loss_batch(network, trajectory, frames, device, config, *, fixed_pr
             frame = int(frames[index]) + offset
             generator = None if flow_generators is None else flow_generators[index]
             loss, terms = _loss(network, batch, *prepared.targets(frame), config, proposal,
-                                flow=fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
+                                flow=flow and fixed_predictor is None, fracture_positive_weight=fracture_positive_weight,
                                 support_positive_weight=support_positive_weight, flow_generator=generator, output=output)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"nonfinite temporal dynamics training loss in {trajectory.case_id} at frame {frame}")
@@ -328,7 +329,8 @@ def _checkpoint_splits(trajectories, checkpoint):
 
 def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, device="auto", stream_data=False,
                            rollout_steps=None, learning_rate=None, batch_size=None, lr_patience=None, lr_factor=None,
-                           min_learning_rate=None, early_stopping_patience=None, min_improvement=None, resume=None):
+                           min_learning_rate=None, early_stopping_patience=None, min_improvement=None, resume=None,
+                           baseline_checkpoint=None):
     if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
         raise ValueError("corrector epochs must be a positive integer")
     model, _, checkpoint, _ = load_dynamics_model(checkpoint_path, "cpu")
@@ -354,10 +356,10 @@ def train_neural_corrector(data_dir, checkpoint_path, output_dir, *, epochs, dev
     options.update({name: value for name, value in overrides.items() if value is not None})
     config = DynamicsTrainingConfig(**options)
     return train_dynamics(data_dir, output_dir, config, resume=resume,
-                          predictor_checkpoint=checkpoint_path if resume is None else None)
+                          predictor_checkpoint=checkpoint_path if resume is None else None, baseline_checkpoint=baseline_checkpoint)
 
 
-def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None):
+def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_checkpoint=None, baseline_checkpoint=None):
     if not isinstance(config, DynamicsTrainingConfig):
         raise TypeError("config must be DynamicsTrainingConfig")
     if config.epochs < 1 or config.corrector_epochs < 0 or config.learning_rate <= 0:
@@ -379,12 +381,14 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
         raise ValueError("fracture and flow weights must be positive")
     if predictor_checkpoint is not None and (resume is not None or config.corrector_epochs < 1):
         raise ValueError("a pretrained predictor requires a fresh corrector run with positive corrector epochs")
+    if baseline_checkpoint is not None and (resume is not None or predictor_checkpoint is None):
+        raise ValueError("a baseline checkpoint requires a fresh corrector-only run")
     resumed = torch.load(Path(resume), map_location="cpu", weights_only=True) if resume is not None else None
     if resumed is not None:
         if resumed.get("format") != FORMAT or "training_state" not in resumed:
             raise ValueError("resume requires a resumable last.pt checkpoint; legacy model weights remain valid for inference")
         previous = asdict(DynamicsTrainingConfig(**resumed["training"]))
-        variable_options = {"epochs", "corrector_epochs", "device", "stream_data"}
+        variable_options = {"epochs", "corrector_epochs", "device", "stream_data", "batch_size"}
         if any(previous.get(key) != value for key, value in asdict(config).items() if key not in variable_options):
             raise ValueError("resuming requires unchanged model, loss, split, seed and rollout settings")
         state = resumed["training_state"]
@@ -516,6 +520,8 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
                           predictor_checkpoint_sha256=(frozen_checkpoint["predictor_checkpoint_sha256"] if resumed is not None
                                                        else file_hash(predictor_checkpoint)),
                           probability_policy=frozen_checkpoint.get("probability_policy", "legacy_weighted_logits"))
+    if resumed is not None and "batch_size_changes" in resumed:
+        checkpoint["batch_size_changes"] = list(resumed["batch_size_changes"])
     started = perf_counter()
     setup_progress(dict(phase="ready", status="completed", device=str(device),
                         splits={name: len(rows) for name, rows in splits.items()}))
@@ -535,9 +541,10 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
         selection = None
         key = "model" if stage == "predictor" else "corrector"
 
-        def run_split(name, epoch, is_training):
+        def run_split(name, epoch, is_training, baseline=False):
             split_started = last_progress = perf_counter()
-            network.train(is_training)
+            active_network = fixed_predictor if baseline else network
+            active_network.train(is_training)
             metrics = _TrainingMetrics(device)
             window_count = sum(len(item) for item in splits[name])
             prepare_seconds, optimizer_steps = 0.0, 0
@@ -554,13 +561,15 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
                     with torch.set_grad_enabled(is_training):
                         if is_training:
                             optimizer.zero_grad(set_to_none=True)
-                        options = dict(fixed_predictor=fixed_predictor, fracture_positive_weight=fracture_positive_weight,
+                        options = dict(fixed_predictor=None if baseline else fixed_predictor, fracture_positive_weight=fracture_positive_weight,
                                        support_positive_weight=support_positive_weight, prepared=prepared)
+                        if baseline:
+                            options["flow"] = False
                         if len(frames) == 1:
-                            loss, terms = _rollout_loss(network, trajectory, int(frames[0]), device, config,
+                            loss, terms = _rollout_loss(active_network, trajectory, int(frames[0]), device, config,
                                                         flow_generator=None if generators is None else generators[0], **options)
                         else:
-                            loss, terms = _rollout_loss_batch(network, trajectory, frames, device, config,
+                            loss, terms = _rollout_loss_batch(active_network, trajectory, frames, device, config,
                                                               flow_generators=generators, **options)
                         if is_training:
                             loss.backward()
@@ -610,22 +619,45 @@ def train_dynamics(data_dir, output_dir, config, *, resume=None, predictor_check
             selection = resumed.get("selection")
             if "training_baseline" in resumed:
                 checkpoint["training_baseline"] = resumed["training_baseline"]
+            if "training_baseline_context" in resumed:
+                checkpoint["training_baseline_context"] = resumed["training_baseline_context"]
+            previous_batch_size = resumed["training"].get("batch_size", 1)
+            if previous_batch_size != config.batch_size:
+                change = dict(stage=stage, after_completed_epoch=first_epoch,
+                              previous_batch_size=previous_batch_size, batch_size=config.batch_size)
+                checkpoint.setdefault("batch_size_changes", []).append(change)
             _restore_random_state(saved["random_state"])
             _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
             setup_progress(dict(phase="resume", status="completed", stage=stage, completed_epoch=first_epoch,
-                                target_epochs=epochs, checkpoint=str(Path(resume).resolve())))
+                                target_epochs=epochs, checkpoint=str(Path(resume).resolve()),
+                                previous_batch_size=previous_batch_size, batch_size=config.batch_size))
         elif fixed_predictor is not None:
             baseline_split = "validation" if splits["validation"] else "train"
-            scores, timing = run_split(baseline_split, 0, False)
-            best = significant_best = scores["loss"]
+            windows = sum(len(item) for item in splits[baseline_split])
+            context = dynamics_baseline.baseline_context(checkpoint, asdict(config), baseline_split, windows, device)
+            cache_path = dynamics_baseline.baseline_cache_path(directory, context)
+            baseline_source = "cache"
+            if baseline_checkpoint is not None:
+                baseline = dynamics_baseline.read_checkpoint_baseline(baseline_checkpoint, context)
+                baseline_source = "checkpoint"
+            else:
+                baseline = dynamics_baseline.read_cached_baseline(cache_path, context)
+            if baseline is None:
+                scores, timing = run_split(baseline_split, 0, False, baseline=True)
+                baseline = dict(stage=stage, epoch=0, split=baseline_split, losses=scores, timing=timing)
+                baseline_source = "evaluated"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_checkpoint(cache_path, dict(format=dynamics_baseline.FORMAT, context=context, baseline=baseline))
+            best = significant_best = baseline["losses"]["loss"]
             best_state = {name: value.detach().cpu().clone() for name, value in network.state_dict().items()}
-            baseline = dict(stage=stage, epoch=0, split=baseline_split, losses=scores, timing=timing)
             checkpoint["training_baseline"] = baseline
+            checkpoint["training_baseline_context"] = context
             selection = dict(stage=stage, epoch=0, loss=best, split=baseline_split)
             if scheduler is not None:
                 scheduler.step(best)
             _atomic_checkpoint(directory / "best.pt", {**checkpoint, key: best_state, "selection": selection})
-            print(json.dumps(dict(event="training_baseline", **baseline), allow_nan=False), flush=True)
+            print(json.dumps(dict(event="training_baseline", source=baseline_source, cache=str(cache_path), **baseline),
+                             allow_nan=False), flush=True)
         if stop_reason == "validation_plateau":
             network.load_state_dict(best_state)
             network.eval()
