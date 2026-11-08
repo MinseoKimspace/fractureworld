@@ -2,8 +2,9 @@ import json
 from pathlib import Path
 
 import pytest
+import numpy as np
 
-from fracture_world.cases import Case, collection
+from fracture_world.cases import Case, collection, input_hash
 from fracture_world.generation2d import configuration, cut_mesh, generate, smoke_configuration
 from fracture_world.stage_a import main
 
@@ -79,3 +80,43 @@ def test_incomplete_generation_is_not_training_data(tmp_path):
     path.write_text(json.dumps({"format": "cut-dynamics-a-v1", "status": "in_progress", "cases": []}), encoding="utf-8")
     with pytest.raises(ValueError, match="not completed"):
         collection(path, "train")
+
+
+def test_expanded_inputs_are_unique_and_split_by_cut_geometry():
+    from fracture_world.generation2d import generation_plan, generation_summary, times
+    from fracture_world.teacher2d import Material, Pull
+
+    config = source_config()
+    plan = generation_plan(config)
+    summary = generation_summary(config)
+    assert len(plan) == summary["cases"] == 1026
+    assert summary["splits"] == {"train": 648, "validation": 126, "test": 252}
+    assert summary["cut_groups"] == 57
+    groups = {split: {item["group"] for item in plan if item["split"] == split}
+              for split in ("train", "validation", "test")}
+    assert [len(groups[split]) for split in ("train", "validation", "test")] == [36, 7, 14]
+    assert not groups["train"] & groups["validation"]
+    assert not groups["train"] & groups["test"]
+    assert not groups["validation"] & groups["test"]
+    material = Material(**config["material"])
+    time = times(config)
+    meshes, hashes = {}, set()
+    for item in plan:
+        key = item["column"], item["depth"]
+        if key not in meshes:
+            meshes[key] = cut_mesh(config, *key)
+        mesh = meshes[key]
+        mask, boundary_x, boundary_v = Pull(**item["load"]).boundary(mesh, time)
+        arrays = {
+            "rest": mesh.rest, "triangles": mesh.triangles, "original_vertex": mesh.original_vertex,
+            "cut_edges": mesh.cut_edges, "time": time, "boundary_mask": mask,
+            "boundary_position": boundary_x, "boundary_velocity": boundary_v,
+            "position": mesh.rest[None], "velocity": np.zeros_like(mesh.rest)[None],
+        }
+        value = input_hash(arrays, material.metadata())
+        assert value not in hashes
+        hashes.add(value)
+    assert min(load["amplitude"] for load in config["loads"]) == 0.015
+    assert max(load["amplitude"] for load in config["loads"]) == 0.03
+    assert min(load["ramp_time"] for load in config["loads"]) == 0.04
+    assert max(load["ramp_time"] for load in config["loads"]) == 0.06

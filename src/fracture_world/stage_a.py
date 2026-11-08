@@ -5,9 +5,12 @@ import json
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m fracture_world.stage_a")
     commands = parser.add_subparsers(dest="command", required=True)
+    plan = commands.add_parser("plan")
+    plan.add_argument("--config", default="configs/stage-a.json")
     generate = commands.add_parser("generate")
     generate.add_argument("--config", default="configs/stage-a.json")
     generate.add_argument("--output", required=True)
+    generate.add_argument("--resume", action="store_true")
     validate = commands.add_parser("validate")
     validate.add_argument("--config", default="configs/stage-a.json")
     validate.add_argument("--output", required=True)
@@ -65,11 +68,15 @@ def main(argv=None):
         import torch
 
         torch.set_num_threads(threads)
-    if command in ("generate", "validate", "train"):
+    if command in ("plan", "generate", "validate", "train"):
         from .generation2d import configuration
 
         config = configuration(args.pop("config"))
-    if command == "generate":
+    if command == "plan":
+        from .generation2d import generation_summary
+
+        result = generation_summary(config)
+    elif command == "generate":
         from .generation2d import generate
 
         result = generate(config, **args)
