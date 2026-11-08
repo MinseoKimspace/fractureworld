@@ -1,0 +1,27 @@
+{
+  "mesh": {"nx": 8, "ny": 8, "width": 1.0, "height": 1.0},
+  "material": {"young": 100.0, "poisson": 0.25, "density": 1.0, "thickness": 1.0},
+  "time": {"step": 0.002, "duration": 0.2},
+  "cut_columns": [2, 4, 6],
+  "cut_depths": {"train": [2, 4], "validation": [6], "test": [7, 8]},
+  "include_intact_training": true,
+  "loads": [
+    {"amplitude": 0.015, "ramp_time": 0.04},
+    {"amplitude": 0.015, "ramp_time": 0.06},
+    {"amplitude": 0.03, "ramp_time": 0.04},
+    {"amplitude": 0.03, "ramp_time": 0.06}
+  ],
+  "integration": {"rtol": 1e-8, "atol": 1e-10, "max_step": 0.001},
+  "training": {
+    "epochs": 20, "batch_size": 8, "rollout_steps": 4,
+    "windows_per_epoch": 1024, "hidden": 64, "layers": 3,
+    "learning_rate": 0.0003, "seed": 17
+  },
+  "training_profiles": {
+    "a6000-48gb": {
+      "epochs": 40, "batch_size": 256, "rollout_steps": 4,
+      "windows_per_epoch": 16384, "hidden": 128, "layers": 6,
+      "learning_rate": 0.0003, "seed": 17, "patience": 6
+    }
+  }
+}
