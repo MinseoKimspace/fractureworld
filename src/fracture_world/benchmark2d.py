@@ -1,4 +1,6 @@
+import hashlib
 import json
+from collections import Counter
 from itertools import combinations
 from pathlib import Path
 from time import perf_counter
@@ -7,6 +9,7 @@ import numpy as np
 import torch
 
 from .cases import Case, collection
+from .integration2d import advance
 from .metrics2d import RMSE_CONVENTION, weighted_rmse
 from .training2d import emit, graph_for, load_model
 
@@ -14,6 +17,11 @@ from .training2d import emit, graph_for, load_model
 def synchronize(device):
     if str(device).startswith("cuda"):
         torch.cuda.synchronize(device)
+
+
+def checkpoint_hash(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def trajectory_metrics(case, position, velocity):
@@ -83,12 +91,15 @@ def rollout(model, case, dt, device):
     boundary_velocity = torch.as_tensor(case.arrays["boundary_velocity"], dtype=torch.float32, device=device)
     positions, velocities, reactions = [position], [velocity], []
     failure = None
+    cache = None
     with torch.inference_mode():
         for frame in range(1, len(case.arrays["time"])):
             try:
-                next_position, next_velocity, force = model(
-                    graph, position, velocity, boundary_position[frame], boundary_velocity[frame], dt
+                prediction = advance(
+                    model, graph, position, velocity, boundary_position[frame], boundary_velocity[frame], dt,
+                    cache=cache,
                 )
+                next_position, next_velocity, force = prediction.position, prediction.velocity, prediction.mean_force
                 if not all(torch.isfinite(value).all().item() for value in (next_position, next_velocity, force)):
                     failure = f"Non-finite prediction at frame {frame}"
                     break
@@ -97,7 +108,8 @@ def rollout(model, case, dt, device):
                 positions.append(next_position)
                 velocities.append(next_velocity)
                 position, velocity = next_position, next_velocity
-            except RuntimeError as error:
+                cache = prediction.cache
+            except (RuntimeError, ValueError, FloatingPointError) as error:
                 failure = f"Prediction failed at frame {frame}: {error}"
                 break
         arrays = {
@@ -125,8 +137,7 @@ def benchmark(data, checkpoints, output, split="test", device="cpu", case_limit=
     selected = selected if case_limit is None else selected[:case_limit]
     rows, paths = zip(*selected)
     cases = [Case.load(path) for path in paths]
-    methods = {}
-    prepared = []
+    methods, loaded = {}, []
     for checkpoint_path in checkpoints:
         synchronize(device)
         started = perf_counter()
@@ -141,16 +152,28 @@ def benchmark(data, checkpoints, output, split="test", device="cpu", case_limit=
         if training_status == "untrained" and not allow_untrained:
             raise ValueError("Untrained checkpoint requires explicit allow_untrained=True for pipeline checks")
         method = checkpoint["model_config"]["method"]
-        if method in methods:
-            raise ValueError(f"Repeated method label: {method}")
-        methods[method] = {
+        architecture = checkpoint["model_config"].get("architecture", "legacy")
+        if any(item[0] == method and item[1] == architecture for item in loaded):
+            raise ValueError(f"Repeated method variant: {method}/{architecture}")
+        details = {
             "checkpoint": str(Path(checkpoint_path).resolve()),
+            "checkpoint_sha256": checkpoint_hash(checkpoint_path),
+            "model_method": method,
+            "architecture": architecture,
+            "integrator": getattr(model, "integrator", "legacy_constant_acceleration"),
+            "force_semantics": "instantaneous_position_force" if architecture == "equilibrium" else "learned_step_force",
             "weight_loading_seconds": loading_seconds,
             "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
             "training_status": training_status,
             "cases": [],
         }
-        prepared.append((method, model, dt))
+        loaded.append((method, architecture, model, dt, details))
+    counts = Counter(item[0] for item in loaded)
+    prepared = []
+    for method, architecture, model, dt, details in loaded:
+        label = method if counts[method] == 1 else f"{method}_{architecture}"
+        methods[label] = details
+        prepared.append((label, model, dt))
     output.mkdir(parents=True, exist_ok=True)
     for method, model, dt in prepared:
         synchronize(device)
@@ -161,7 +184,7 @@ def benchmark(data, checkpoints, output, split="test", device="cpu", case_limit=
                   for key, index in (("position", 0), ("velocity", 0),
                                      ("boundary_position", 1), ("boundary_velocity", 1))]
         with torch.inference_mode():
-            model(graph, *values, dt)
+            advance(model, graph, *values, dt)
         synchronize(device)
         methods[method]["warmup_seconds"] = perf_counter() - started
         for index, (row, case) in enumerate(zip(rows, cases)):
@@ -196,6 +219,10 @@ def benchmark(data, checkpoints, output, split="test", device="cpu", case_limit=
                     arrays[key] = arrays[key][:frames]
                 arrays.update(prediction)
                 metadata = dict(case.metadata, method_label=method, source_revision="local-stage-a-v1",
+                                model_method=methods[method]["model_method"],
+                                architecture=methods[method]["architecture"],
+                                integrator=methods[method]["integrator"],
+                                checkpoint_sha256=methods[method]["checkpoint_sha256"],
                                 training_status=methods[method]["training_status"],
                                 source_url="https://arxiv.org/abs/2010.03409",
                                 source_scope="Architecture reference; independent stage A implementation",

@@ -76,7 +76,7 @@ def test_real_diagnostics_reuse_saved_rollouts_without_training_or_engine(tmp_pa
         assert values["summary"]["attempted_cases"] == 2
         assert values["summary"]["saved_rollouts_completed"] == 2
         assert values["summary"]["teacher_forced_completed"] == 2
-        assert values["checkpoint_identity_status"] == "original_checkpoint_checksum_unavailable"
+        assert values["checkpoint_identity_status"] == "verified_original_checksum"
         assert values["by_depth"]["2"]["attempted_cases"] == 2
         for case in values["cases"]:
             assert case["autonomous"]["free_motion"]["position_rmse"] == pytest.approx(0, abs=1e-12)
@@ -156,5 +156,5 @@ def test_untrained_checkpoint_is_not_diagnosed_as_learned_model(tmp_path):
     payload = torch.load(paths[0], weights_only=True)
     payload["trained"] = False
     torch.save(payload, paths[0])
-    with pytest.raises(ValueError, match="trained checkpoint"):
+    with pytest.raises(ValueError, match="trained checkpoint|Checkpoint changed"):
         diagnose(report, data, tmp_path / "diagnostics")

@@ -7,7 +7,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from .benchmark2d import check_checkpoint
+from .benchmark2d import check_checkpoint, checkpoint_hash
 from .cases import Case, collection
 from .diagnostic_metrics import free_motion_metrics, momentum_balance, zero_internal_force
 from .diagnostic_probes import rest_probe, teacher_forced
@@ -18,11 +18,6 @@ def save_diagnostics(output, report):
     temporary = output / "diagnostics.tmp"
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     temporary.replace(output / "diagnostics.json")
-
-
-def checkpoint_hash(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def geometry_key(case):
@@ -36,7 +31,7 @@ def geometry_key(case):
     return digest.hexdigest()
 
 
-def saved_prediction(reference, result, report_directory, method=None):
+def saved_prediction(reference, result, report_directory, method=None, identity=None):
     relative = result.get("trajectory")
     if not relative:
         if result.get("status") == "completed" or result.get("completed_steps", 0) >= 1:
@@ -53,6 +48,9 @@ def saved_prediction(reference, result, report_directory, method=None):
     saved = Case.load(path)
     if method is not None and saved.metadata.get("method_label") != method:
         raise ValueError("Saved trajectory method differs from the benchmark label")
+    for name, value in (identity or {}).items():
+        if saved.metadata.get(name) != value:
+            raise ValueError(f"Saved trajectory {name} differs from the benchmark identity")
     if saved.metadata.get("status") != result["status"]:
         raise ValueError("Saved trajectory status differs from the benchmark record")
     expected_hash = str(reference.arrays["case_hash"].item())
@@ -211,12 +209,20 @@ def diagnose(report, data, output, device="cpu", case_limit=None):
             model, checkpoint = load_model(checkpoint_path, device)
             if checkpoint.get("trained") is not True:
                 raise ValueError("Diagnostics require a trained checkpoint")
-            if checkpoint["model_config"]["method"] != method:
+            model_method = checkpoint["model_config"]["method"]
+            architecture = checkpoint["model_config"].get("architecture", "legacy")
+            integrator = getattr(model, "integrator", "legacy_constant_acceleration")
+            if model_method != source_method.get("model_method", method):
                 raise ValueError("Checkpoint method differs from its benchmark label")
+            if source_method.get("architecture", architecture) != architecture:
+                raise ValueError("Checkpoint architecture differs from its benchmark identity")
+            if source_method.get("integrator", integrator) != integrator:
+                raise ValueError("Checkpoint integrator differs from its benchmark identity")
             check_checkpoint(checkpoint, rows, references, split)
             method_results = {
                 "checkpoint": str(checkpoint_path.resolve()), "checkpoint_sha256": digest,
                 "checkpoint_identity_status": "verified_original_checksum" if original_digest else "original_checkpoint_checksum_unavailable",
+                "model_method": model_method, "architecture": architecture, "integrator": integrator,
                 "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
                 "rest_probes": {}, "cases": [],
             }
@@ -224,7 +230,9 @@ def diagnose(report, data, output, device="cpu", case_limit=None):
             for index, (row, case) in enumerate(zip(rows, references)):
                 case_id = str(row.get("id", row["path"]))
                 recorded = indexed[method][case_id]
-                prediction = saved_prediction(case, recorded, report_path.parent, method)
+                identity = {name: source_method[name] for name in
+                            ("model_method", "architecture", "integrator", "checkpoint_sha256") if name in source_method}
+                prediction = saved_prediction(case, recorded, report_path.parent, method, identity)
                 key = geometry_key(case)
                 if key not in method_results["rest_probes"]:
                     method_results["rest_probes"][key] = dict(rest_probe(model, case, device), source_case=case_id, group=row["group"])

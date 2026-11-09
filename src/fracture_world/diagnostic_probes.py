@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .benchmark2d import synchronize
+from .integration2d import advance
 from .training2d import graph_for
 
 
@@ -35,13 +36,14 @@ def setup(model, case, device):
     return graph, device, dtype
 
 
-def finite_prediction(model, graph, position, velocity, boundary_position, boundary_velocity, dt):
-    prediction = model(graph, position, velocity, boundary_position, boundary_velocity, dt)
-    if len(prediction) != 3 or any(
-        not isinstance(value, torch.Tensor) or value.shape != position.shape for value in prediction
+def finite_prediction(model, graph, position, velocity, boundary_position, boundary_velocity, dt, cache=None):
+    prediction = advance(model, graph, position, velocity, boundary_position, boundary_velocity, dt, cache=cache)
+    values = prediction.position, prediction.velocity, prediction.mean_force
+    if any(
+        not isinstance(value, torch.Tensor) or value.shape != position.shape for value in values
     ):
         raise ValueError("Model must return position, velocity and force arrays matching the graph")
-    if not all(torch.isfinite(value).all().item() for value in prediction):
+    if not all(torch.isfinite(value).all().item() for value in values):
         raise FloatingPointError("Non-finite model prediction")
     return prediction
 
@@ -62,10 +64,11 @@ def teacher_forced(model, case, device="cpu"):
             source_position = values["position"][frame - 1]
             source_velocity = values["velocity"][frame - 1]
             try:
-                position, velocity, force = finite_prediction(
+                prediction = finite_prediction(
                     model, graph, source_position, source_velocity,
                     values["boundary_position"][frame], values["boundary_velocity"][frame], float(dt),
                 )
+                position, velocity, force = prediction.position, prediction.velocity, prediction.mean_force
             except (RuntimeError, ValueError, FloatingPointError) as error:
                 failure = f"One-step prediction failed at frame {frame}: {error}"
                 break
@@ -88,6 +91,8 @@ def teacher_forced(model, case, device="cpu"):
     requested = len(case.arrays["time"]) - 1
     return arrays, {
         "mode": "teacher_forced_one_step", "autonomous": False,
+        "integrator": getattr(model, "integrator", "legacy_constant_acceleration"),
+        "internal_force_scope": "Step-average force used by the integrator; not an instantaneous stress label",
         "status": "completed" if completed == requested and failure is None else "failed",
         "failure": failure, "completed_steps": completed, "requested_steps": requested,
         "completed_horizon": float(case.arrays["time"][completed] - case.arrays["time"][0]),
@@ -113,6 +118,7 @@ def rest_probe(model, case, device="cpu"):
     free = ~graph.boundary_mask
     failure = None
     completed = 0
+    cache = None
     initial = {
         "initial_free_acceleration_max_norm": None,
         "initial_free_force_max_norm": None,
@@ -124,13 +130,18 @@ def rest_probe(model, case, device="cpu"):
     with evaluation(model):
         for frame, dt in enumerate(np.diff(case.arrays["time"]), start=1):
             try:
-                next_position, next_velocity, force = finite_prediction(
+                prediction = finite_prediction(
                     model, graph, position, velocity, boundary_position, boundary_velocity, float(dt),
+                    cache=cache,
                 )
+                next_position, next_velocity = prediction.position, prediction.velocity
             except (RuntimeError, ValueError, FloatingPointError) as error:
                 failure = f"Rest prediction failed at frame {frame}: {error}"
                 break
             if frame == 1:
+                force = prediction.start_force
+                if force is None:
+                    force = prediction.mean_force
                 initial["initial_free_acceleration_max_norm"] = maximum_norm(force / graph.mass[:, None] * free)
                 initial["initial_free_force_max_norm"] = maximum_norm(force * free)
                 initial["initial_internal_force_max_norm"] = maximum_norm(force)
@@ -143,11 +154,14 @@ def rest_probe(model, case, device="cpu"):
             max_drift = max(max_drift, maximum_norm((next_position - graph.rest) * free))
             max_speed = max(max_speed, maximum_norm(next_velocity * free))
             position, velocity = next_position, next_velocity
+            cache = prediction.cache
             completed += 1
     synchronize(device)
     requested = len(case.arrays["time"]) - 1
     return {
         "mode": "stationary_no_load", **initial,
+        "integrator": getattr(model, "integrator", "legacy_constant_acceleration"),
+        "initial_force_scope": "instantaneous_start_force" if hasattr(model, "instantaneous_force") else "legacy_step_force",
         "status": "completed" if completed == requested and failure is None else "failed",
         "failure": failure, "completed_steps": completed, "requested_steps": requested,
         "completed_horizon": float(case.arrays["time"][completed] - case.arrays["time"][0]),

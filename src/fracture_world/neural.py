@@ -192,3 +192,15 @@ class DynamicsModel(nn.Module):
         next_velocity = torch.where(graph.boundary_mask, boundary_velocity_next, next_velocity)
         next_position = torch.where(graph.boundary_mask, boundary_position_next, next_position)
         return next_position, next_velocity, force
+
+
+def create_model(configuration):
+    configuration = dict(configuration)
+    architecture = configuration.pop("architecture", "legacy")
+    if architecture == "legacy":
+        return DynamicsModel(**configuration)
+    if architecture == "equilibrium":
+        from .equilibrium import EquilibriumDynamicsModel
+
+        return EquilibriumDynamicsModel(**configuration)
+    raise ValueError(f"Unknown dynamics architecture: {architecture}")

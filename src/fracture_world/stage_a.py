@@ -16,15 +16,26 @@ def main(argv=None):
     validate.add_argument("--output", required=True)
     validate.add_argument("--device", default="cpu")
     validate.add_argument("--threads", type=int, default=4)
+    equilibrium = commands.add_parser("validate-equilibrium")
+    equilibrium.add_argument("--device", default="cpu")
+    equilibrium.add_argument("--hidden", type=int, default=16)
+    equilibrium.add_argument("--layers", type=int, default=2)
+    equilibrium.add_argument("--no-teacher", dest="include_teacher", action="store_false")
+    equilibrium.add_argument("--threads", type=int, default=4)
     train = commands.add_parser("train")
     train.add_argument("--config", default="configs/stage-a.json")
     train.add_argument("--profile", choices=("pilot", "a6000-48gb"), default="pilot")
     train.add_argument("--data", required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--method", choices=("direct", "stress"), required=True)
+    train.add_argument("--architecture", choices=("legacy", "equilibrium"), default="equilibrium")
     train.add_argument("--epochs", type=int)
     train.add_argument("--batch-size", type=int)
     train.add_argument("--rollout-steps", type=int)
+    train.add_argument("--rollout-schedule", type=int, nargs="+")
+    train.add_argument("--curriculum-epochs", type=int)
+    train.add_argument("--autonomous-validation-cases", type=int, default=8)
+    train.add_argument("--force-weight", type=float, default=1.0)
     train.add_argument("--windows-per-epoch", type=int)
     train.add_argument("--device", default="cpu")
     train.add_argument("--seed", type=int)
@@ -50,6 +61,8 @@ def main(argv=None):
     diagnose.add_argument("--threads", type=int, default=4)
     profile = commands.add_parser("profile")
     profile.add_argument("--case", required=True)
+    profile.add_argument("--architecture", choices=("legacy", "equilibrium"), default="equilibrium")
+    profile.add_argument("--method", choices=("direct", "stress"), default="stress")
     profile.add_argument("--device", default="cuda")
     profile.add_argument("--batch-sizes", type=int, nargs="+", default=[32, 64, 128, 256])
     profile.add_argument("--hidden", type=int, default=128)
@@ -91,6 +104,10 @@ def main(argv=None):
         from .validation2d import validate
 
         result = validate(config, **args)
+    elif command == "validate-equilibrium":
+        from .equilibrium_validation import validate_equilibrium
+
+        result = validate_equilibrium(**args)
     elif command == "train":
         from .training2d import fit
 
