@@ -41,6 +41,13 @@ def main(argv=None):
     benchmark.add_argument("--device", default="cpu")
     benchmark.add_argument("--case-limit", type=int)
     benchmark.add_argument("--threads", type=int, default=4)
+    diagnose = commands.add_parser("diagnose")
+    diagnose.add_argument("--data", required=True)
+    diagnose.add_argument("--report", required=True)
+    diagnose.add_argument("--output", required=True)
+    diagnose.add_argument("--device", default="cpu")
+    diagnose.add_argument("--case-limit", type=int)
+    diagnose.add_argument("--threads", type=int, default=4)
     profile = commands.add_parser("profile")
     profile.add_argument("--case", required=True)
     profile.add_argument("--device", default="cuda")
@@ -95,6 +102,10 @@ def main(argv=None):
         from .benchmark2d import benchmark
 
         result = benchmark(**args)
+    elif command == "diagnose":
+        from .diagnostics2d import diagnose
+
+        result = diagnose(**args)
     elif command == "render":
         from .render2d import render
 
