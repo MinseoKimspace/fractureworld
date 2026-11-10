@@ -72,6 +72,18 @@ def main(argv=None):
                         default=["force", "long", "topology", "load"])
     stress.add_argument("--render", dest="render_results", action="store_true")
     stress.add_argument("--threads", type=int, default=4)
+    event = commands.add_parser("cut-event-evaluate")
+    event.add_argument("--checkpoint", required=True)
+    event.add_argument("--data", required=True)
+    event.add_argument("--output", required=True)
+    event.add_argument("--source-cases", nargs="+")
+    event.add_argument("--event-time", type=float, default=0.03)
+    event.add_argument("--horizon", type=float)
+    event.add_argument("--substeps", type=int, choices=(1, 2, 4), default=1)
+    event.add_argument("--device", default="cpu")
+    event.add_argument("--render", dest="render_results", action="store_true")
+    event.add_argument("--allow-untrained", action="store_true")
+    event.add_argument("--threads", type=int, default=4)
     profile = commands.add_parser("profile")
     profile.add_argument("--case", required=True)
     profile.add_argument("--architecture", choices=("legacy", "equilibrium"), default="equilibrium")
@@ -140,6 +152,10 @@ def main(argv=None):
         from .stress_evaluation import evaluate_stress
 
         result = evaluate_stress(**args)
+    elif command == "cut-event-evaluate":
+        from .cut_event_evaluation import evaluate_cut_event
+
+        result = evaluate_cut_event(**args)
     elif command == "render":
         from .render2d import render
 
