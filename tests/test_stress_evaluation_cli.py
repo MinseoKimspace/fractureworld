@@ -30,6 +30,7 @@ def test_stress_evaluation_cli_defaults_do_not_train(monkeypatch, capsys):
     assert received == {
         "checkpoint": "best.pt", "data": "collection.json", "output": "new-evaluation",
         "device": "cpu", "source_cases": None, "horizon": 1.0, "case_limit": None,
+        "substeps": [1, 2],
         "groups": ["force", "long", "topology", "load"], "render_results": False,
     }
     assert json.loads(capsys.readouterr().out) == {
@@ -43,12 +44,13 @@ def test_stress_evaluation_cli_explicit_selection(monkeypatch, capsys):
     main(["stress-evaluate", "--checkpoint", "best.pt", "--data", "collection.json",
           "--output", "new-evaluation", "--device", "cuda", "--source-cases",
           "x7-depth7-load12", "x3-depth8-load12", "--horizon", "1.2", "--case-limit", "2",
-          "--groups", "force", "long", "--render"])
+          "--groups", "force", "long", "--substeps", "1", "2", "4", "--render"])
     assert received["device"] == "cuda"
     assert received["source_cases"] == ["x7-depth7-load12", "x3-depth8-load12"]
     assert received["horizon"] == 1.2
     assert received["case_limit"] == 2
     assert received["groups"] == ["force", "long"]
+    assert received["substeps"] == [1, 2, 4]
     assert received["render_results"] is True
     assert json.loads(capsys.readouterr().out)["training_executed"] is False
 
@@ -57,4 +59,12 @@ def test_stress_evaluation_cli_rejects_unknown_group():
     with pytest.raises(SystemExit) as error:
         main(["stress-evaluate", "--checkpoint", "best.pt", "--data", "collection.json",
               "--output", "new-evaluation", "--groups", "contact"])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3", "0.5"])
+def test_stress_evaluation_cli_rejects_unsupported_substeps(value):
+    with pytest.raises(SystemExit) as error:
+        main(["stress-evaluate", "--checkpoint", "best.pt", "--data", "collection.json",
+              "--output", "new-evaluation", "--substeps", value])
     assert error.value.code == 2

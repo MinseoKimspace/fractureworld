@@ -66,6 +66,7 @@ def main(argv=None):
     stress.add_argument("--device", default="cpu")
     stress.add_argument("--source-cases", nargs="+")
     stress.add_argument("--horizon", type=float, default=1.0)
+    stress.add_argument("--substeps", type=int, nargs="+", choices=(1, 2, 4), default=[1, 2])
     stress.add_argument("--case-limit", type=int)
     stress.add_argument("--groups", nargs="+", choices=("force", "long", "topology", "load"),
                         default=["force", "long", "topology", "load"])

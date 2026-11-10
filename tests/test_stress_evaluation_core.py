@@ -7,6 +7,8 @@ from fracture_world.cases import Case
 from fracture_world.neural import create_model
 from fracture_world.stress_evaluation import (
     case_at_time,
+    checked_substeps,
+    checkpoint_means,
     evaluation_summary,
     evaluation_time,
     orientation_metrics,
@@ -110,7 +112,54 @@ def test_partial_rollout_time_checkpoints_do_not_claim_unreached_horizons():
     result = prediction_metrics(reference, prediction, {"status": "failed", "failure": "test", "runtime_seconds": 0})
     assert result["aligned_completed_steps"] == 19
     assert all(not point["reached"] for point in result["time_checkpoints"])
+    assert all(point["time"] is None and point["free_position_error"] is None for point in result["time_checkpoints"])
     assert result["aligned_completed_horizon"] < 0.2
+
+
+def test_motion_checkpoints_distinguish_instantaneous_and_prefix_errors():
+    reference = stationary_case(1.0)
+    prediction = {name: reference.arrays[name].copy() for name in ("time", "position", "velocity", "boundary_impulse")}
+    free = ~reference.arrays["boundary_mask"]
+    time = reference.arrays["time"]
+    prediction["position"][:, :, 0] += 0.001 * time[:, None] * free[None, :, 0]
+    prediction["velocity"][:, :, 0] += 0.002 * time[:, None] * free[None, :, 0]
+    result = prediction_metrics(reference, prediction, {"status": "completed", "runtime_seconds": 0})
+    assert [point["requested_time"] for point in result["time_checkpoints"]] == [0.2, 0.5, 1.0]
+    for point in result["time_checkpoints"]:
+        target = point["requested_time"]
+        end = round(target / 0.002)
+        expected = 0.001 * np.sqrt(np.mean(time[1:end + 1] ** 2))
+        assert point["reached"] is True
+        assert point["free_position_error"] == pytest.approx(0.001 * target)
+        assert point["free_velocity_error"] == pytest.approx(0.002 * target)
+        assert point["prefix_free_position_rmse"] == pytest.approx(expected)
+        assert point["prefix_free_velocity_rmse"] == pytest.approx(2 * expected)
+        assert point["prefix_free_position_relative_rmse"] is None
+    assert result["time_checkpoints"][-1]["prefix_free_position_rmse"] == pytest.approx(result["free_motion"]["position_rmse"])
+
+
+def test_checkpoint_summary_keeps_unreached_values_unknown():
+    records = [
+        {"time_checkpoints": [{"requested_time": 0.2, "reached": True, "prefix_free_position_rmse": 1.0}]},
+        {"time_checkpoints": [{"requested_time": 0.2, "reached": True, "prefix_free_position_rmse": 3.0}]},
+        {"time_checkpoints": [{"requested_time": 0.2, "reached": False, "prefix_free_position_rmse": None}]},
+    ]
+    point = checkpoint_means(records, ("prefix_free_position_rmse",))[0]
+    assert point["attempted"] == 3 and point["reached"] == 2
+    assert point["metric_counts"]["prefix_free_position_rmse"] == 2
+    assert point["mean_prefix_free_position_rmse"] == 2.0
+
+
+@pytest.mark.parametrize("values", [[], [2], [1, 1], [2, 1], [1, 3], [True, 2], [1, 2.0]])
+def test_substep_configuration_rejects_ambiguous_or_unsupported_values(values):
+    with pytest.raises(ValueError, match="Substeps"):
+        checked_substeps(values)
+
+
+def test_substep_configuration_preserves_legacy_and_allows_quarter_without_half():
+    assert checked_substeps((1, 2)) == (1, 2)
+    assert checked_substeps([1, 2, 4]) == (1, 2, 4)
+    assert checked_substeps([1, 4]) == (1, 4)
 
 
 def test_provider_difference_uses_free_coordinates_only():

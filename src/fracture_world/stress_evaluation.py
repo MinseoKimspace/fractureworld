@@ -5,18 +5,72 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from .benchmark2d import check_checkpoint, checkpoint_hash, rollout, synchronize, trajectory_metrics
+from .benchmark2d import check_checkpoint, checkpoint_hash, rollout, trajectory_metrics
 from .cases import Case, collection
 from .diagnostic_metrics import free_motion_metrics, momentum_balance
 from .force_reference2d import reference_solution, teacher_force_rollout
 from .generation2d import file_hash
 from .metrics2d import weighted_rmse
 from .stress_scenarios import evaluation_plan, plan_summary
-from .teacher2d import InternalForce, Pull
-from .training2d import emit, graph_for, load_model
+from .stress_force_diagnostics import instantaneous_force_error
+from .teacher2d import Pull
+from .training2d import emit, load_model
 
 
 GROUPS = {"force": "force_audit", "long": "long_rollout", "topology": "topology", "load": "load"}
+
+
+def checked_substeps(substeps):
+    values = list(substeps)
+    if (
+        not values or any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value not in (1, 2, 4) for value in values)
+        or values != sorted(set(values)) or values[0] != 1
+    ):
+        raise ValueError("Substeps must be increasing unique values from 1, 2, 4 and include 1")
+    return tuple(int(value) for value in values)
+
+
+def method_name(provider, factor):
+    suffix = {1: "", 2: "_half_dt", 4: "_quarter_dt"}[factor]
+    return f"{provider}_verlet{suffix}"
+
+
+def temporal_rms(values):
+    values = np.asarray(values, dtype=np.float64)
+    if not len(values) or not np.isfinite(values).all():
+        return None
+    scale = float(np.max(np.abs(values)))
+    return 0.0 if scale == 0 else float(scale * np.sqrt(np.mean((values / scale) ** 2)))
+
+
+def motion_checkpoints(reference, prediction, free=None):
+    horizon = float(reference.arrays["time"][-1])
+    times = reference.arrays["time"][:len(prediction["position"])]
+    result = []
+    for target in sorted({0.2, 0.5, 1.0, horizon}):
+        if target > horizon:
+            continue
+        tolerance = 4 * abs(np.spacing(np.float64(target)))
+        indices = np.flatnonzero(np.abs(times - target) <= tolerance)
+        point = {
+            "requested_time": target, "time": None, "reached": False, "status": "unavailable_target_state",
+            "free_position_error": None, "free_velocity_error": None,
+            "prefix_free_position_rmse": None, "prefix_free_velocity_rmse": None,
+            "prefix_free_position_relative_rmse": None, "prefix_free_velocity_relative_rmse": None,
+        }
+        if len(indices) and indices[0] > 0 and free is not None:
+            end = int(indices[0])
+            point.update(time=float(times[end]), reached=True, status="available")
+            for name in ("position", "velocity"):
+                values = free["curves"][name + "_rmse"]
+                signals = free["curves"][name + "_reference_rms"]
+                error = temporal_rms(values[:end])
+                signal = temporal_rms(signals[:end])
+                point["free_" + name + "_error"] = values[end - 1]
+                point["prefix_free_" + name + "_rmse"] = error
+                point["prefix_free_" + name + "_relative_rmse"] = None if signal in (0, None) or error is None else error / signal
+        result.append(point)
+    return result
 
 
 def evaluation_time(duration, dt):
@@ -93,7 +147,7 @@ def orientation_metrics(mesh, prediction):
         "frames_with_inversion": int(invalid.sum()),
         "first_invalid_orientation_time": None if not len(indices) else float(prediction["time"][indices[0]]),
         "minimum_signed_area": float(area.min() / 2),
-        "geometry_scope": "All native integration states, including intermediate half-dt states; positive area only",
+        "geometry_scope": "All native integration states, including all intermediate substep states; positive area only",
     }
 
 
@@ -107,6 +161,7 @@ def prediction_metrics(reference, prediction, status, native_geometry=None):
     )
     if frames < 2:
         result["metric_status"] = "unavailable_no_completed_interval"
+        result["time_checkpoints"] = motion_checkpoints(reference, prediction)
         if native_geometry is not None:
             result.update(native_geometry, native_geometry=native_geometry)
         return result
@@ -123,61 +178,13 @@ def prediction_metrics(reference, prediction, status, native_geometry=None):
     result["minimum_signed_area"] = float(area.min() / 2)
     difference = prediction["boundary_impulse"] - reference.arrays["boundary_impulse"][:frames - 1]
     result["boundary_impulse_rmse"] = float(np.sqrt(np.mean(np.sum(difference ** 2, axis=(1, 2)))))
-    result["time_checkpoints"] = []
-    for target in sorted({0.2, 0.5, float(reference.arrays["time"][-1])}):
-        indices = np.flatnonzero(reference.arrays["time"][1:frames] <= target + 1e-14)
-        if target > reference.arrays["time"][-1] or not len(indices):
-            continue
-        end = int(indices[-1])
-        result["time_checkpoints"].append({
-            "time": float(reference.arrays["time"][end + 1]),
-            "requested_time": target,
-            "reached": bool(reference.arrays["time"][frames - 1] >= target - 1e-14),
-            "free_position_error": free["curves"]["position_rmse"][end],
-            "free_velocity_error": free["curves"]["velocity_rmse"][end],
-        })
+    result["time_checkpoints"] = motion_checkpoints(reference, prediction, free)
     if native_geometry is not None:
         result["aligned_geometry"] = {
             key: result[key] for key in native_geometry if key in result
         }
         result.update(native_geometry, native_geometry=native_geometry)
     return result
-
-
-def instantaneous_force_error(model, reference, material, prediction, device, samples=16):
-    synchronize(device)
-    started = perf_counter()
-    graph = graph_for(reference, device)
-    frames = np.unique(np.linspace(0, len(prediction["position"]) - 1, min(samples, len(prediction["position"])) , dtype=int))
-    force = InternalForce(reference.mesh, material)
-    predicted, truth = [], []
-    with torch.inference_mode():
-        for frame in frames:
-            position = np.asarray(prediction["position"][frame])
-            state = torch.as_tensor(position, dtype=torch.float32, device=device)
-            predicted.append(model.instantaneous_force(graph, state).cpu().numpy().astype(np.float64))
-            truth.append(force(state.cpu().numpy().astype(np.float64)))
-    predicted, truth = np.stack(predicted), np.stack(truth)
-    error = predicted - truth
-    finite = np.isfinite(predicted).all() and np.isfinite(truth).all()
-    if not finite:
-        return {"status": "unknown_nonfinite_force", "frames": frames.tolist()}
-    mass = reference.mass
-    free = ~reference.arrays["boundary_mask"]
-    acceleration = np.where(free[None], error / mass[None, :, None], 0)
-    signal = float(np.sqrt(np.mean(np.sum(truth ** 2, axis=-1))))
-    rmse = float(np.sqrt(np.mean(np.sum(error ** 2, axis=-1))))
-    synchronize(device)
-    return {
-        "status": "available", "sample_count": len(frames), "frames": frames.tolist(),
-        "force_rmse": rmse, "teacher_force_rms": signal,
-        "force_relative_rmse": None if signal == 0 else rmse / signal,
-        "normalization_status": "zero_signal" if signal == 0 else "available",
-        "free_acceleration_rmse": weighted_rmse(acceleration[:, np.any(free, axis=1)], mass[np.any(free, axis=1)])
-        if np.any(free) else None,
-        "runtime_seconds": perf_counter() - started,
-        "scope": "Both force functions evaluated at the same float32-rounded positions; teacher is diagnostic only",
-    }
 
 
 def write_report(output, report):
@@ -200,6 +207,40 @@ def provider_difference(reference, neural, oracle):
     return result
 
 
+def checkpoint_means(records, fields):
+    targets = sorted({point["requested_time"] for row in records for point in row.get("time_checkpoints", [])})
+    result = []
+    for target in targets:
+        points = [point for row in records for point in row.get("time_checkpoints", []) if point["requested_time"] == target]
+        point = {"requested_time": target, "attempted": len(points), "reached": sum(bool(item["reached"]) for item in points), "metric_counts": {}}
+        for field in fields:
+            values = [item[field] for item in points if item.get(field) is not None and np.isfinite(item[field])]
+            point["mean_" + field] = float(np.mean(values)) if values else None
+            point["metric_counts"][field] = len(values)
+        result.append(point)
+    return result
+
+
+def force_diagnostic_summary(rows):
+    fields = ("force_rmse", "force_relative_rmse", "free_acceleration_rmse")
+    sources = {}
+    for row in rows:
+        reference = row.get("instantaneous_force_diagnostics", {}).get("on_reference_states")
+        if reference is not None:
+            sources.setdefault("reference_states", []).append(reference)
+        for name, diagnostic in row.get("instantaneous_force_diagnostics_by_method", {}).items():
+            sources.setdefault(name, []).append(diagnostic)
+    result = {}
+    for name, records in sources.items():
+        available = [row for row in records if row["status"] == "available"]
+        result[name] = {"attempted": len(records), "available": len(available), "unknown": len(records) - len(available)}
+        for field in fields:
+            values = [row[field] for row in available if row.get(field) is not None]
+            result[name]["mean_" + field] = float(np.mean(values)) if values else None
+        result[name]["time_checkpoints"] = checkpoint_means(records, fields)
+    return result
+
+
 def evaluation_summary(cases):
     result = {}
     for category in dict.fromkeys(row["category"] for row in cases):
@@ -219,18 +260,24 @@ def evaluation_summary(cases):
                 "max_case_free_position_rmse": max(position_errors, default=None),
                 "max_case_free_velocity_rmse": max(velocity_errors, default=None),
                 "position_metric_count": len(position_errors), "velocity_metric_count": len(velocity_errors),
+                "time_checkpoints": checkpoint_means(attempted, (
+                    "free_position_error", "free_velocity_error",
+                    "prefix_free_position_rmse", "prefix_free_velocity_rmse",
+                    "prefix_free_position_relative_rmse", "prefix_free_velocity_relative_rmse",
+                )),
             }
         result[category] = {
             "scenarios": len(rows),
             "reference_unavailable": sum(row["status"] in {"reference_failed", "reference_unverified"} for row in rows),
             "methods": methods,
+            "force_diagnostics": force_diagnostic_summary(rows),
             "scope": "Completed finite trajectories contribute to errors even when orientation is invalid; failures remain in attempt counts",
         }
     return result
 
 
 def evaluate_stress(checkpoint, data, output, device="cpu", source_cases=None, horizon=1.0,
-                    case_limit=None, groups=None, render_results=False):
+                    case_limit=None, groups=None, render_results=False, substeps=(1, 2)):
     if str(device).startswith("cuda") and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable")
     groups = list(GROUPS) if groups is None else list(groups)
@@ -238,6 +285,7 @@ def evaluate_stress(checkpoint, data, output, device="cpu", source_cases=None, h
         raise ValueError("Evaluation groups must be unique force, long, topology or load names")
     if case_limit is not None and (isinstance(case_limit, bool) or int(case_limit) != case_limit or case_limit < 1):
         raise ValueError("Case limit must be a positive integer")
+    substeps = checked_substeps(substeps)
     output, checkpoint, data = Path(output).resolve(), Path(checkpoint).resolve(), Path(data).resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("Evaluation output must be a new or empty directory")
@@ -278,6 +326,7 @@ def evaluate_stress(checkpoint, data, output, device="cpu", source_cases=None, h
         "checkpoint": str(checkpoint), "checkpoint_sha256": checkpoint_hash(checkpoint),
         "data": str(data), "device": str(device), "training_executed": False,
         "model_configuration": model.configuration(), "trained_dt": float(payload["dt"]),
+        "substeps": list(substeps), "integration_timesteps": [float(payload["dt"]) / factor for factor in substeps],
         "plan": plan_summary(plan), "cases": [], "inputs_unchanged": None,
         "scope": "Frozen-model evaluation; prescribed initial cuts and tensile loading; no contact or fracture evolution",
         "comparison_scope": "Oracle uses FElupe on CPU float64; neural rollout uses the requested device float32; timings are not a hardware-matched speed benchmark",
@@ -325,10 +374,10 @@ def evaluate_stress(checkpoint, data, output, device="cpu", source_cases=None, h
                     "velocity": reference.arrays["velocity"][:frames],
                 })
             saved_predictions = {}
-            factors = (1, 2) if scenario["category"] in {"force_audit", "long_rollout"} else (1,)
+            factors = substeps if scenario["category"] in {"force_audit", "long_rollout"} else (1,)
             for provider in ("neural", "teacher"):
                 for factor in factors:
-                    name = f"{provider}_verlet" + ("_half_dt" if factor == 2 else "")
+                    name = method_name(provider, factor)
                     emit("stress_evaluation_phase", case=scenario["id"], phase=name + "_started")
                     current_time = evaluation_time(scenario["duration"], scenario["time_step"] / factor)
                     if provider == "neural":
@@ -359,17 +408,21 @@ def evaluate_stress(checkpoint, data, output, device="cpu", source_cases=None, h
                     write_report(output, report)
                     emit("stress_evaluation_phase", case=scenario["id"], phase=name + "_completed", status=result["status"], runtime_seconds=result["runtime_seconds"])
             row["force_provider_difference"] = {
-                "dt": provider_difference(reference, saved_predictions["neural_verlet"], saved_predictions["teacher_verlet"]),
+                {1: "dt", 2: "half_dt", 4: "quarter_dt"}[factor]: provider_difference(
+                    reference, saved_predictions[method_name("neural", factor)], saved_predictions[method_name("teacher", factor)],
+                ) for factor in factors
             }
-            if 2 in factors:
-                row["force_provider_difference"]["half_dt"] = provider_difference(
-                    reference, saved_predictions["neural_verlet_half_dt"], saved_predictions["teacher_verlet_half_dt"],
-                )
-            if scenario["category"] == "force_audit":
+            if scenario["category"] in {"force_audit", "long_rollout"}:
                 emit("stress_evaluation_phase", case=scenario["id"], phase="same_state_force_diagnostics")
+                force_by_method = {
+                    method_name("neural", factor): instantaneous_force_error(
+                        model, reference, scenario["material"], saved_predictions[method_name("neural", factor)], device,
+                    ) for factor in factors
+                }
+                row["instantaneous_force_diagnostics_by_method"] = force_by_method
                 row["instantaneous_force_diagnostics"] = {
                     "on_reference_states": instantaneous_force_error(model, reference, scenario["material"], reference.arrays, device),
-                    "on_neural_states": instantaneous_force_error(model, reference, scenario["material"], saved_predictions["neural_verlet"], device),
+                    "on_neural_states": force_by_method["neural_verlet"],
                 }
             row["status"] = "completed"
             if render_results:
