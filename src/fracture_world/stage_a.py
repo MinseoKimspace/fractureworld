@@ -59,6 +59,18 @@ def main(argv=None):
     diagnose.add_argument("--device", default="cpu")
     diagnose.add_argument("--case-limit", type=int)
     diagnose.add_argument("--threads", type=int, default=4)
+    stress = commands.add_parser("stress-evaluate")
+    stress.add_argument("--checkpoint", required=True)
+    stress.add_argument("--data", required=True)
+    stress.add_argument("--output", required=True)
+    stress.add_argument("--device", default="cpu")
+    stress.add_argument("--source-cases", nargs="+")
+    stress.add_argument("--horizon", type=float, default=1.0)
+    stress.add_argument("--case-limit", type=int)
+    stress.add_argument("--groups", nargs="+", choices=("force", "long", "topology", "load"),
+                        default=["force", "long", "topology", "load"])
+    stress.add_argument("--render", dest="render_results", action="store_true")
+    stress.add_argument("--threads", type=int, default=4)
     profile = commands.add_parser("profile")
     profile.add_argument("--case", required=True)
     profile.add_argument("--architecture", choices=("legacy", "equilibrium"), default="equilibrium")
@@ -123,6 +135,10 @@ def main(argv=None):
         from .diagnostics2d import diagnose
 
         result = diagnose(**args)
+    elif command == "stress-evaluate":
+        from .stress_evaluation import evaluate_stress
+
+        result = evaluate_stress(**args)
     elif command == "render":
         from .render2d import render
 

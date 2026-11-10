@@ -5,6 +5,13 @@ import numpy as np
 from .teacher2d import simulate
 
 
+REFINEMENT_LIMITS = {
+    "position_max_difference": 1e-7,
+    "velocity_max_difference": 1e-6,
+    "boundary_impulse_max_difference": 1e-7,
+}
+
+
 def maximum_difference(first, second):
     return float(np.max(np.abs(first - second), initial=0))
 
@@ -42,9 +49,7 @@ def audit_teacher(mesh, material, time, amplitude=0.02, ramp_time=0.05,
     balance = maximum_difference(momentum[1:] - momentum[0], impulse)
     thresholds = {
         "repeatability_max_difference": 0.0,
-        "position_max_difference": 1e-7,
-        "velocity_max_difference": 1e-6,
-        "boundary_impulse_max_difference": 1e-7,
+        **REFINEMENT_LIMITS,
         "momentum_balance_max_error": 1e-8,
     }
     checks = {
