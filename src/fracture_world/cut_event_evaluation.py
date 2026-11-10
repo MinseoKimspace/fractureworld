@@ -60,10 +60,20 @@ def reference_sequences(scenario):
         ))
         refinement[condition] = differences
         checks[condition] = {key: value <= REFINEMENT_LIMITS[key] for key, value in differences.items()}
+    post = time > scenario["event_time"]
+    weights = corner_weights(source)
+    causal_refinement = {}
+    for field in ("position", "velocity"):
+        coarse_change = levels[0][0].corners(field) - levels[0][1].corners(field)
+        refined_change = levels[1][0].corners(field) - levels[1][1].corners(field)
+        difference = (refined_change - coarse_change)[post].reshape(int(post.sum()), -1, 2)
+        causal_refinement[f"{field}_intervention_refinement_rms"] = weighted_rmse(difference, weights)
     return {"cut": levels[1][0], "no_cut": levels[1][1]}, {
         "converged": all(all(value.values()) for value in checks.values()),
         "checks": checks, "refinement": refinement, "limits": dict(REFINEMENT_LIMITS),
         "event_transfer": levels[1][2], "coarse_settings": coarse_settings,
+        "causal_refinement": causal_refinement,
+        "causal_refinement_scope": "Observed coarse-to-refined intervention difference; not a rigorous error bound",
         "refined_settings": fine_settings, "runtime_seconds": perf_counter() - started,
         "scope": "Independent refined FElupe/DOP853 numerical references; no experimental physical truth",
     }
@@ -98,7 +108,7 @@ def sequence_metrics(reference, prediction):
     return result
 
 
-def causal_metrics(references, predictions):
+def causal_metrics(references, predictions, reference_audit=None):
     result = {}
     baseline = predictions.get("no_cut")
     if baseline is None:
@@ -120,6 +130,10 @@ def causal_metrics(references, predictions):
             values[f"teacher_{field}_intervention_rms"] = weighted_rmse(
                 target[post].reshape(int(post.sum()), -1, 2), weights,
             ) if post.any() else None
+            refinement = (reference_audit or {}).get("causal_refinement", {})
+            values[f"teacher_{field}_intervention_refinement_rms"] = refinement.get(
+                f"{field}_intervention_refinement_rms"
+            )
         result[label] = values
     return result
 
@@ -178,12 +192,13 @@ def record_case(report, result, output, started):
     report["cases"].append(result)
     (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     emit("cut_event_case_completed", case=result["case"], status=result["status"],
+         index=result.get("index"), cases=result.get("requested_cases"),
          runtime_seconds=result["runtime_seconds"])
 
 
 def evaluate_cut_event(data, checkpoint, output, source_cases=None, event_time=0.03,
                        horizon=None, device="cpu", substeps=1, render_results=False,
-                       allow_untrained=False):
+                       allow_untrained=False, scenario_plan=None):
     from .cut_event_runtime import event_rollout
 
     if str(device).startswith("cuda") and not torch.cuda.is_available():
@@ -201,7 +216,11 @@ def evaluate_cut_event(data, checkpoint, output, source_cases=None, event_time=0
     required = {"training_groups", "training_case_hashes", "dt"}
     if not required.issubset(details):
         raise ValueError("The checkpoint is missing training provenance or its timestep")
-    plan = experiment_plan(data, source_cases, event_time, horizon)
+    plan = experiment_plan(data, source_cases, event_time, horizon) if scenario_plan is None else list(scenario_plan)
+    if not plan or len({row["id"] for row in plan}) != len(plan):
+        raise ValueError("The evaluation plan must have nonempty, unique scenario IDs")
+    if len({row["experiment_hash"] for row in plan}) != len(plan):
+        raise ValueError("The evaluation plan contains duplicate physical conditions")
     dt = float(details.get("dt", 0))
     if not np.isfinite(dt) or dt <= 0 or any(not np.allclose(
         np.diff(row["time"]), dt, rtol=1e-9, atol=1e-12,
@@ -226,13 +245,18 @@ def evaluate_cut_event(data, checkpoint, output, source_cases=None, event_time=0
         "scope": "Prescribed single cut finishing a pre-existing notch during tension; no contact or learned fracture criterion",
         "topology_ablation": "Frozen pre-cut encoder context versus updated encoder context; both cut variants use the actual separated physical mesh",
         "interpretation": "Homogeneous local StVK stress need not depend on graph context at identical strain; updated-context superiority is not assumed",
-        "cases": [],
+        "requested_cases": len(plan), "status": "running", "cases": [],
     }
-    for scenario in plan:
+    (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    for index, scenario in enumerate(plan, start=1):
         started = perf_counter()
-        emit("cut_event_reference_started", case=scenario["id"], event_time=scenario["event_time"])
+        emit("cut_event_reference_started", case=scenario["id"], index=index, cases=len(plan),
+             event_time=scenario["event_time"])
         result = {"case": scenario["id"], "inputs": scenario["inputs"],
-                  "experiment_hash": scenario["experiment_hash"], "methods": {}}
+                  "experiment_hash": scenario["experiment_hash"], "index": index,
+                  "requested_cases": len(plan), "methods": {}}
+        if "sweep" in scenario:
+            result["sweep"] = dict(scenario["sweep"])
         try:
             references, audit = reference_sequences(scenario)
         except (RuntimeError, ValueError, FloatingPointError, OverflowError) as error:
@@ -282,7 +306,7 @@ def evaluate_cut_event(data, checkpoint, output, source_cases=None, event_time=0
                     sequence.save(path)
                     status["trajectory"] = str(path.relative_to(output))
                 result["methods"][label] = status
-            result["causal_response"] = causal_metrics(references, predictions)
+            result["causal_response"] = causal_metrics(references, predictions, audit)
             if render_results and len(predictions) == 3:
                 from .render2d import render
 

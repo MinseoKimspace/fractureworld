@@ -84,6 +84,20 @@ def main(argv=None):
     event.add_argument("--render", dest="render_results", action="store_true")
     event.add_argument("--allow-untrained", action="store_true")
     event.add_argument("--threads", type=int, default=4)
+    sweep = commands.add_parser("cut-event-sweep")
+    sweep.add_argument("--data", required=True)
+    sweep.add_argument("--checkpoint")
+    sweep.add_argument("--output")
+    sweep.add_argument("--columns", type=int, nargs="+")
+    sweep.add_argument("--load-indices", type=int, nargs="+")
+    sweep.add_argument("--event-times", type=float, nargs="+")
+    sweep.add_argument("--horizon", type=float)
+    sweep.add_argument("--substeps", type=int, choices=(1, 2, 4), default=4)
+    sweep.add_argument("--device", default="cpu")
+    sweep.add_argument("--plan-only", action="store_true")
+    sweep.add_argument("--render-worst", type=int, default=3)
+    sweep.add_argument("--allow-untrained", action="store_true")
+    sweep.add_argument("--threads", type=int, default=4)
     profile = commands.add_parser("profile")
     profile.add_argument("--case", required=True)
     profile.add_argument("--architecture", choices=("legacy", "equilibrium"), default="equilibrium")
@@ -156,6 +170,15 @@ def main(argv=None):
         from .cut_event_evaluation import evaluate_cut_event
 
         result = evaluate_cut_event(**args)
+    elif command == "cut-event-sweep":
+        from .cut_event_sweep import run_sweep
+
+        result = run_sweep(**args)
+        if not args["plan_only"]:
+            result = {key: result[key] for key in (
+                "status", "report", "conditions_csv", "training_executed", "checkpoint_unchanged",
+                "requested_cases", "renders", "sweep_runtime_seconds",
+            )} | {"summary": result["sweep_summary"]["overall"]}
     elif command == "render":
         from .render2d import render
 
